@@ -1,0 +1,27 @@
+# rust
+/target/
+
+# environment
+.env
+.env.local
+
+# config (use config.example.toml as template)
+config.toml
+
+# ide
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# os
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+
+docs/*
+!docs/logo/
+docs/logo/*
+!docs/logo/kntx_no_bg.png
