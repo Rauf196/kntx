@@ -1,0 +1,17 @@
+# kntx example configuration
+# copy to config.toml and edit for your environment
+
+[listener]
+address = "0.0.0.0:8080"
+
+[[backends]]
+address = "127.0.0.1:3001"
+
+[[backends]]
+address = "127.0.0.1:3002"
+
+[logging]
+level = "info"
+
+[metrics]
+address = "0.0.0.0:9090"
