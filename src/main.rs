@@ -1,5 +1,11 @@
+use std::sync::Arc;
+
 use clap::{Parser, ValueEnum};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+use kntx::balancer::RoundRobin;
+use kntx::config;
+use kntx::listener;
 
 #[derive(Parser)]
 #[command(name = "kntx", version, about = "High-performance L4/L7 reverse proxy")]
@@ -51,18 +57,27 @@ fn init_tracing(level: Option<&str>, format: &LogFormat) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    init_tracing(args.log_level.as_deref(), &args.log_format);
+    let config = config::Config::from_file(&args.config)?;
 
-    tracing::info!(config = %args.config, "kntx starting");
+    let log_level = args.log_level.as_deref().unwrap_or(&config.logging.level);
+    init_tracing(Some(log_level), &args.log_format);
 
     if args.validate {
-        // actual validation comes in phase 1 with config parsing
-        tracing::info!("config validation not yet implemented");
+        tracing::info!(config = %args.config, "configuration is valid");
         return Ok(());
     }
 
-    // proxy startup comes in phase 1
-    tracing::info!("proxy not yet implemented");
+    tracing::info!(
+        listen = %config.listener.address,
+        backends = config.backends.len(),
+        "kntx starting",
+    );
+
+    let backend_addrs: Vec<_> = config.backends.iter().map(|b| b.address).collect();
+    let balancer = Arc::new(RoundRobin::new(backend_addrs));
+
+    let tcp_listener = listener::bind(config.listener.address).await?;
+    listener::serve(tcp_listener, balancer).await;
 
     Ok(())
 }

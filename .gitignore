@@ -5,8 +5,9 @@
 .env
 .env.local
 
-# config (use config.example.toml as template)
+# config (use config/example.toml as template)
 config.toml
+config/benchmark.toml
 
 # ide
 .idea/
