@@ -1,12 +1,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::net::TcpListener;
 use thiserror::Error;
+use tokio::net::TcpListener;
 use tracing::Instrument;
 
 use crate::balancer::RoundRobin;
-use crate::proxy::l4;
+use crate::config::ForwardingStrategy;
+use crate::proxy::l4::{self, Resources};
 
 #[derive(Debug, Error)]
 pub enum ListenerError {
@@ -27,14 +28,34 @@ pub async fn bind(address: SocketAddr) -> Result<TcpListener, ListenerError> {
         .map_err(|source| ListenerError::Bind { address, source })
 }
 
-pub async fn serve(listener: TcpListener, balancer: Arc<RoundRobin>) {
+pub async fn serve(
+    listener: TcpListener,
+    balancer: Arc<RoundRobin>,
+    strategy: ForwardingStrategy,
+    resources: Resources,
+) {
     let address = listener.local_addr().expect("listener has local address");
-    tracing::info!(%address, "listening");
+    tracing::info!(%address, %strategy, "listening");
 
     loop {
         match listener.accept().await {
             Ok((client, peer)) => {
+                // disable nagle  - proxy forwards data immediately, coalescing adds latency
+                if let Err(e) = client.set_nodelay(true) {
+                    tracing::warn!(%peer, error = %e, "failed to set tcp_nodelay");
+                }
+
+                // apply socket buffer tuning if configured
+                #[cfg(target_os = "linux")]
+                if let Some(size) = resources.socket_buffer_size {
+                    use std::os::fd::AsRawFd;
+                    if let Err(e) = crate::util::set_socket_buffer_size(client.as_raw_fd(), size) {
+                        tracing::warn!(%peer, error = %e, "failed to set socket buffer size");
+                    }
+                }
+
                 let balancer = Arc::clone(&balancer);
+                let resources = resources.clone();
                 tokio::spawn(async move {
                     let backend = match balancer.next_backend() {
                         Some(addr) => addr,
@@ -51,7 +72,7 @@ pub async fn serve(listener: TcpListener, balancer: Arc<RoundRobin>) {
                     );
 
                     async {
-                        match l4::forward(client, backend).await {
+                        match l4::forward(client, backend, strategy, &resources).await {
                             Ok(result) => {
                                 tracing::debug!(
                                     sent = result.client_to_backend,

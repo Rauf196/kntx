@@ -6,6 +6,8 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use kntx::balancer::RoundRobin;
 use kntx::config;
 use kntx::listener;
+use kntx::pool::buffer::BufferPool;
+use kntx::proxy::l4::Resources;
 
 #[derive(Parser)]
 #[command(name = "kntx", version, about = "High-performance L4/L7 reverse proxy")]
@@ -53,6 +55,29 @@ fn init_tracing(level: Option<&str>, format: &LogFormat) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn check_fd_limit(pipe_pool: &kntx::pool::pipe::PipePool) {
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
+    if ret == 0 {
+        // each pipe pair = 2 fds, plus headroom for sockets, listeners, etc.
+        let pipe_fds = (pipe_pool.capacity() * 2) as u64;
+        let recommended = pipe_fds + 256; // headroom for sockets, stdout, etc.
+        if rlim.rlim_cur < recommended {
+            tracing::warn!(
+                current = rlim.rlim_cur,
+                recommended,
+                pipe_fds,
+                "ulimit -n is low for the configured pipe pool size. \
+                 run: ulimit -n {recommended}",
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -67,17 +92,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let strategy = config.forwarding.strategy;
+
     tracing::info!(
         listen = %config.listener.address,
         backends = config.backends.len(),
+        %strategy,
         "kntx starting",
     );
 
     let backend_addrs: Vec<_> = config.backends.iter().map(|b| b.address).collect();
     let balancer = Arc::new(RoundRobin::new(backend_addrs));
 
+    let buffer_pool = BufferPool::with_defaults();
+
+    #[cfg(target_os = "linux")]
+    let pipe_pool = kntx::pool::pipe::PipePool::with_defaults()?;
+
+    #[cfg(target_os = "linux")]
+    check_fd_limit(&pipe_pool);
+
+    let resources = Resources {
+        buffer_pool,
+        #[cfg(target_os = "linux")]
+        pipe_pool,
+        socket_buffer_size: config.forwarding.socket_buffer_size,
+    };
+
+    tracing::info!(
+        buffer_pool_capacity = resources.buffer_pool.capacity(),
+        buffer_size = resources.buffer_pool.buffer_size(),
+        "resource pools initialized",
+    );
+
     let tcp_listener = listener::bind(config.listener.address).await?;
-    listener::serve(tcp_listener, balancer).await;
+    listener::serve(tcp_listener, balancer, strategy, resources).await;
 
     Ok(())
 }

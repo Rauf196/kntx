@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -24,6 +25,27 @@ pub enum ConfigError {
     NoBackends,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardingStrategy {
+    #[default]
+    Userspace,
+    Vectored,
+    #[cfg(target_os = "linux")]
+    Splice,
+}
+
+impl fmt::Display for ForwardingStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Userspace => f.write_str("userspace"),
+            Self::Vectored => f.write_str("vectored"),
+            #[cfg(target_os = "linux")]
+            Self::Splice => f.write_str("splice"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub listener: ListenerConfig,
@@ -33,6 +55,16 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+    #[serde(default)]
+    pub forwarding: ForwardingConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ForwardingConfig {
+    #[serde(default)]
+    pub strategy: ForwardingStrategy,
+    /// SO_RCVBUF/SO_SNDBUF size in bytes. None = OS default.
+    pub socket_buffer_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,18 +102,16 @@ pub struct MetricsConfig {
 
 impl Config {
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(Path::new(path)).map_err(|source| {
-            ConfigError::ReadFile {
-                path: path.to_owned(),
-                source,
-            }
-        })?;
-
-        let config: Config =
-            toml::from_str(&content).map_err(|source| ConfigError::Parse {
+        let content =
+            std::fs::read_to_string(Path::new(path)).map_err(|source| ConfigError::ReadFile {
                 path: path.to_owned(),
                 source,
             })?;
+
+        let config: Config = toml::from_str(&content).map_err(|source| ConfigError::Parse {
+            path: path.to_owned(),
+            source,
+        })?;
 
         config.validate()?;
         Ok(config)
@@ -211,7 +241,7 @@ mod tests {
         );
 
         // `backends = []` (inline array) vs `[[backends]]` (table array) parse
-        // differently — either way, no backends means rejection
+        // differently  - either way, no backends means rejection
         let result = Config::from_file(file.path().to_str().unwrap());
         assert!(result.is_err());
     }
@@ -249,6 +279,41 @@ mod tests {
     fn file_not_found() {
         let err = Config::from_file("/nonexistent/path.toml").unwrap_err();
         assert!(matches!(err, ConfigError::ReadFile { .. }));
+    }
+
+    #[test]
+    fn forwarding_strategy_defaults_to_userspace() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.forwarding.strategy, ForwardingStrategy::Userspace);
+    }
+
+    #[test]
+    fn forwarding_strategy_parsed() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [forwarding]
+            strategy = "userspace"
+            "#,
+        );
+
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.forwarding.strategy, ForwardingStrategy::Userspace);
     }
 
     #[test]

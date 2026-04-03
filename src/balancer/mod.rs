@@ -1,15 +1,12 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::util::CacheLinePadded;
+
 pub struct RoundRobin {
     backends: Vec<SocketAddr>,
     index: CacheLinePadded<AtomicUsize>,
 }
-
-// prevent false sharing when multiple cores access the atomic index
-// alongside other hot data. 64 bytes = typical x86 cache line.
-#[repr(align(64))]
-struct CacheLinePadded<T>(T);
 
 impl RoundRobin {
     pub fn new(backends: Vec<SocketAddr>) -> Self {
