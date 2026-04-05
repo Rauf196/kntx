@@ -6,11 +6,13 @@
 // smaller gain than splice (which avoids userspace entirely) but portable.
 
 use std::io::IoSlice;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::pool::buffer::{BufferGuard, BufferPool};
+use crate::util::monotonic_millis;
 
 use super::{Direction, ForwardResult, ProxyError};
 
@@ -23,6 +25,7 @@ pub async fn forward(
     client: TcpStream,
     server: TcpStream,
     buffer_pool: &BufferPool,
+    last_activity: &AtomicU64,
 ) -> Result<ForwardResult, ProxyError> {
     let (client_read, client_write) = client.into_split();
     let (server_read, server_write) = server.into_split();
@@ -33,30 +36,20 @@ pub async fn forward(
     let b2c_bufs = borrow_segments(buffer_pool, SEGMENTS_PER_DIRECTION)
         .ok_or(ProxyError::BufferPoolExhausted)?;
 
-    let c2b = tokio::spawn(copy_vectored(client_read, server_write, c2b_bufs));
-    let b2c = tokio::spawn(copy_vectored(server_read, client_write, b2c_bufs));
+    let (c2b_result, b2c_result) = tokio::join!(
+        copy_vectored(client_read, server_write, c2b_bufs, last_activity),
+        copy_vectored(server_read, client_write, b2c_bufs, last_activity),
+    );
 
-    let (c2b_result, b2c_result) = tokio::join!(c2b, b2c);
+    let client_to_backend = c2b_result.map_err(|source| ProxyError::Forward {
+        direction: Direction::ClientToBackend,
+        source,
+    })?;
 
-    let client_to_backend = c2b_result
-        .map_err(|e| ProxyError::Forward {
-            direction: Direction::ClientToBackend,
-            source: std::io::Error::other(e),
-        })?
-        .map_err(|source| ProxyError::Forward {
-            direction: Direction::ClientToBackend,
-            source,
-        })?;
-
-    let backend_to_client = b2c_result
-        .map_err(|e| ProxyError::Forward {
-            direction: Direction::BackendToClient,
-            source: std::io::Error::other(e),
-        })?
-        .map_err(|source| ProxyError::Forward {
-            direction: Direction::BackendToClient,
-            source,
-        })?;
+    let backend_to_client = b2c_result.map_err(|source| ProxyError::Forward {
+        direction: Direction::BackendToClient,
+        source,
+    })?;
 
     Ok(ForwardResult {
         client_to_backend,
@@ -79,6 +72,7 @@ async fn copy_vectored(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut bufs: Vec<BufferGuard>,
+    last_activity: &AtomicU64,
 ) -> std::io::Result<u64> {
     let mut total = 0u64;
 
@@ -138,6 +132,8 @@ async fn copy_vectored(
                 break;
             }
         }
+
+        last_activity.store(monotonic_millis(), Ordering::Relaxed);
     }
 }
 

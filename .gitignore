@@ -28,4 +28,5 @@ docs/logo/*
 !docs/logo/kntx_no_bg.png
 
 benchmark-results/*
-!benchmark-results/reference/
+!benchmark-results/reference-single/
+!benchmark-results/reference-scale/

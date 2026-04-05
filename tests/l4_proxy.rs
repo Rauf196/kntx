@@ -2,13 +2,14 @@ mod helpers;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use kntx::balancer::RoundRobin;
 use kntx::config::ForwardingStrategy;
-use kntx::listener;
+use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 
@@ -23,6 +24,16 @@ fn test_resources() -> Resources {
     }
 }
 
+fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
+    ServeConfig {
+        strategy,
+        resources: test_resources(),
+        max_connections: None,
+        idle_timeout: None,
+        drain_timeout: Duration::from_secs(5),
+    }
+}
+
 async fn start_proxy(backend_addrs: &[SocketAddr]) -> SocketAddr {
     start_proxy_with_strategy(backend_addrs, ForwardingStrategy::Userspace).await
 }
@@ -30,17 +41,19 @@ async fn start_proxy(backend_addrs: &[SocketAddr]) -> SocketAddr {
 async fn start_proxy_with_strategy(
     backend_addrs: &[SocketAddr],
     strategy: ForwardingStrategy,
-) -> std::net::SocketAddr {
-    let backend_addrs: Vec<_> = backend_addrs.to_vec();
-    let balancer = Arc::new(RoundRobin::new(backend_addrs));
-    let resources = test_resources();
+) -> SocketAddr {
+    let balancer = Arc::new(RoundRobin::new(backend_addrs.to_vec()));
+    let config = test_serve_config(strategy);
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
-        listener::serve(tcp_listener, balancer, strategy, resources).await;
-    });
+    tokio::spawn(listener::serve(
+        tcp_listener,
+        balancer,
+        config,
+        std::future::pending::<()>(),
+    ));
 
     proxy_addr
 }
@@ -86,20 +99,16 @@ async fn round_robin_distribution() {
     let backend_addrs = vec![b1_addr, b2_addr];
     let balancer = Arc::new(RoundRobin::new(backend_addrs));
     let balancer_ref = Arc::clone(&balancer);
-    let resources = test_resources();
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    tokio::spawn(async move {
-        listener::serve(
-            tcp_listener,
-            balancer_ref,
-            ForwardingStrategy::Userspace,
-            resources,
-        )
-        .await;
-    });
+    tokio::spawn(listener::serve(
+        tcp_listener,
+        balancer_ref,
+        test_serve_config(ForwardingStrategy::Userspace),
+        std::future::pending::<()>(),
+    ));
 
     for _ in 0..4 {
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -118,21 +127,7 @@ async fn round_robin_distribution() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backend_unreachable() {
     let dead_addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
-    let balancer = Arc::new(RoundRobin::new(vec![dead_addr]));
-    let resources = test_resources();
-
-    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = tcp_listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        listener::serve(
-            tcp_listener,
-            balancer,
-            ForwardingStrategy::Userspace,
-            resources,
-        )
-        .await;
-    });
+    let proxy_addr = start_proxy(&[dead_addr]).await;
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
 
@@ -141,9 +136,8 @@ async fn backend_unreachable() {
     assert_eq!(n, 0);
 }
 
-// --- large payload integrity test (all strategies) ---
-// verifies no data corruption through each forwarding path with payloads
-// larger than a single buffer (64KB), exercising multi-read/write cycles.
+// large payload (256KB) through each forwarding path to verify no data
+// corruption across multi-read/write cycles.
 
 async fn verify_large_payload(strategy: ForwardingStrategy) {
     let backend = EchoServer::start().await;
@@ -186,8 +180,6 @@ async fn large_payload_splice() {
     verify_large_payload(ForwardingStrategy::Splice).await;
 }
 
-// --- vectored I/O forwarding tests ---
-
 mod vectored_tests {
     use super::*;
 
@@ -225,9 +217,6 @@ mod vectored_tests {
         }
     }
 }
-
-// --- splice forwarding tests (linux only) ---
-// mirror the userspace tests to verify data integrity through the splice path
 
 #[cfg(target_os = "linux")]
 mod splice_tests {
@@ -277,20 +266,16 @@ mod splice_tests {
         let backend_addrs = vec![b1_addr, b2_addr];
         let balancer = Arc::new(RoundRobin::new(backend_addrs));
         let balancer_ref = Arc::clone(&balancer);
-        let resources = test_resources();
 
         let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = tcp_listener.local_addr().unwrap();
 
-        tokio::spawn(async move {
-            listener::serve(
-                tcp_listener,
-                balancer_ref,
-                ForwardingStrategy::Splice,
-                resources,
-            )
-            .await;
-        });
+        tokio::spawn(listener::serve(
+            tcp_listener,
+            balancer_ref,
+            test_serve_config(ForwardingStrategy::Splice),
+            std::future::pending::<()>(),
+        ));
 
         for _ in 0..4 {
             let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -308,21 +293,7 @@ mod splice_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backend_unreachable() {
         let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let balancer = Arc::new(RoundRobin::new(vec![dead_addr]));
-        let resources = test_resources();
-
-        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = tcp_listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            listener::serve(
-                tcp_listener,
-                balancer,
-                ForwardingStrategy::Splice,
-                resources,
-            )
-            .await;
-        });
+        let proxy_addr = start_proxy_with_strategy(&[dead_addr], ForwardingStrategy::Splice).await;
 
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
 

@@ -1,3 +1,14 @@
+use std::sync::LazyLock;
+use std::time::Instant;
+
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// monotonic millisecond timestamp for elapsed-time comparisons.
+/// uses Instant (not SystemTime) to avoid clock skew issues.
+pub fn monotonic_millis() -> u64 {
+    EPOCH.elapsed().as_millis() as u64
+}
+
 // prevent false sharing when multiple cores access adjacent atomic data.
 // 64 bytes = typical x86/arm cache line. aligning shared atomics to cache
 // line boundaries ensures each core's cache line contains only one hot variable.

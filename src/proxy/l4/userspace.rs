@@ -1,13 +1,16 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::pool::buffer::BufferPool;
+use crate::util::monotonic_millis;
 
 use super::{Direction, ForwardResult, ProxyError};
 
 /// forward bytes bidirectionally using pooled userspace buffers.
 ///
-/// two concurrent tasks (one per direction), each doing read -> write in a
+/// two concurrent futures (one per direction), each doing read -> write in a
 /// loop with a buffer borrowed from the pool. when one direction sees EOF,
 /// the write side shuts down to propagate the close,
 /// then wait for the other direction to drain.
@@ -15,6 +18,7 @@ pub async fn forward(
     client: TcpStream,
     server: TcpStream,
     buffer_pool: &BufferPool,
+    last_activity: &AtomicU64,
 ) -> Result<ForwardResult, ProxyError> {
     let (client_read, client_write) = client.into_split();
     let (server_read, server_write) = server.into_split();
@@ -27,32 +31,20 @@ pub async fn forward(
         _ => return Err(ProxyError::BufferPoolExhausted),
     };
 
-    let c2b = tokio::spawn(copy_one_direction(client_read, server_write, c2b_buf));
-    let b2c = tokio::spawn(copy_one_direction(server_read, client_write, b2c_buf));
+    let (c2b_result, b2c_result) = tokio::join!(
+        copy_one_direction(client_read, server_write, c2b_buf, last_activity),
+        copy_one_direction(server_read, client_write, b2c_buf, last_activity),
+    );
 
-    // wait for both directions. if one errors, the other will see a broken pipe
-    // on its next write and terminate naturally.
-    let (c2b_result, b2c_result) = tokio::join!(c2b, b2c);
+    let client_to_backend = c2b_result.map_err(|source| ProxyError::Forward {
+        direction: Direction::ClientToBackend,
+        source,
+    })?;
 
-    let client_to_backend = c2b_result
-        .map_err(|e| ProxyError::Forward {
-            direction: Direction::ClientToBackend,
-            source: std::io::Error::other(e),
-        })?
-        .map_err(|source| ProxyError::Forward {
-            direction: Direction::ClientToBackend,
-            source,
-        })?;
-
-    let backend_to_client = b2c_result
-        .map_err(|e| ProxyError::Forward {
-            direction: Direction::BackendToClient,
-            source: std::io::Error::other(e),
-        })?
-        .map_err(|source| ProxyError::Forward {
-            direction: Direction::BackendToClient,
-            source,
-        })?;
+    let backend_to_client = b2c_result.map_err(|source| ProxyError::Forward {
+        direction: Direction::BackendToClient,
+        source,
+    })?;
 
     Ok(ForwardResult {
         client_to_backend,
@@ -66,6 +58,7 @@ async fn copy_one_direction(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut buf: crate::pool::buffer::BufferGuard,
+    last_activity: &AtomicU64,
 ) -> std::io::Result<u64> {
     let mut total = 0u64;
 
@@ -78,6 +71,7 @@ async fn copy_one_direction(
         }
 
         writer.write_all(&buf[..n]).await?;
+        last_activity.store(monotonic_millis(), Ordering::Relaxed);
         total += n as u64;
     }
 }

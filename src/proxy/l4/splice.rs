@@ -10,11 +10,13 @@
 // AsyncFd provides readiness. avoids double-registering the fd with epoll.
 
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::unix::AsyncFd;
 use tokio::net::TcpStream;
 
 use crate::pool::pipe::{PipeGuard, PipePool};
+use crate::util::monotonic_millis;
 
 use super::{Direction, ForwardResult, ProxyError};
 
@@ -27,6 +29,7 @@ pub async fn forward(
     client: TcpStream,
     server: TcpStream,
     pipe_pool: &PipePool,
+    last_activity: &AtomicU64,
 ) -> Result<ForwardResult, ProxyError> {
     // deregister from tokio's reactor  - AsyncFd handles splice readiness.
     // into_std() converts to std TcpStream, which deregisters the fd.
@@ -60,8 +63,8 @@ pub async fn forward(
     // run both directions concurrently on the same task.
     // join! polls both futures cooperatively  - they yield at readable/writable awaits.
     let (c2b_result, b2c_result) = tokio::join!(
-        splice_one_direction(&async_client, &async_server, &c2b_pipe),
-        splice_one_direction(&async_server, &async_client, &b2c_pipe),
+        splice_one_direction(&async_client, &async_server, &c2b_pipe, last_activity),
+        splice_one_direction(&async_server, &async_client, &b2c_pipe, last_activity),
     );
 
     // client_std/server_std own the fds and must outlive async_client/async_server.
@@ -90,6 +93,7 @@ async fn splice_one_direction(
     src: &AsyncFd<FdWrapper>,
     dst: &AsyncFd<FdWrapper>,
     pipe: &PipeGuard,
+    last_activity: &AtomicU64,
 ) -> std::io::Result<u64> {
     let src_fd = src.get_ref().0;
     let dst_fd = dst.get_ref().0;
@@ -112,6 +116,7 @@ async fn splice_one_direction(
                 }
                 Ok(n) => {
                     guard.retain_ready();
+                    last_activity.store(monotonic_millis(), Ordering::Relaxed);
                     break n;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

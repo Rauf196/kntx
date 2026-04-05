@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# kntx forwarding strategy benchmark
-#
-# compares throughput across: direct, userspace, vectored, splice
-# optionally benchmarks nginx stream mode if nginx is installed
+# kntx multi-stream scaling benchmark
+# multi-stream scaling — how throughput changes with concurrent connections
 #
 # requires: iperf3, cargo, jq
 # optional: nginx with stream module (nginx-mainline + nginx-mainline-mod-stream on arch)
 #
-# usage: ./scripts/benchmark.sh [duration_seconds]
+# usage: ./scripts/benchmark-scale.sh [duration_seconds]
 
 set -euo pipefail
 
-DURATION=${1:-10}
+DURATION=${1:-5}
 PROXY_PORT=8080
 IPERF_PORT=3001
+STREAM_COUNTS="1 10 50 100"
 RESULTS_DIR="benchmark-results"
 KNTX="./target/release/kntx"
 NGINX_CONF="/tmp/kntx-nginx-benchmark.conf"
@@ -43,7 +42,6 @@ check_port() {
 
 has_nginx_stream() {
     command -v nginx >/dev/null 2>&1 || return 1
-    # check if stream module exists
     local mod_path="/usr/lib/nginx/modules/ngx_stream_module.so"
     [[ -f "$mod_path" ]] || return 1
     return 0
@@ -56,16 +54,29 @@ extract_gbps() {
     jq -r '.end.sum_sent.bits_per_second / 1e9 | . * 100 | round / 100' "$file"
 }
 
-run_iperf_test() {
+run_scaled_test() {
     local label="$1"
     local port="$2"
-    local output_file="$RESULTS_DIR/${label}.json"
+    local streams="$3"
+    local output_file="$RESULTS_DIR/scale-${label}-P${streams}.json"
+    iperf3 -c 127.0.0.1 -p "$port" -t "$DURATION" -P "$streams" -J > "$output_file" 2>/dev/null
+    jq -r '.end.sum_sent.bits_per_second / 1e9 | . * 100 | round / 100' "$output_file"
+}
 
-    echo -n "  $(printf '%-20s' "$label")"
-    iperf3 -c 127.0.0.1 -p "$port" -t "$DURATION" -J > "$output_file" 2>/dev/null
-    local gbps
-    gbps=$(extract_gbps "$output_file")
-    echo "$gbps Gbps"
+print_scaling_row() {
+    local label="$1"
+    printf "  %-20s" "$label"
+    for streams in $STREAM_COUNTS; do
+        local f="$RESULTS_DIR/scale-${label}-P${streams}.json"
+        if [[ -f "$f" ]]; then
+            local gbps
+            gbps=$(jq -r '.end.sum_sent.bits_per_second / 1e9 | . * 100 | round / 100' "$f")
+            printf " %-10s" "$gbps"
+        else
+            printf " %-10s" "n/a"
+        fi
+    done
+    echo ""
 }
 
 cleanup() {
@@ -94,11 +105,12 @@ fi
 RESULTS_DIR="$RESULTS_DIR/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RESULTS_DIR"
 
-echo "=== kntx forwarding benchmark ==="
+echo "=== kntx multi-stream scaling benchmark ==="
 echo "date:     $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "kernel:   $(uname -r)"
 echo "cpu:      $(lscpu | grep 'Model name' | sed 's/.*: *//')"
 echo "duration: ${DURATION}s per test"
+echo "streams:  $STREAM_COUNTS"
 if has_nginx_stream; then
     echo "nginx:    $(nginx -v 2>&1 | sed 's/.*\///')"
 else
@@ -128,19 +140,31 @@ rustc:    $(rustc --version)
 kntx:     $(git describe --tags --always --dirty 2>/dev/null || echo "unknown")
 ulimit:   $(ulimit -n)
 duration: ${DURATION}s
+streams:  $STREAM_COUNTS
 $(if has_nginx_stream; then echo "nginx:    $(nginx -v 2>&1)"; fi)
 
 commands:
-  ./scripts/benchmark.sh $DURATION
+  ./scripts/benchmark-scale.sh $DURATION
 EOF
 
+echo "note: default pools — buffer: 1024 (userspace: 2/conn, vectored: 8/conn), pipe: 512 (splice: 2/conn)"
+echo "note: kntx log level set to 'error' — expected teardown warnings at high P are suppressed"
 echo ""
-echo "--- throughput (single stream, ${DURATION}s) ---"
 
-# 1. direct baseline
-run_iperf_test "direct" "$IPERF_PORT"
+# --- direct baseline ---
 
-# 2. kntx forwarding strategies
+echo "--- direct baseline ---"
+for streams in $STREAM_COUNTS; do
+    gbps=$(run_scaled_test "direct" "$IPERF_PORT" "$streams")
+    printf "    P=%-4s %s Gbps\n" "$streams" "$gbps"
+done
+
+# --- scaling tests ---
+
+echo ""
+echo "--- throughput scaling (multi-stream, ${DURATION}s per test) ---"
+echo ""
+
 KNTX_PID=""
 for strategy in userspace vectored splice; do
     cat > /tmp/kntx-bench-${strategy}.toml <<EOF
@@ -154,14 +178,18 @@ address = "127.0.0.1:$IPERF_PORT"
 strategy = "$strategy"
 
 [logging]
-level = "warn"
+level = "error"
 EOF
 
+    echo "  kntx-${strategy}:"
     $KNTX -c "/tmp/kntx-bench-${strategy}.toml" &
     KNTX_PID=$!
     sleep 0.5
 
-    run_iperf_test "kntx-$strategy" "$PROXY_PORT"
+    for streams in $STREAM_COUNTS; do
+        gbps=$(run_scaled_test "kntx-${strategy}" "$PROXY_PORT" "$streams")
+        printf "    P=%-4s %s Gbps\n" "$streams" "$gbps"
+    done
 
     kill "$KNTX_PID" 2>/dev/null
     wait "$KNTX_PID" 2>/dev/null || true
@@ -169,7 +197,6 @@ EOF
     sleep 0.3
 done
 
-# 3. nginx stream mode (if available)
 if has_nginx_stream; then
     cat > "$NGINX_CONF" <<EOF
 load_module /usr/lib/nginx/modules/ngx_stream_module.so;
@@ -192,28 +219,43 @@ stream {
 }
 EOF
 
+    echo "  nginx-stream:"
     nginx -c "$NGINX_CONF" 2>/dev/null
     sleep 0.5
 
-    run_iperf_test "nginx-stream" "$PROXY_PORT"
+    for streams in $STREAM_COUNTS; do
+        gbps=$(run_scaled_test "nginx-stream" "$PROXY_PORT" "$streams")
+        printf "    P=%-4s %s Gbps\n" "$streams" "$gbps"
+    done
 
     nginx -s stop -c "$NGINX_CONF" 2>/dev/null
     sleep 0.3
 fi
 
-# --- summary ---
+# --- scaling summary ---
 
 echo ""
-echo "--- summary ---"
+echo "--- scaling summary ---"
 echo ""
-printf "  %-20s %s\n" "PATH" "THROUGHPUT"
-printf "  %-20s %s\n" "----" "----------"
-
-for f in "$RESULTS_DIR"/*.json; do
-    label=$(basename "$f" .json)
-    gbps=$(extract_gbps "$f")
-    printf "  %-20s %s Gbps\n" "$label" "$gbps"
+printf "  %-20s" "STRATEGY"
+for streams in $STREAM_COUNTS; do
+    printf " %-10s" "P=${streams}"
 done
+printf " %s\n" "Gbps"
+printf "  %-20s" "----"
+for streams in $STREAM_COUNTS; do
+    printf " %-10s" "----"
+done
+echo ""
+
+print_scaling_row "direct"
+for strategy in userspace vectored splice; do
+    print_scaling_row "kntx-${strategy}"
+done
+
+if has_nginx_stream; then
+    print_scaling_row "nginx-stream"
+fi
 
 echo ""
 echo "results saved to $RESULTS_DIR/"

@@ -1,11 +1,12 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use kntx::balancer::RoundRobin;
 use kntx::config;
-use kntx::listener;
+use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 
@@ -55,6 +56,27 @@ fn init_tracing(level: Option<&str>, format: &LogFormat) {
     }
 }
 
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => { tracing::info!("received SIGINT"); }
+            _ = sigterm.recv() => { tracing::info!("received SIGTERM"); }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.expect("failed to listen for ctrl-c");
+        tracing::info!("received SIGINT");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn check_fd_limit(pipe_pool: &kntx::pool::pipe::PipePool) {
     let mut rlim = libc::rlimit {
@@ -92,6 +114,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if let Some(ref metrics_config) = config.metrics {
+        kntx::metrics::install(metrics_config.address)?;
+        tracing::info!(address = %metrics_config.address, "metrics endpoint started");
+    }
+
     let strategy = config.forwarding.strategy;
 
     tracing::info!(
@@ -125,8 +152,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "resource pools initialized",
     );
 
-    let tcp_listener = listener::bind(config.listener.address).await?;
-    listener::serve(tcp_listener, balancer, strategy, resources).await;
+    let serve_config = ServeConfig {
+        strategy: config.forwarding.strategy,
+        resources,
+        max_connections: config.listener.max_connections,
+        idle_timeout: config.connection.idle_timeout_secs.map(Duration::from_secs),
+        drain_timeout: Duration::from_secs(config.listener.drain_timeout_secs),
+    };
 
+    let tcp_listener = listener::bind(config.listener.address).await?;
+    listener::serve(tcp_listener, balancer, serve_config, shutdown_signal()).await;
+
+    tracing::info!("kntx stopped");
     Ok(())
 }

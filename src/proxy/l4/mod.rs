@@ -6,6 +6,7 @@ pub mod splice;
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -102,17 +103,20 @@ pub async fn forward(
     backend: SocketAddr,
     strategy: ForwardingStrategy,
     resources: &Resources,
+    last_activity: &AtomicU64,
 ) -> Result<ForwardResult, ProxyError> {
     let server = connect_backend(backend, resources.socket_buffer_size).await?;
 
     match strategy {
         ForwardingStrategy::Userspace => {
-            userspace::forward(client, server, &resources.buffer_pool).await
+            userspace::forward(client, server, &resources.buffer_pool, last_activity).await
         }
         ForwardingStrategy::Vectored => {
-            vectored::forward(client, server, &resources.buffer_pool).await
+            vectored::forward(client, server, &resources.buffer_pool, last_activity).await
         }
         #[cfg(target_os = "linux")]
-        ForwardingStrategy::Splice => splice::forward(client, server, &resources.pipe_pool).await,
+        ForwardingStrategy::Splice => {
+            splice::forward(client, server, &resources.pipe_pool, last_activity).await
+        }
     }
 }

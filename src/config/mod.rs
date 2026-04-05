@@ -23,6 +23,12 @@ pub enum ConfigError {
 
     #[error("no backends configured")]
     NoBackends,
+
+    #[error("invalid value for '{field}': {reason}")]
+    InvalidValue {
+        field: &'static str,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -57,6 +63,8 @@ pub struct Config {
     pub metrics: Option<MetricsConfig>,
     #[serde(default)]
     pub forwarding: ForwardingConfig,
+    #[serde(default)]
+    pub connection: ConnectionConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,6 +78,21 @@ pub struct ForwardingConfig {
 #[derive(Debug, Deserialize)]
 pub struct ListenerConfig {
     pub address: SocketAddr,
+    /// max concurrent connections. None = unlimited.
+    pub max_connections: Option<usize>,
+    /// seconds to wait for in-flight connections during shutdown. default 30.
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout_secs: u64,
+}
+
+fn default_drain_timeout() -> u64 {
+    30
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ConnectionConfig {
+    /// close connections with no data transfer for this many seconds. None = no timeout.
+    pub idle_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +143,18 @@ impl Config {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.backends.is_empty() {
             return Err(ConfigError::NoBackends);
+        }
+        if self.listener.max_connections == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "listener.max_connections",
+                reason: "must be at least 1".to_owned(),
+            });
+        }
+        if self.connection.idle_timeout_secs == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "connection.idle_timeout_secs",
+                reason: "must be at least 1".to_owned(),
+            });
         }
         Ok(())
     }
@@ -322,5 +357,39 @@ mod tests {
 
         let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn reject_zero_max_connections() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+            max_connections = 0
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn reject_zero_idle_timeout() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [connection]
+            idle_timeout_secs = 0
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
     }
 }
