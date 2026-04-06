@@ -88,7 +88,10 @@ impl HalfCloseServer {
             }
         });
 
-        Self { addr, _shutdown: shutdown_tx }
+        Self {
+            addr,
+            _shutdown: shutdown_tx,
+        }
     }
 }
 
@@ -125,6 +128,9 @@ impl DyingServer {
             }
         });
 
-        Self { addr, _shutdown: shutdown_tx }
+        Self {
+            addr,
+            _shutdown: shutdown_tx,
+        }
     }
 }

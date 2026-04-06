@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 
 use kntx::balancer::RoundRobin;
 use kntx::config::ForwardingStrategy;
+use kntx::health::BackendPool;
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
@@ -26,6 +27,10 @@ fn test_resources() -> Resources {
     }
 }
 
+fn test_pool(addrs: &[SocketAddr]) -> Arc<BackendPool> {
+    Arc::new(BackendPool::new(addrs.to_vec(), 3, Duration::from_secs(10)))
+}
+
 fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
     ServeConfig {
         strategy,
@@ -33,6 +38,8 @@ fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
         max_connections: None,
         idle_timeout: None,
         drain_timeout: Duration::from_secs(5),
+        connect_timeout: Duration::from_secs(5),
+        max_connect_attempts: 3,
     }
 }
 
@@ -45,7 +52,7 @@ async fn start_proxy(backend_addrs: &[SocketAddr]) -> SocketAddr {
 }
 
 async fn start_proxy_with_config(backend_addrs: &[SocketAddr], config: ServeConfig) -> SocketAddr {
-    let balancer = Arc::new(RoundRobin::new(backend_addrs.to_vec()));
+    let balancer = Arc::new(RoundRobin::new(test_pool(backend_addrs)));
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
@@ -77,6 +84,8 @@ async fn pool_exhaustion_degrades_gracefully() {
         max_connections: None,
         idle_timeout: None,
         drain_timeout: Duration::from_secs(5),
+        connect_timeout: Duration::from_secs(5),
+        max_connect_attempts: 3,
     };
 
     let proxy_addr = start_proxy_with_config(&[backend.addr], config).await;
@@ -100,7 +109,10 @@ async fn pool_exhaustion_degrades_gracefully() {
     }
 
     assert!(success >= 1, "at least one connection should succeed");
-    assert!(rejected >= 1, "some connections should be rejected (pool exhausted)");
+    assert!(
+        rejected >= 1,
+        "some connections should be rejected (pool exhausted)"
+    );
 
     // drop all connections, let buffers return to pool
     drop(streams);

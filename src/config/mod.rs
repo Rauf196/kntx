@@ -25,10 +25,7 @@ pub enum ConfigError {
     NoBackends,
 
     #[error("invalid value for '{field}': {reason}")]
-    InvalidValue {
-        field: &'static str,
-        reason: String,
-    },
+    InvalidValue { field: &'static str, reason: String },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -65,6 +62,8 @@ pub struct Config {
     pub forwarding: ForwardingConfig,
     #[serde(default)]
     pub connection: ConnectionConfig,
+    #[serde(default)]
+    pub health: HealthConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -89,10 +88,65 @@ fn default_drain_timeout() -> u64 {
     30
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct ConnectionConfig {
     /// close connections with no data transfer for this many seconds. None = no timeout.
+    #[serde(default)]
     pub idle_timeout_secs: Option<u64>,
+    /// timeout for connecting to a backend. default 5s.
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    /// max connect attempts before giving up and closing the client connection. default 3.
+    #[serde(default = "default_max_connect_attempts")]
+    pub max_connect_attempts: u32,
+}
+
+impl Default for ConnectionConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: None,
+            connect_timeout_secs: default_connect_timeout(),
+            max_connect_attempts: default_max_connect_attempts(),
+        }
+    }
+}
+
+fn default_connect_timeout() -> u64 {
+    5
+}
+
+fn default_max_connect_attempts() -> u32 {
+    3
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HealthConfig {
+    /// active probe interval in seconds. None = no active health checks.
+    pub check_interval_secs: Option<u64>,
+    /// consecutive failures before circuit opens. default 3.
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    /// seconds to wait in Open state before allowing a probe. default 10.
+    #[serde(default = "default_recovery_timeout")]
+    pub recovery_timeout_secs: u64,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            check_interval_secs: None,
+            failure_threshold: default_failure_threshold(),
+            recovery_timeout_secs: default_recovery_timeout(),
+        }
+    }
+}
+
+fn default_failure_threshold() -> u32 {
+    3
+}
+
+fn default_recovery_timeout() -> u64 {
+    10
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +207,30 @@ impl Config {
         if self.connection.idle_timeout_secs == Some(0) {
             return Err(ConfigError::InvalidValue {
                 field: "connection.idle_timeout_secs",
+                reason: "must be at least 1".to_owned(),
+            });
+        }
+        if self.connection.connect_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "connection.connect_timeout_secs",
+                reason: "must be at least 1".to_owned(),
+            });
+        }
+        if self.health.failure_threshold == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "health.failure_threshold",
+                reason: "must be at least 1".to_owned(),
+            });
+        }
+        if self.health.recovery_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "health.recovery_timeout_secs",
+                reason: "must be at least 1".to_owned(),
+            });
+        }
+        if self.health.check_interval_secs == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "health.check_interval_secs",
                 reason: "must be at least 1".to_owned(),
             });
         }
@@ -387,6 +465,137 @@ mod tests {
 
             [connection]
             idle_timeout_secs = 0
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn connection_defaults_applied() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.connection.connect_timeout_secs, 5);
+        assert_eq!(config.connection.max_connect_attempts, 3);
+        assert!(config.connection.idle_timeout_secs.is_none());
+    }
+
+    #[test]
+    fn health_defaults_applied_when_section_omitted() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert!(config.health.check_interval_secs.is_none());
+        assert_eq!(config.health.failure_threshold, 3);
+        assert_eq!(config.health.recovery_timeout_secs, 10);
+    }
+
+    #[test]
+    fn health_values_parsed() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [health]
+            check_interval_secs = 5
+            failure_threshold = 2
+            recovery_timeout_secs = 30
+            "#,
+        );
+
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.health.check_interval_secs, Some(5));
+        assert_eq!(config.health.failure_threshold, 2);
+        assert_eq!(config.health.recovery_timeout_secs, 30);
+    }
+
+    #[test]
+    fn reject_zero_connect_timeout() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [connection]
+            connect_timeout_secs = 0
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn reject_zero_failure_threshold() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [health]
+            failure_threshold = 0
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn reject_zero_recovery_timeout() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [health]
+            recovery_timeout_secs = 0
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn reject_zero_check_interval() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [health]
+            check_interval_secs = 0
             "#,
         );
         let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();

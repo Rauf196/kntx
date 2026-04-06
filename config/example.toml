@@ -25,3 +25,10 @@ address = "0.0.0.0:9090"
 
 [connection]
 # idle_timeout_secs = 300
+# connect_timeout_secs = 5
+# max_connect_attempts = 3
+
+# [health]
+# check_interval_secs = 5    # active TCP probes (omit to disable)
+# failure_threshold = 3       # consecutive failures before circuit opens
+# recovery_timeout_secs = 10  # wait before half-open probe

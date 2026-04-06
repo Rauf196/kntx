@@ -7,6 +7,7 @@ pub mod splice;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -33,6 +34,9 @@ pub enum ProxyError {
         #[source]
         source: io::Error,
     },
+
+    #[error("connect timeout to backend {backend}")]
+    BackendConnectTimeout { backend: SocketAddr },
 
     #[error("forwarding failed: {direction}")]
     Forward {
@@ -70,12 +74,14 @@ pub struct ForwardResult {
 
 /// connect to backend and apply socket tuning (TCP_NODELAY, buffer sizes).
 /// centralized here so each forwarding strategy doesn't repeat this.
-async fn connect_backend(
+pub async fn connect_backend(
     backend: SocketAddr,
+    connect_timeout: Duration,
     socket_buffer_size: Option<usize>,
 ) -> Result<TcpStream, ProxyError> {
-    let server = TcpStream::connect(backend)
+    let server = tokio::time::timeout(connect_timeout, TcpStream::connect(backend))
         .await
+        .map_err(|_| ProxyError::BackendConnectTimeout { backend })?
         .map_err(|source| ProxyError::BackendConnect { backend, source })?;
 
     if let Err(e) = server.set_nodelay(true) {
@@ -97,16 +103,14 @@ async fn connect_backend(
     Ok(server)
 }
 
-/// dispatch to the configured forwarding strategy
-pub async fn forward(
+/// dispatch to the configured forwarding strategy on already-connected streams.
+pub async fn forward_connected(
     client: TcpStream,
-    backend: SocketAddr,
+    server: TcpStream,
     strategy: ForwardingStrategy,
     resources: &Resources,
     last_activity: &AtomicU64,
 ) -> Result<ForwardResult, ProxyError> {
-    let server = connect_backend(backend, resources.socket_buffer_size).await?;
-
     match strategy {
         ForwardingStrategy::Userspace => {
             userspace::forward(client, server, &resources.buffer_pool, last_activity).await

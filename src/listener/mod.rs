@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -30,6 +30,8 @@ pub struct ServeConfig {
     pub max_connections: Option<usize>,
     pub idle_timeout: Option<Duration>,
     pub drain_timeout: Duration,
+    pub connect_timeout: Duration,
+    pub max_connect_attempts: u32,
 }
 
 pub async fn bind(address: SocketAddr) -> Result<TcpListener, ListenerError> {
@@ -68,6 +70,8 @@ pub async fn serve(
     let idle_timeout = config.idle_timeout;
     let strategy = config.strategy;
     let drain_timeout = config.drain_timeout;
+    let connect_timeout = config.connect_timeout;
+    let max_connect_attempts = config.max_connect_attempts;
 
     let mut tasks: JoinSet<()> = JoinSet::new();
     tokio::pin!(shutdown);
@@ -115,34 +119,57 @@ pub async fn serve(
                             // permit held for connection lifetime — dropped on task end
                             let _permit = permit;
 
-                            let backend = match balancer.next_backend() {
-                                Some(addr) => addr,
-                                None => {
-                                    tracing::warn!(%peer, "no backends available");
-                                    metrics::gauge!("kntx_connections_active").decrement(1.0);
-                                    return;
+                            let pool = balancer.pool();
+
+                            // retry loop: try connecting to successive healthy backends
+                            let mut attempts = 0u32;
+                            let (backend_addr, server) = loop {
+                                let addr = match balancer.next_backend() {
+                                    Some(a) => a,
+                                    None => {
+                                        tracing::warn!(%peer, "no healthy backends available");
+                                        metrics::gauge!("kntx_connections_active").decrement(1.0);
+                                        return;
+                                    }
+                                };
+
+                                match l4::connect_backend(addr, connect_timeout, resources.socket_buffer_size).await {
+                                    Ok(server) => break (addr, server),
+                                    Err(e) => {
+                                        pool.record_failure(addr);
+                                        attempts += 1;
+                                        metrics::counter!("kntx_connect_retries_total").increment(1);
+                                        if attempts >= max_connect_attempts {
+                                            tracing::warn!(%peer, attempts, "all retry attempts exhausted");
+                                            metrics::gauge!("kntx_connections_active").decrement(1.0);
+                                            return;
+                                        }
+                                        tracing::debug!(%peer, %addr, attempt = attempts, error = %e, "retrying");
+                                    }
                                 }
                             };
 
-                            let span = tracing::info_span!("conn", %peer, %backend);
+                            // span created after retry so backend address is known
+                            let span = tracing::info_span!("conn", %peer, backend = %backend_addr);
 
                             async {
                                 let last_activity = AtomicU64::new(monotonic_millis());
 
                                 let result = if let Some(timeout) = idle_timeout {
                                     tokio::select! {
-                                        result = l4::forward(client, backend, strategy, &resources, &last_activity) => Some(result),
+                                        result = l4::forward_connected(client, server, strategy, &resources, &last_activity) => Some(result),
                                         _ = idle_watchdog(&last_activity, timeout) => {
                                             tracing::info!("idle timeout");
                                             None
                                         }
                                     }
                                 } else {
-                                    Some(l4::forward(client, backend, strategy, &resources, &last_activity).await)
+                                    Some(l4::forward_connected(client, server, strategy, &resources, &last_activity).await)
                                 };
 
                                 match result {
                                     Some(Ok(fwd)) => {
+                                        pool.record_success(backend_addr);
                                         metrics::counter!("kntx_forwarded_bytes_total", "direction" => "client_to_backend")
                                             .increment(fwd.client_to_backend);
                                         metrics::counter!("kntx_forwarded_bytes_total", "direction" => "backend_to_client")
@@ -154,6 +181,7 @@ pub async fn serve(
                                         );
                                     }
                                     Some(Err(e)) => {
+                                        pool.record_failure(backend_addr);
                                         tracing::warn!(error = %e, "connection failed");
                                     }
                                     None => {

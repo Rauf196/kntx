@@ -6,6 +6,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use kntx::balancer::RoundRobin;
 use kntx::config;
+use kntx::health::{BackendPool, HealthChecker};
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
@@ -129,7 +130,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let backend_addrs: Vec<_> = config.backends.iter().map(|b| b.address).collect();
-    let balancer = Arc::new(RoundRobin::new(backend_addrs));
+
+    let pool = Arc::new(BackendPool::new(
+        backend_addrs,
+        config.health.failure_threshold,
+        Duration::from_secs(config.health.recovery_timeout_secs),
+    ));
+
+    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+
+    if config.metrics.is_some() {
+        pool.emit_initial_metrics();
+    }
+
+    if let Some(interval_secs) = config.health.check_interval_secs {
+        let checker = HealthChecker::new(
+            Arc::clone(&pool),
+            Duration::from_secs(interval_secs),
+            Duration::from_secs(config.connection.connect_timeout_secs),
+        );
+        checker.spawn();
+        tracing::info!(interval_secs, "health checker started");
+    }
 
     let buffer_pool = BufferPool::with_defaults();
 
@@ -158,6 +180,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_connections: config.listener.max_connections,
         idle_timeout: config.connection.idle_timeout_secs.map(Duration::from_secs),
         drain_timeout: Duration::from_secs(config.listener.drain_timeout_secs),
+        connect_timeout: Duration::from_secs(config.connection.connect_timeout_secs),
+        max_connect_attempts: config.connection.max_connect_attempts,
     };
 
     let tcp_listener = listener::bind(config.listener.address).await?;

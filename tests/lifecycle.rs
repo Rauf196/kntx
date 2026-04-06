@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 
 use kntx::balancer::RoundRobin;
 use kntx::config::ForwardingStrategy;
+use kntx::health::BackendPool;
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
@@ -25,6 +26,10 @@ fn test_resources() -> Resources {
     }
 }
 
+fn test_pool(addrs: &[SocketAddr]) -> Arc<BackendPool> {
+    Arc::new(BackendPool::new(addrs.to_vec(), 3, Duration::from_secs(10)))
+}
+
 fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
     ServeConfig {
         strategy,
@@ -32,6 +37,8 @@ fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
         max_connections: None,
         idle_timeout: None,
         drain_timeout: Duration::from_secs(5),
+        connect_timeout: Duration::from_secs(5),
+        max_connect_attempts: 3,
     }
 }
 
@@ -44,7 +51,7 @@ async fn start_proxy(backend_addrs: &[SocketAddr]) -> SocketAddr {
 }
 
 async fn start_proxy_with_config(backend_addrs: &[SocketAddr], config: ServeConfig) -> SocketAddr {
-    let balancer = Arc::new(RoundRobin::new(backend_addrs.to_vec()));
+    let balancer = Arc::new(RoundRobin::new(test_pool(backend_addrs)));
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
@@ -103,6 +110,8 @@ async fn idle_timeout_closes_connection() {
         max_connections: None,
         idle_timeout: Some(Duration::from_secs(1)),
         drain_timeout: Duration::from_secs(5),
+        connect_timeout: Duration::from_secs(5),
+        max_connect_attempts: 3,
     };
 
     let proxy_addr = start_proxy_with_config(&[backend.addr], config).await;
@@ -133,6 +142,8 @@ async fn max_connections_rejects_excess() {
         max_connections: Some(2),
         idle_timeout: None,
         drain_timeout: Duration::from_secs(5),
+        connect_timeout: Duration::from_secs(5),
+        max_connect_attempts: 3,
     };
 
     let proxy_addr = start_proxy_with_config(&[backend.addr], config).await;
@@ -173,13 +184,16 @@ async fn max_connections_rejects_excess() {
 async fn graceful_shutdown_drains_connections() {
     let backend = EchoServer::start().await;
 
-    let balancer = Arc::new(RoundRobin::new(vec![backend.addr]));
+    let pool = test_pool(&[backend.addr]);
+    let balancer = Arc::new(RoundRobin::new(pool));
     let config = ServeConfig {
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
         idle_timeout: None,
         drain_timeout: Duration::from_secs(5),
+        connect_timeout: Duration::from_secs(5),
+        max_connect_attempts: 3,
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -187,12 +201,9 @@ async fn graceful_shutdown_drains_connections() {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    let serve_handle = tokio::spawn(listener::serve(
-        tcp_listener,
-        balancer,
-        config,
-        async { let _ = shutdown_rx.await; },
-    ));
+    let serve_handle = tokio::spawn(listener::serve(tcp_listener, balancer, config, async {
+        let _ = shutdown_rx.await;
+    }));
 
     // establish a connection
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();

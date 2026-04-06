@@ -9,6 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use kntx::balancer::RoundRobin;
 use kntx::config::ForwardingStrategy;
+use kntx::health::BackendPool;
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
@@ -24,6 +25,10 @@ fn test_resources() -> Resources {
     }
 }
 
+fn test_pool(addrs: &[SocketAddr]) -> Arc<BackendPool> {
+    Arc::new(BackendPool::new(addrs.to_vec(), 3, Duration::from_secs(10)))
+}
+
 fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
     ServeConfig {
         strategy,
@@ -31,6 +36,8 @@ fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
         max_connections: None,
         idle_timeout: None,
         drain_timeout: Duration::from_secs(5),
+        connect_timeout: Duration::from_secs(5),
+        max_connect_attempts: 3,
     }
 }
 
@@ -42,7 +49,7 @@ async fn start_proxy_with_strategy(
     backend_addrs: &[SocketAddr],
     strategy: ForwardingStrategy,
 ) -> SocketAddr {
-    let balancer = Arc::new(RoundRobin::new(backend_addrs.to_vec()));
+    let balancer = Arc::new(RoundRobin::new(test_pool(backend_addrs)));
     let config = test_serve_config(strategy);
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -96,8 +103,8 @@ async fn round_robin_distribution() {
     let b1_addr = b1.addr;
     let b2_addr = b2.addr;
 
-    let backend_addrs = vec![b1_addr, b2_addr];
-    let balancer = Arc::new(RoundRobin::new(backend_addrs));
+    let pool = test_pool(&[b1_addr, b2_addr]);
+    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
     let balancer_ref = Arc::clone(&balancer);
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -263,8 +270,8 @@ mod splice_tests {
         let b1_addr = b1.addr;
         let b2_addr = b2.addr;
 
-        let backend_addrs = vec![b1_addr, b2_addr];
-        let balancer = Arc::new(RoundRobin::new(backend_addrs));
+        let pool = test_pool(&[b1_addr, b2_addr]);
+        let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
         let balancer_ref = Arc::clone(&balancer);
 
         let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
