@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::pool::buffer::BufferPool;
@@ -23,6 +23,41 @@ pub async fn forward(
     let (client_read, client_write) = client.into_split();
     let (server_read, server_write) = server.into_split();
 
+    forward_halves(client_read, client_write, server_read, server_write, buffer_pool, last_activity).await
+}
+
+/// forward a TLS client stream to a plain TCP backend using pooled userspace buffers.
+///
+/// splice is impossible after TLS termination — decrypted bytes live in userspace.
+/// this function always uses userspace copy regardless of configured strategy.
+pub async fn forward_tls(
+    client: tokio_rustls::server::TlsStream<TcpStream>,
+    server: TcpStream,
+    buffer_pool: &BufferPool,
+    last_activity: &AtomicU64,
+) -> Result<ForwardResult, ProxyError> {
+    // tokio::io::split handles the Mutex-based split required for TLS streams
+    // (TLS state is shared between read and write halves)
+    let (client_read, client_write) = tokio::io::split(client);
+    let (server_read, server_write) = server.into_split();
+
+    forward_halves(client_read, client_write, server_read, server_write, buffer_pool, last_activity).await
+}
+
+async fn forward_halves<CR, CW, SR, SW>(
+    client_read: CR,
+    client_write: CW,
+    server_read: SR,
+    server_write: SW,
+    buffer_pool: &BufferPool,
+    last_activity: &AtomicU64,
+) -> Result<ForwardResult, ProxyError>
+where
+    CR: AsyncRead + Unpin,
+    CW: AsyncWrite + Unpin,
+    SR: AsyncRead + Unpin,
+    SW: AsyncWrite + Unpin,
+{
     let c2b_buf = buffer_pool.get();
     let b2c_buf = buffer_pool.get();
 
@@ -54,12 +89,16 @@ pub async fn forward(
 
 /// copy bytes from reader to writer using the provided buffer.
 /// returns total bytes transferred. shuts down the writer on EOF.
-async fn copy_one_direction(
-    mut reader: tokio::net::tcp::OwnedReadHalf,
-    mut writer: tokio::net::tcp::OwnedWriteHalf,
+async fn copy_one_direction<R, W>(
+    mut reader: R,
+    mut writer: W,
     mut buf: crate::pool::buffer::BufferGuard,
     last_activity: &AtomicU64,
-) -> std::io::Result<u64> {
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut total = 0u64;
 
     loop {

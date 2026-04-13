@@ -103,6 +103,19 @@ pub async fn connect_backend(
     Ok(server)
 }
 
+/// forward a TLS-terminated client stream to a plain TCP backend.
+///
+/// always uses userspace — splice cannot operate on decrypted bytes in userspace.
+/// the function signature itself encodes this: no strategy parameter.
+pub async fn forward_tls(
+    client: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    server: TcpStream,
+    resources: &Resources,
+    last_activity: &AtomicU64,
+) -> Result<ForwardResult, ProxyError> {
+    userspace::forward_tls(client, server, &resources.buffer_pool, last_activity).await
+}
+
 /// dispatch to the configured forwarding strategy on already-connected streams.
 pub async fn forward_connected(
     client: TcpStream,

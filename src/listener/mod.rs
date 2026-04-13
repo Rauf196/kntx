@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use thiserror::Error;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::Instrument;
 
@@ -32,6 +32,13 @@ pub struct ServeConfig {
     pub drain_timeout: Duration,
     pub connect_timeout: Duration,
     pub max_connect_attempts: u32,
+    pub tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    pub tls_handshake_timeout: Duration,
+}
+
+enum ClientConn {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
 }
 
 pub async fn bind(address: SocketAddr) -> Result<TcpListener, ListenerError> {
@@ -72,6 +79,8 @@ pub async fn serve(
     let drain_timeout = config.drain_timeout;
     let connect_timeout = config.connect_timeout;
     let max_connect_attempts = config.max_connect_attempts;
+    let tls_acceptor = config.tls_acceptor;
+    let tls_handshake_timeout = config.tls_handshake_timeout;
 
     let mut tasks: JoinSet<()> = JoinSet::new();
     tokio::pin!(shutdown);
@@ -114,10 +123,63 @@ pub async fn serve(
 
                         let balancer = Arc::clone(&balancer);
                         let resources = config.resources.clone();
+                        let tls_acceptor = tls_acceptor.clone();
 
                         tasks.spawn(async move {
                             // permit held for connection lifetime — dropped on task end
                             let _permit = permit;
+
+                            // TLS handshake (if TLS is configured) runs in the spawned task,
+                            // not in the accept loop — a slow handshake here doesn't block accepts
+                            let client_conn = if let Some(acceptor) = tls_acceptor {
+                                let handshake_start = std::time::Instant::now();
+                                match tokio::time::timeout(
+                                    tls_handshake_timeout,
+                                    acceptor.accept(client),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(tls)) => {
+                                        let duration = handshake_start.elapsed();
+                                        metrics::histogram!(
+                                            "kntx_tls_handshake_duration_seconds"
+                                        )
+                                        .record(duration.as_secs_f64());
+                                        metrics::counter!("kntx_tls_handshakes_total")
+                                            .increment(1);
+
+                                        if let Some(sni) = tls.get_ref().1.server_name() {
+                                            tracing::debug!(%peer, %sni, "TLS handshake completed");
+                                        } else {
+                                            tracing::debug!(%peer, "TLS handshake completed (no SNI)");
+                                        }
+
+                                        ClientConn::Tls(Box::new(tls))
+                                    }
+                                    Ok(Err(e)) => {
+                                        tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                                        metrics::counter!(
+                                            "kntx_tls_handshake_failures_total",
+                                            "reason" => "protocol_error"
+                                        )
+                                        .increment(1);
+                                        metrics::gauge!("kntx_connections_active").decrement(1.0);
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        tracing::debug!(%peer, "TLS handshake timed out");
+                                        metrics::counter!(
+                                            "kntx_tls_handshake_failures_total",
+                                            "reason" => "timeout"
+                                        )
+                                        .increment(1);
+                                        metrics::gauge!("kntx_connections_active").decrement(1.0);
+                                        return;
+                                    }
+                                }
+                            } else {
+                                ClientConn::Plain(client)
+                            };
 
                             let pool = balancer.pool();
 
@@ -155,16 +217,27 @@ pub async fn serve(
                             async {
                                 let last_activity = AtomicU64::new(monotonic_millis());
 
+                                let forward_fut = async {
+                                    match client_conn {
+                                        ClientConn::Plain(tcp) => {
+                                            l4::forward_connected(tcp, server, strategy, &resources, &last_activity).await
+                                        }
+                                        ClientConn::Tls(tls) => {
+                                            l4::forward_tls(*tls, server, &resources, &last_activity).await
+                                        }
+                                    }
+                                };
+
                                 let result = if let Some(timeout) = idle_timeout {
                                     tokio::select! {
-                                        result = l4::forward_connected(client, server, strategy, &resources, &last_activity) => Some(result),
+                                        result = forward_fut => Some(result),
                                         _ = idle_watchdog(&last_activity, timeout) => {
                                             tracing::info!("idle timeout");
                                             None
                                         }
                                     }
                                 } else {
-                                    Some(l4::forward_connected(client, server, strategy, &resources, &last_activity).await)
+                                    Some(forward_fut.await)
                                 };
 
                                 match result {

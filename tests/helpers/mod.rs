@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod tls;
+
 use std::net::SocketAddr;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

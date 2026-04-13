@@ -174,6 +174,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "resource pools initialized",
     );
 
+    let tls_acceptor = if let Some(ref tls_config) = config.tls {
+        let acceptor = kntx::tls::build_acceptor(tls_config)?;
+        tracing::info!(
+            certificates = tls_config.certificates.len(),
+            min_version = %tls_config.min_version,
+            "TLS termination enabled",
+        );
+        #[cfg(target_os = "linux")]
+        if matches!(strategy, kntx::config::ForwardingStrategy::Splice) {
+            tracing::info!(
+                "TLS connections will use userspace forwarding (splice requires plain TCP)",
+            );
+        }
+        Some(acceptor)
+    } else {
+        None
+    };
+
+    let tls_handshake_timeout = config
+        .tls
+        .as_ref()
+        .map(|t| Duration::from_secs(t.handshake_timeout_secs))
+        .unwrap_or(Duration::from_secs(5));
+
     let serve_config = ServeConfig {
         strategy: config.forwarding.strategy,
         resources,
@@ -182,6 +206,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         drain_timeout: Duration::from_secs(config.listener.drain_timeout_secs),
         connect_timeout: Duration::from_secs(config.connection.connect_timeout_secs),
         max_connect_attempts: config.connection.max_connect_attempts,
+        tls_acceptor,
+        tls_handshake_timeout,
     };
 
     let tcp_listener = listener::bind(config.listener.address).await?;

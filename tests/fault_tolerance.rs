@@ -34,6 +34,8 @@ fn test_serve_config() -> ServeConfig {
         drain_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(5),
         max_connect_attempts: 3,
+        tls_acceptor: None,
+        tls_handshake_timeout: Duration::from_secs(5),
     }
 }
 

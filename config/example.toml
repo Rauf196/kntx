@@ -32,3 +32,23 @@ address = "0.0.0.0:9090"
 # check_interval_secs = 5    # active TCP probes (omit to disable)
 # failure_threshold = 3       # consecutive failures before circuit opens
 # recovery_timeout_secs = 10  # wait before half-open probe
+
+# [tls]
+# handshake_timeout_secs = 5  # default 5
+# min_version = "1.2"         # "1.2" (default) or "1.3"
+#
+# # single certificate
+# [[tls.certificates]]
+# cert = "/path/to/fullchain.pem"
+# key = "/path/to/privkey.pem"
+#
+# # multiple certificates (SNI-based selection)
+# [[tls.certificates]]
+# cert = "/path/to/api.example.com/fullchain.pem"
+# key = "/path/to/api.example.com/privkey.pem"
+# sni_names = ["api.example.com"]
+#
+# [[tls.certificates]]
+# cert = "/path/to/cdn.example.com/fullchain.pem"
+# key = "/path/to/cdn.example.com/privkey.pem"
+# sni_names = ["cdn.example.com"]

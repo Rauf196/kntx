@@ -40,6 +40,8 @@ fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
         drain_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(5),
         max_connect_attempts: 3,
+        tls_acceptor: None,
+        tls_handshake_timeout: Duration::from_secs(5),
     }
 }
 
@@ -86,6 +88,8 @@ async fn pool_exhaustion_degrades_gracefully() {
         drain_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(5),
         max_connect_attempts: 3,
+        tls_acceptor: None,
+        tls_handshake_timeout: Duration::from_secs(5),
     };
 
     let proxy_addr = start_proxy_with_config(&[backend.addr], config).await;

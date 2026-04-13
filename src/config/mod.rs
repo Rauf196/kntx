@@ -1,6 +1,6 @@
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -26,6 +26,12 @@ pub enum ConfigError {
 
     #[error("invalid value for '{field}': {reason}")]
     InvalidValue { field: &'static str, reason: String },
+
+    #[error("TLS cert file not found: '{path}'")]
+    TlsCertFileNotFound { path: PathBuf },
+
+    #[error("TLS key file not found: '{path}'")]
+    TlsKeyFileNotFound { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -64,6 +70,34 @@ pub struct Config {
     pub connection: ConnectionConfig,
     #[serde(default)]
     pub health: HealthConfig,
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TlsConfig {
+    #[serde(default = "default_handshake_timeout")]
+    pub handshake_timeout_secs: u64,
+    #[serde(default = "default_min_version")]
+    pub min_version: String,
+    pub certificates: Vec<CertificateConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CertificateConfig {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    /// SNI hostnames this cert serves. required when multiple certs are configured.
+    #[serde(default)]
+    pub sni_names: Vec<String>,
+}
+
+fn default_handshake_timeout() -> u64 {
+    5
+}
+
+fn default_min_version() -> String {
+    "1.2".to_owned()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -233,6 +267,45 @@ impl Config {
                 field: "health.check_interval_secs",
                 reason: "must be at least 1".to_owned(),
             });
+        }
+        if let Some(ref tls) = self.tls {
+            if tls.certificates.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "tls.certificates",
+                    reason: "must have at least one certificate".to_owned(),
+                });
+            }
+            if tls.handshake_timeout_secs == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "tls.handshake_timeout_secs",
+                    reason: "must be at least 1".to_owned(),
+                });
+            }
+            if tls.min_version != "1.2" && tls.min_version != "1.3" {
+                return Err(ConfigError::InvalidValue {
+                    field: "tls.min_version",
+                    reason: format!("must be '1.2' or '1.3', got '{}'", tls.min_version),
+                });
+            }
+            let multi = tls.certificates.len() > 1;
+            for cert_config in &tls.certificates {
+                if !cert_config.cert.exists() {
+                    return Err(ConfigError::TlsCertFileNotFound {
+                        path: cert_config.cert.clone(),
+                    });
+                }
+                if !cert_config.key.exists() {
+                    return Err(ConfigError::TlsKeyFileNotFound {
+                        path: cert_config.key.clone(),
+                    });
+                }
+                if multi && cert_config.sni_names.is_empty() {
+                    return Err(ConfigError::InvalidValue {
+                        field: "tls.certificates[].sni_names",
+                        reason: "required when multiple certificates are configured".to_owned(),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -600,5 +673,204 @@ mod tests {
         );
         let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    // --- TLS config tests ---
+
+    fn write_pem_files() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        use rcgen::generate_simple_self_signed;
+        let cert = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        (dir, cert_path, key_path)
+    }
+
+    #[test]
+    fn tls_section_absent_is_plain_mode() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert!(config.tls.is_none());
+    }
+
+    #[test]
+    fn parse_tls_single_cert() {
+        let (_dir, cert_path, key_path) = write_pem_files();
+        let content = format!(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [[tls.certificates]]
+            cert = "{}"
+            key = "{}"
+            "#,
+            cert_path.display(),
+            key_path.display(),
+        );
+        let file = write_temp_config(&content);
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        let tls = config.tls.unwrap();
+        assert_eq!(tls.certificates.len(), 1);
+        assert_eq!(tls.handshake_timeout_secs, 5);
+        assert_eq!(tls.min_version, "1.2");
+    }
+
+    #[test]
+    fn parse_tls_multi_cert() {
+        let (_dir1, cert1, key1) = write_pem_files();
+        let (_dir2, cert2, key2) = write_pem_files();
+        let content = format!(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [[tls.certificates]]
+            cert = "{}"
+            key = "{}"
+            sni_names = ["a.test"]
+
+            [[tls.certificates]]
+            cert = "{}"
+            key = "{}"
+            sni_names = ["b.test"]
+            "#,
+            cert1.display(),
+            key1.display(),
+            cert2.display(),
+            key2.display(),
+        );
+        let file = write_temp_config(&content);
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        let tls = config.tls.unwrap();
+        assert_eq!(tls.certificates.len(), 2);
+        assert_eq!(tls.certificates[0].sni_names, ["a.test"]);
+        assert_eq!(tls.certificates[1].sni_names, ["b.test"]);
+    }
+
+    #[test]
+    fn tls_defaults_applied() {
+        let (_dir, cert_path, key_path) = write_pem_files();
+        let content = format!(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [[tls.certificates]]
+            cert = "{}"
+            key = "{}"
+            "#,
+            cert_path.display(),
+            key_path.display(),
+        );
+        let file = write_temp_config(&content);
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        let tls = config.tls.unwrap();
+        assert_eq!(tls.handshake_timeout_secs, 5);
+        assert_eq!(tls.min_version, "1.2");
+    }
+
+    #[test]
+    fn reject_empty_certificates() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [tls]
+            certificates = []
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn reject_invalid_min_version() {
+        let (_dir, cert_path, key_path) = write_pem_files();
+        let content = format!(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [tls]
+            min_version = "1.1"
+
+            [[tls.certificates]]
+            cert = "{}"
+            key = "{}"
+            "#,
+            cert_path.display(),
+            key_path.display(),
+        );
+        let file = write_temp_config(&content);
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn reject_missing_cert_file_path() {
+        let file = write_temp_config(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [[tls.certificates]]
+            cert = "/nonexistent/cert.pem"
+            key = "/nonexistent/key.pem"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::TlsCertFileNotFound { .. }));
+    }
+
+    #[test]
+    fn reject_missing_key_file_path() {
+        let (_dir, cert_path, _key_path) = write_pem_files();
+        let content = format!(
+            r#"
+            [listener]
+            address = "0.0.0.0:8080"
+
+            [[backends]]
+            address = "127.0.0.1:3001"
+
+            [[tls.certificates]]
+            cert = "{}"
+            key = "/nonexistent/key.pem"
+            "#,
+            cert_path.display(),
+        );
+        let file = write_temp_config(&content);
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::TlsKeyFileNotFound { .. }));
     }
 }
