@@ -31,6 +31,15 @@ pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         "kntx_health_check_duration_seconds",
         "health check probe duration in seconds"
     );
+    describe_counter!("kntx_tls_handshakes_total", "successful TLS handshakes");
+    describe_counter!(
+        "kntx_tls_handshake_failures_total",
+        "failed TLS handshakes by reason"
+    );
+    describe_histogram!(
+        "kntx_tls_handshake_duration_seconds",
+        "TLS handshake duration in seconds"
+    );
 
     PrometheusBuilder::new()
         .with_http_listener(address)
