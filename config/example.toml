@@ -1,17 +1,6 @@
 # kntx example configuration
 # copy to config.toml and edit for your environment
 
-[listener]
-address = "0.0.0.0:8080"
-# max_connections = 10000
-# drain_timeout_secs = 30
-
-[[backends]]
-address = "127.0.0.1:3001"
-
-[[backends]]
-address = "127.0.0.1:3002"
-
 [forwarding]
 # forwarding strategy: "userspace" (default), "vectored", or "splice" (linux-only, zero-copy)
 strategy = "userspace"
@@ -23,32 +12,59 @@ level = "info"
 [metrics]
 address = "0.0.0.0:9090"
 
-[connection]
+# global health check defaults — each [[pools]] entry can override these
+[health]
+# check_interval_secs = 10   # active TCP probes (omit to disable globally)
+failure_threshold = 3         # consecutive failures before circuit opens
+recovery_timeout_secs = 10    # seconds in Open state before half-open probe
+
+# -------- listeners --------
+# each listener binds one address and routes to a named pool
+
+[[listeners]]
+address = "0.0.0.0:8080"
+mode = "l4"
+pool = "web"
+# max_connections = 10000
 # idle_timeout_secs = 300
+# drain_timeout_secs = 30
 # connect_timeout_secs = 5
 # max_connect_attempts = 3
 
-# [health]
-# check_interval_secs = 5    # active TCP probes (omit to disable)
-# failure_threshold = 3       # consecutive failures before circuit opens
-# recovery_timeout_secs = 10  # wait before half-open probe
+# TLS listener — dotted keys + inline cert array keeps everything in one block.
+# uncomment a `tls.certificates = [...]` line below to enable.
+[[listeners]]
+address = "0.0.0.0:8443"
+mode = "l4"
+pool = "api"
+tls.handshake_timeout_secs = 5
+tls.min_version = "1.2"   # "1.2" (default) or "1.3"
 
-# [tls]
-# handshake_timeout_secs = 5  # default 5
-# min_version = "1.2"         # "1.2" (default) or "1.3"
-#
-# # single certificate
-# [[tls.certificates]]
-# cert = "/path/to/fullchain.pem"
-# key = "/path/to/privkey.pem"
-#
-# # multiple certificates (SNI-based selection)
-# [[tls.certificates]]
-# cert = "/path/to/api.example.com/fullchain.pem"
-# key = "/path/to/api.example.com/privkey.pem"
-# sni_names = ["api.example.com"]
-#
-# [[tls.certificates]]
-# cert = "/path/to/cdn.example.com/fullchain.pem"
-# key = "/path/to/cdn.example.com/privkey.pem"
-# sni_names = ["cdn.example.com"]
+# single certificate:
+# tls.certificates = [{ cert = "/path/to/fullchain.pem", key = "/path/to/privkey.pem" }]
+
+# multiple certificates (SNI selection) — inline array spans lines, each entry stays one line:
+# tls.certificates = [
+#   { cert = "/path/api/fullchain.pem",   key = "/path/api/privkey.pem",   sni_names = ["api.example.com"] },
+#   { cert = "/path/admin/fullchain.pem", key = "/path/admin/privkey.pem", sni_names = ["admin.example.com"] },
+#   { cert = "/path/wildcard/fullchain.pem", key = "/path/wildcard/privkey.pem", sni_names = ["*.example.com"] },
+# ]
+
+# -------- pools --------
+# each pool is one block: name, optional health override, backends list
+
+[[pools]]
+name = "web"
+backends = [
+  { address = "127.0.0.1:3001" },
+  { address = "127.0.0.1:3002" },
+]
+
+[[pools]]
+name = "api"
+# per-pool health override (merges with [health] defaults above)
+health = { check_interval_secs = 5, failure_threshold = 2 }
+backends = [
+  { address = "127.0.0.1:4001" },
+  { address = "127.0.0.1:4002" },
+]

@@ -30,7 +30,12 @@ fn test_resources() -> Resources {
 }
 
 fn test_pool(addrs: &[SocketAddr]) -> Arc<BackendPool> {
-    Arc::new(BackendPool::new(addrs.to_vec(), 3, Duration::from_secs(10)))
+    Arc::new(BackendPool::new(
+        "test".into(),
+        addrs.to_vec(),
+        3,
+        Duration::from_secs(10),
+    ))
 }
 
 /// build a TlsAcceptor from a test cert, writing PEM files to a TempDir.
@@ -57,11 +62,16 @@ fn make_tls_acceptor(tc: &TestCert) -> (tokio_rustls::TlsAcceptor, tempfile::Tem
 }
 
 /// start a proxy with TLS using the given test cert and default userspace strategy.
-/// returns (proxy_addr, tempdir) — caller must hold the TempDir to keep cert files alive.
+/// returns (proxy_addr, tempdir, shutdown_tx) — caller must hold the TempDir to
+/// keep cert files alive AND hold the Sender to keep the listener alive.
 async fn start_tls_proxy(
     backend_addrs: &[SocketAddr],
     tc: &TestCert,
-) -> (SocketAddr, tempfile::TempDir) {
+) -> (
+    SocketAddr,
+    tempfile::TempDir,
+    tokio::sync::watch::Sender<()>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let cert_path = dir.path().join("cert.pem");
     let key_path = dir.path().join("key.pem");
@@ -91,19 +101,16 @@ async fn start_tls_proxy(
         max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    tokio::spawn(listener::serve(
-        tcp_listener,
-        balancer,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
 
-    (proxy_addr, dir)
+    (proxy_addr, dir, shutdown_tx)
 }
 
 // (5.6) basic TLS handshake + echo: handshake succeeds, data flows through proxy.
@@ -111,7 +118,7 @@ async fn start_tls_proxy(
 async fn tls_echo_basic() {
     let backend = EchoServer::start().await;
     let tc = generate_cert(&["localhost"]);
-    let (proxy_addr, _dir) = start_tls_proxy(&[backend.addr], &tc).await;
+    let (proxy_addr, _dir, _shutdown) = start_tls_proxy(&[backend.addr], &tc).await;
 
     let client_cfg = client_config_trusting(&tc.cert_der);
     let mut stream = tls_connect(proxy_addr, "localhost", client_cfg).await;
@@ -128,7 +135,7 @@ async fn tls_echo_basic() {
 async fn tls_concurrent_connections() {
     let backend = EchoServer::start().await;
     let tc = generate_cert(&["localhost"]);
-    let (proxy_addr, _dir) = start_tls_proxy(&[backend.addr], &tc).await;
+    let (proxy_addr, _dir, _shutdown) = start_tls_proxy(&[backend.addr], &tc).await;
 
     let client_cfg = client_config_trusting(&tc.cert_der);
 
@@ -157,7 +164,7 @@ async fn tls_concurrent_connections() {
 async fn tls_large_payload() {
     let backend = EchoServer::start().await;
     let tc = generate_cert(&["localhost"]);
-    let (proxy_addr, _dir) = start_tls_proxy(&[backend.addr], &tc).await;
+    let (proxy_addr, _dir, _shutdown) = start_tls_proxy(&[backend.addr], &tc).await;
 
     let client_cfg = client_config_trusting(&tc.cert_der);
     let mut stream = tls_connect(proxy_addr, "localhost", client_cfg).await;
@@ -205,17 +212,14 @@ async fn tls_handshake_timeout() {
         max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(1),
+        listener_label: "test-listener".into(),
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    tokio::spawn(listener::serve(
-        tcp_listener,
-        balancer,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
 
     // connect TCP but send no ClientHello — just idle
     let mut idle = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
@@ -248,17 +252,14 @@ async fn tls_plain_regression() {
         max_connect_attempts: 3,
         tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    tokio::spawn(listener::serve(
-        tcp_listener,
-        balancer,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream.write_all(b"plain tcp works").await.unwrap();
@@ -302,17 +303,14 @@ async fn tls_splice_strategy_fallback() {
         max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    tokio::spawn(listener::serve(
-        tcp_listener,
-        balancer,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
 
     let client_cfg = client_config_trusting(&tc.cert_der);
     let mut stream = tls_connect(proxy_addr, "localhost", client_cfg).await;
@@ -363,17 +361,14 @@ async fn tls_sni_multi_cert() {
         max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    tokio::spawn(listener::serve(
-        tcp_listener,
-        balancer,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
 
     // client_a trusts only cert_a — connecting with SNI "a.test" must succeed
     let client_a = client_config_trusting(&tc_a.cert_der);
@@ -407,7 +402,7 @@ async fn tls_sni_multi_cert() {
 async fn tls_handshake_failure_garbage_input() {
     let backend = EchoServer::start().await;
     let tc = generate_cert(&["localhost"]);
-    let (proxy_addr, _dir) = start_tls_proxy(&[backend.addr], &tc).await;
+    let (proxy_addr, _dir, _shutdown) = start_tls_proxy(&[backend.addr], &tc).await;
 
     // connect and immediately send garbage — not a TLS ClientHello
     let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
@@ -435,7 +430,7 @@ async fn tls_handshake_failure_garbage_input() {
 async fn tls_half_close() {
     let backend = HalfCloseServer::start().await;
     let tc = generate_cert(&["localhost"]);
-    let (proxy_addr, _dir) = start_tls_proxy(&[backend.addr], &tc).await;
+    let (proxy_addr, _dir, _shutdown) = start_tls_proxy(&[backend.addr], &tc).await;
 
     let client_cfg = client_config_trusting(&tc.cert_der);
     let mut stream = tls_connect(proxy_addr, "localhost", client_cfg).await;
@@ -468,17 +463,14 @@ async fn tls_idle_timeout() {
         max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    tokio::spawn(listener::serve(
-        tcp_listener,
-        balancer,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
 
     let client_cfg = client_config_trusting(&tc.cert_der);
     let mut stream = tls_connect(proxy_addr, "localhost", client_cfg).await;
@@ -500,8 +492,6 @@ async fn tls_idle_timeout() {
 // verifies JoinSet drain works when the spawned task holds WriteHalf<TlsStream> behind a Mutex.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_graceful_shutdown() {
-    use tokio::sync::oneshot;
-
     let backend = EchoServer::start().await;
     let tc = generate_cert(&["localhost"]);
     let (acceptor, _dir) = make_tls_acceptor(&tc);
@@ -517,16 +507,15 @@ async fn tls_graceful_shutdown() {
         max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
-    let serve_handle = tokio::spawn(listener::serve(tcp_listener, balancer, config, async {
-        let _ = shutdown_rx.await;
-    }));
+    let serve_handle = tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
 
     let client_cfg = client_config_trusting(&tc.cert_der);
     let mut stream = tls_connect(proxy_addr, "localhost", client_cfg).await;
@@ -538,7 +527,7 @@ async fn tls_graceful_shutdown() {
     assert_eq!(&buf[..n], b"before shutdown");
 
     // trigger shutdown — in-flight connection must still work
-    shutdown_tx.send(()).unwrap();
+    let _ = shutdown_tx.send(());
 
     stream.write_all(b"after signal").await.unwrap();
     let n = stream.read(&mut buf).await.unwrap();
@@ -560,7 +549,7 @@ async fn tls_graceful_shutdown() {
 async fn tls_backend_dies_mid_transfer() {
     let backend = DyingServer::start(b"partial").await;
     let tc = generate_cert(&["localhost"]);
-    let (proxy_addr, _dir) = start_tls_proxy(&[backend.addr], &tc).await;
+    let (proxy_addr, _dir, _shutdown) = start_tls_proxy(&[backend.addr], &tc).await;
 
     let client_cfg = client_config_trusting(&tc.cert_der);
     let mut stream = tls_connect(proxy_addr, "localhost", client_cfg).await;

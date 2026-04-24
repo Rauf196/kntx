@@ -26,7 +26,12 @@ fn test_resources() -> Resources {
 }
 
 fn test_pool(addrs: &[SocketAddr]) -> Arc<BackendPool> {
-    Arc::new(BackendPool::new(addrs.to_vec(), 3, Duration::from_secs(10)))
+    Arc::new(BackendPool::new(
+        "test".into(),
+        addrs.to_vec(),
+        3,
+        Duration::from_secs(10),
+    ))
 }
 
 fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
@@ -40,37 +45,36 @@ fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
         max_connect_attempts: 3,
         tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     }
 }
 
-async fn start_proxy(backend_addrs: &[SocketAddr]) -> SocketAddr {
+async fn start_proxy(
+    backend_addrs: &[SocketAddr],
+) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
     start_proxy_with_strategy(backend_addrs, ForwardingStrategy::Userspace).await
 }
 
 async fn start_proxy_with_strategy(
     backend_addrs: &[SocketAddr],
     strategy: ForwardingStrategy,
-) -> SocketAddr {
+) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
     let balancer = Arc::new(RoundRobin::new(test_pool(backend_addrs)));
     let config = test_serve_config(strategy);
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    tokio::spawn(listener::serve(
-        tcp_listener,
-        balancer,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
 
-    proxy_addr
+    (proxy_addr, shutdown_tx)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_backend_echo() {
     let backend = EchoServer::start().await;
-    let proxy_addr = start_proxy(&[backend.addr]).await;
+    let (proxy_addr, _shutdown) = start_proxy(&[backend.addr]).await;
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
 
@@ -84,7 +88,7 @@ async fn single_backend_echo() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multiple_messages() {
     let backend = EchoServer::start().await;
-    let proxy_addr = start_proxy(&[backend.addr]).await;
+    let (proxy_addr, _shutdown) = start_proxy(&[backend.addr]).await;
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     let mut buf = [0u8; 64];
@@ -112,11 +116,12 @@ async fn round_robin_distribution() {
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
+    let (_shutdown_tx2, shutdown_rx2) = tokio::sync::watch::channel(());
     tokio::spawn(listener::serve(
         tcp_listener,
         balancer_ref,
         test_serve_config(ForwardingStrategy::Userspace),
-        std::future::pending::<()>(),
+        shutdown_rx2,
     ));
 
     for _ in 0..4 {
@@ -136,7 +141,7 @@ async fn round_robin_distribution() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backend_unreachable() {
     let dead_addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
-    let proxy_addr = start_proxy(&[dead_addr]).await;
+    let (proxy_addr, _shutdown) = start_proxy(&[dead_addr]).await;
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
 
@@ -150,7 +155,7 @@ async fn backend_unreachable() {
 
 async fn verify_large_payload(strategy: ForwardingStrategy) {
     let backend = EchoServer::start().await;
-    let proxy_addr = start_proxy_with_strategy(&[backend.addr], strategy).await;
+    let (proxy_addr, _shutdown) = start_proxy_with_strategy(&[backend.addr], strategy).await;
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
 
@@ -192,14 +197,16 @@ async fn large_payload_splice() {
 mod vectored_tests {
     use super::*;
 
-    async fn start_vectored_proxy(backend_addrs: &[SocketAddr]) -> SocketAddr {
+    async fn start_vectored_proxy(
+        backend_addrs: &[SocketAddr],
+    ) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
         start_proxy_with_strategy(backend_addrs, ForwardingStrategy::Vectored).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn single_backend_echo() {
         let backend = EchoServer::start().await;
-        let proxy_addr = start_vectored_proxy(&[backend.addr]).await;
+        let (proxy_addr, _shutdown) = start_vectored_proxy(&[backend.addr]).await;
 
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
         stream.write_all(b"hello vectored").await.unwrap();
@@ -212,7 +219,7 @@ mod vectored_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn multiple_messages() {
         let backend = EchoServer::start().await;
-        let proxy_addr = start_vectored_proxy(&[backend.addr]).await;
+        let (proxy_addr, _shutdown) = start_vectored_proxy(&[backend.addr]).await;
 
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
         let mut buf = [0u8; 64];
@@ -231,14 +238,16 @@ mod vectored_tests {
 mod splice_tests {
     use super::*;
 
-    async fn start_splice_proxy(backend_addrs: &[SocketAddr]) -> SocketAddr {
+    async fn start_splice_proxy(
+        backend_addrs: &[SocketAddr],
+    ) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
         start_proxy_with_strategy(backend_addrs, ForwardingStrategy::Splice).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn single_backend_echo() {
         let backend = EchoServer::start().await;
-        let proxy_addr = start_splice_proxy(&[backend.addr]).await;
+        let (proxy_addr, _shutdown) = start_splice_proxy(&[backend.addr]).await;
 
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
         stream.write_all(b"hello splice").await.unwrap();
@@ -251,7 +260,7 @@ mod splice_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn multiple_messages() {
         let backend = EchoServer::start().await;
-        let proxy_addr = start_splice_proxy(&[backend.addr]).await;
+        let (proxy_addr, _shutdown) = start_splice_proxy(&[backend.addr]).await;
 
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
         let mut buf = [0u8; 64];
@@ -279,11 +288,12 @@ mod splice_tests {
         let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = tcp_listener.local_addr().unwrap();
 
+        let (_shutdown_tx_s, shutdown_rx_s) = tokio::sync::watch::channel(());
         tokio::spawn(listener::serve(
             tcp_listener,
             balancer_ref,
             test_serve_config(ForwardingStrategy::Splice),
-            std::future::pending::<()>(),
+            shutdown_rx_s,
         ));
 
         for _ in 0..4 {
@@ -302,7 +312,8 @@ mod splice_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backend_unreachable() {
         let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let proxy_addr = start_proxy_with_strategy(&[dead_addr], ForwardingStrategy::Splice).await;
+        let (proxy_addr, _shutdown) =
+            start_proxy_with_strategy(&[dead_addr], ForwardingStrategy::Splice).await;
 
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
 

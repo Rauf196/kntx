@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 
 use crate::util::monotonic_millis;
 
@@ -21,7 +22,7 @@ impl CircuitState {
             0 => Self::Closed,
             1 => Self::Open,
             2 => Self::HalfOpen,
-            _ => Self::Closed, // defensive fallback
+            _ => Self::Closed,
         }
     }
 }
@@ -57,7 +58,7 @@ impl BackendState {
     pub fn is_available(&self, recovery_timeout: Duration) -> bool {
         match self.circuit_state() {
             CircuitState::Closed => true,
-            CircuitState::HalfOpen => false, // probe in flight
+            CircuitState::HalfOpen => false,
             CircuitState::Open => {
                 let elapsed =
                     monotonic_millis().saturating_sub(self.open_since.load(Ordering::Relaxed));
@@ -79,18 +80,29 @@ impl BackendState {
 }
 
 pub struct BackendPool {
+    pool_name: Arc<str>,
     backends: Vec<BackendState>,
     failure_threshold: u32,
     recovery_timeout: Duration,
 }
 
 impl BackendPool {
-    pub fn new(addrs: Vec<SocketAddr>, failure_threshold: u32, recovery_timeout: Duration) -> Self {
+    pub fn new(
+        pool_name: Arc<str>,
+        addrs: Vec<SocketAddr>,
+        failure_threshold: u32,
+        recovery_timeout: Duration,
+    ) -> Self {
         Self {
+            pool_name,
             backends: addrs.into_iter().map(BackendState::new).collect(),
             failure_threshold,
             recovery_timeout,
         }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.pool_name
     }
 
     pub fn len(&self) -> usize {
@@ -128,10 +140,19 @@ impl BackendPool {
                 backend
                     .open_since
                     .store(monotonic_millis(), Ordering::Relaxed);
-                tracing::warn!(%addr, "circuit opened after {} failures", prev + 1);
-                metrics::gauge!("kntx_backend_health", "backend" => addr.to_string()).set(0.0);
-                metrics::gauge!("kntx_circuit_breaker_state", "backend" => addr.to_string())
-                    .set(CircuitState::Open as u8 as f64);
+                tracing::warn!(%addr, pool = %self.pool_name, "circuit opened after {} failures", prev + 1);
+                metrics::gauge!(
+                    "kntx_backend_health",
+                    "pool" => self.pool_name.to_string(),
+                    "backend" => addr.to_string(),
+                )
+                .set(0.0);
+                metrics::gauge!(
+                    "kntx_circuit_breaker_state",
+                    "pool" => self.pool_name.to_string(),
+                    "backend" => addr.to_string(),
+                )
+                .set(CircuitState::Open as u8 as f64);
             }
             CircuitState::HalfOpen => {
                 backend
@@ -140,9 +161,13 @@ impl BackendPool {
                 backend
                     .open_since
                     .store(monotonic_millis(), Ordering::Relaxed);
-                tracing::warn!(%addr, "half-open probe failed, circuit re-opened");
-                metrics::gauge!("kntx_circuit_breaker_state", "backend" => addr.to_string())
-                    .set(CircuitState::Open as u8 as f64);
+                tracing::warn!(%addr, pool = %self.pool_name, "half-open probe failed, circuit re-opened");
+                metrics::gauge!(
+                    "kntx_circuit_breaker_state",
+                    "pool" => self.pool_name.to_string(),
+                    "backend" => addr.to_string(),
+                )
+                .set(CircuitState::Open as u8 as f64);
             }
             _ => {}
         }
@@ -159,10 +184,19 @@ impl BackendPool {
             backend
                 .circuit
                 .store(CircuitState::Closed as u8, Ordering::Release);
-            tracing::info!(%addr, "circuit closed, backend recovered");
-            metrics::gauge!("kntx_backend_health", "backend" => addr.to_string()).set(1.0);
-            metrics::gauge!("kntx_circuit_breaker_state", "backend" => addr.to_string())
-                .set(CircuitState::Closed as u8 as f64);
+            tracing::info!(%addr, pool = %self.pool_name, "circuit closed, backend recovered");
+            metrics::gauge!(
+                "kntx_backend_health",
+                "pool" => self.pool_name.to_string(),
+                "backend" => addr.to_string(),
+            )
+            .set(1.0);
+            metrics::gauge!(
+                "kntx_circuit_breaker_state",
+                "pool" => self.pool_name.to_string(),
+                "backend" => addr.to_string(),
+            )
+            .set(CircuitState::Closed as u8 as f64);
         }
     }
 
@@ -170,8 +204,18 @@ impl BackendPool {
     pub fn emit_initial_metrics(&self) {
         for backend in &self.backends {
             let addr = backend.address.to_string();
-            metrics::gauge!("kntx_backend_health", "backend" => addr.clone()).set(1.0);
-            metrics::gauge!("kntx_circuit_breaker_state", "backend" => addr).set(0.0);
+            metrics::gauge!(
+                "kntx_backend_health",
+                "pool" => self.pool_name.to_string(),
+                "backend" => addr.clone(),
+            )
+            .set(1.0);
+            metrics::gauge!(
+                "kntx_circuit_breaker_state",
+                "pool" => self.pool_name.to_string(),
+                "backend" => addr,
+            )
+            .set(0.0);
         }
     }
 
@@ -187,7 +231,11 @@ pub struct HealthChecker {
 }
 
 impl HealthChecker {
-    pub fn new(pool: Arc<BackendPool>, interval: Duration, connect_timeout: Duration) -> Self {
+    pub fn new(
+        pool: Arc<BackendPool>,
+        interval: Duration,
+        connect_timeout: Duration,
+    ) -> Self {
         Self {
             pool,
             interval,
@@ -196,39 +244,47 @@ impl HealthChecker {
     }
 
     /// spawn the health check loop as a background task.
-    /// cancelled automatically when the tokio runtime shuts down.
-    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move { self.run().await })
-    }
-
-    async fn run(&self) {
-        loop {
-            for backend in self.pool.iter() {
-                let addr = backend.address();
-                let start = std::time::Instant::now();
-
-                let result =
-                    tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr)).await;
-
-                let duration = start.elapsed();
-
-                match result {
-                    Ok(Ok(_)) => {
-                        self.pool.record_success(addr);
-                    }
-                    _ => {
-                        self.pool.record_failure(addr);
+    /// exits cleanly when the shutdown receiver fires.
+    pub fn spawn(self, mut shutdown: watch::Receiver<()>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                self.probe_cycle().await;
+                tokio::select! {
+                    _ = tokio::time::sleep(self.interval) => {}
+                    _ = shutdown.changed() => {
+                        tracing::info!(pool = %self.pool.name(), "health checker exiting");
+                        return;
                     }
                 }
+            }
+        })
+    }
 
-                metrics::histogram!(
-                    "kntx_health_check_duration_seconds",
-                    "backend" => addr.to_string(),
-                )
-                .record(duration.as_secs_f64());
+    async fn probe_cycle(&self) {
+        for backend in self.pool.iter() {
+            let addr = backend.address();
+            let start = std::time::Instant::now();
+
+            let result =
+                tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr)).await;
+
+            let duration = start.elapsed();
+
+            match result {
+                Ok(Ok(_)) => {
+                    self.pool.record_success(addr);
+                }
+                _ => {
+                    self.pool.record_failure(addr);
+                }
             }
 
-            tokio::time::sleep(self.interval).await;
+            metrics::histogram!(
+                "kntx_health_check_duration_seconds",
+                "pool" => self.pool.name().to_string(),
+                "backend" => addr.to_string(),
+            )
+            .record(duration.as_secs_f64());
         }
     }
 }
@@ -245,6 +301,7 @@ mod tests {
     fn make_pool(addrs: &[&str], threshold: u32, recovery_secs: u64) -> Arc<BackendPool> {
         let addrs: Vec<SocketAddr> = addrs.iter().map(|a| a.parse().unwrap()).collect();
         Arc::new(BackendPool::new(
+            "test".into(),
             addrs,
             threshold,
             Duration::from_secs(recovery_secs),
@@ -283,7 +340,6 @@ mod tests {
         let addr: SocketAddr = ADDR.parse().unwrap();
         pool.record_failure(addr);
         assert_eq!(pool.get(0).circuit_state(), CircuitState::Open);
-        // recovery timeout = 10s, has not elapsed
         assert!(!pool.get(0).is_available(pool.recovery_timeout()));
     }
 
@@ -294,8 +350,6 @@ mod tests {
         pool.record_failure(addr);
         assert_eq!(pool.get(0).circuit_state(), CircuitState::Open);
 
-        // use Duration::ZERO as the recovery timeout: elapsed >= 0 is always true
-        // for u64, so the CAS will fire regardless of how long the process has run.
         assert!(pool.get(0).is_available(Duration::ZERO));
         assert_eq!(pool.get(0).circuit_state(), CircuitState::HalfOpen);
     }
@@ -312,6 +366,7 @@ mod tests {
     #[test]
     fn only_one_half_open_probe() {
         let pool: Arc<BackendPool> = Arc::new(BackendPool::new(
+            "test".into(),
             vec![ADDR.parse().unwrap()],
             1,
             Duration::from_secs(10),
@@ -321,8 +376,6 @@ mod tests {
             .circuit
             .store(CircuitState::Open as u8, Ordering::Release);
 
-        // Duration::ZERO: elapsed (u64) >= 0 is always true, so all 16 threads
-        // reach the CAS — exactly one wins, the rest get the failure result.
         let wins = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         std::thread::scope(|s| {

@@ -74,21 +74,25 @@ cp config/example.toml config.toml
 ### Configuration
 
 ```toml
-[listener]
-address = "0.0.0.0:8080"
-
-[[backends]]
-address = "127.0.0.1:3001"
-
-[[backends]]
-address = "127.0.0.1:3002"
-
 [logging]
 level = "info"
 
 [metrics]
 address = "0.0.0.0:9090"
+
+[[listeners]]
+address = "0.0.0.0:8080"
+pool = "web"
+
+[[pools]]
+name = "web"
+backends = [
+  { address = "127.0.0.1:3001" },
+  { address = "127.0.0.1:3002" },
+]
 ```
+
+See `config/example.toml` for TLS listeners, per-pool health overrides, and multi-certificate SNI.
 
 ## Design Priorities
 

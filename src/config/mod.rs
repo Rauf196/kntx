@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -21,8 +22,32 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
 
-    #[error("no backends configured")]
-    NoBackends,
+    #[error("listeners list is empty")]
+    EmptyListeners,
+
+    #[error("pools list is empty")]
+    EmptyPools,
+
+    #[error("duplicate pool name: '{name}'")]
+    DuplicatePoolName { name: String },
+
+    #[error("duplicate listener address: {address}")]
+    DuplicateListenerAddress { address: SocketAddr },
+
+    #[error(
+        "listener {wildcard} overlaps with {other} \
+         (wildcard address claims the same port on all interfaces)"
+    )]
+    OverlappingListenerAddress {
+        wildcard: SocketAddr,
+        other: SocketAddr,
+    },
+
+    #[error("listener {listener} references unknown pool '{pool}'")]
+    UnknownPoolReference { listener: SocketAddr, pool: String },
+
+    #[error("pool '{pool}' has no backends")]
+    EmptyPoolBackends { pool: String },
 
     #[error("invalid value for '{field}': {reason}")]
     InvalidValue { field: &'static str, reason: String },
@@ -55,11 +80,21 @@ impl fmt::Display for ForwardingStrategy {
     }
 }
 
+/// which protocol mode this listener runs in.
+/// only l4 exists today; l7 and tls-passthrough land in 6b and 6e.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenerMode {
+    #[default]
+    L4,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub listener: ListenerConfig,
     #[serde(default)]
-    pub backends: Vec<BackendConfig>,
+    pub listeners: Vec<ListenerConfig>,
+    #[serde(default)]
+    pub pools: Vec<PoolConfig>,
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
@@ -67,11 +102,61 @@ pub struct Config {
     #[serde(default)]
     pub forwarding: ForwardingConfig,
     #[serde(default)]
-    pub connection: ConnectionConfig,
-    #[serde(default)]
     pub health: HealthConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListenerConfig {
+    pub address: SocketAddr,
     #[serde(default)]
+    pub mode: ListenerMode,
+    pub pool: String,
+    pub max_connections: Option<usize>,
+    pub idle_timeout_secs: Option<u64>,
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout_secs: u64,
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_max_connect_attempts")]
+    pub max_connect_attempts: u32,
     pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PoolConfig {
+    pub name: String,
+    pub backends: Vec<BackendConfig>,
+    pub health: Option<PoolHealthOverride>,
+}
+
+impl PoolConfig {
+    pub fn effective_health(&self, defaults: &HealthConfig) -> ResolvedHealth {
+        let ovr = self.health.as_ref();
+        ResolvedHealth {
+            check_interval_secs: ovr
+                .and_then(|o| o.check_interval_secs)
+                .or(defaults.check_interval_secs),
+            failure_threshold: ovr
+                .and_then(|o| o.failure_threshold)
+                .unwrap_or(defaults.failure_threshold),
+            recovery_timeout_secs: ovr
+                .and_then(|o| o.recovery_timeout_secs)
+                .unwrap_or(defaults.recovery_timeout_secs),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PoolHealthOverride {
+    pub check_interval_secs: Option<u64>,
+    pub failure_threshold: Option<u32>,
+    pub recovery_timeout_secs: Option<u64>,
+}
+
+pub struct ResolvedHealth {
+    pub check_interval_secs: Option<u64>,
+    pub failure_threshold: u32,
+    pub recovery_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,41 +193,8 @@ pub struct ForwardingConfig {
     pub socket_buffer_size: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ListenerConfig {
-    pub address: SocketAddr,
-    /// max concurrent connections. None = unlimited.
-    pub max_connections: Option<usize>,
-    /// seconds to wait for in-flight connections during shutdown. default 30.
-    #[serde(default = "default_drain_timeout")]
-    pub drain_timeout_secs: u64,
-}
-
 fn default_drain_timeout() -> u64 {
     30
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ConnectionConfig {
-    /// close connections with no data transfer for this many seconds. None = no timeout.
-    #[serde(default)]
-    pub idle_timeout_secs: Option<u64>,
-    /// timeout for connecting to a backend. default 5s.
-    #[serde(default = "default_connect_timeout")]
-    pub connect_timeout_secs: u64,
-    /// max connect attempts before giving up and closing the client connection. default 3.
-    #[serde(default = "default_max_connect_attempts")]
-    pub max_connect_attempts: u32,
-}
-
-impl Default for ConnectionConfig {
-    fn default() -> Self {
-        Self {
-            idle_timeout_secs: None,
-            connect_timeout_secs: default_connect_timeout(),
-            max_connect_attempts: default_max_connect_attempts(),
-        }
-    }
 }
 
 fn default_connect_timeout() -> u64 {
@@ -229,27 +281,119 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.backends.is_empty() {
-            return Err(ConfigError::NoBackends);
+        if self.listeners.is_empty() {
+            return Err(ConfigError::EmptyListeners);
         }
-        if self.listener.max_connections == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "listener.max_connections",
-                reason: "must be at least 1".to_owned(),
-            });
+        if self.pools.is_empty() {
+            return Err(ConfigError::EmptyPools);
         }
-        if self.connection.idle_timeout_secs == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "connection.idle_timeout_secs",
-                reason: "must be at least 1".to_owned(),
-            });
+
+        // listener address uniqueness — exact dup
+        let mut seen_addrs: HashSet<SocketAddr> = HashSet::new();
+        for listener in &self.listeners {
+            if !seen_addrs.insert(listener.address) {
+                return Err(ConfigError::DuplicateListenerAddress {
+                    address: listener.address,
+                });
+            }
         }
-        if self.connection.connect_timeout_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "connection.connect_timeout_secs",
-                reason: "must be at least 1".to_owned(),
-            });
+
+        // listener address overlap — wildcard (0.0.0.0 / ::) on a port
+        // claims that port on every interface, so it conflicts with any
+        // other listener on the same port. kernel would catch this with
+        // EADDRINUSE on bind, but a config-time error is clearer.
+        let mut by_port: HashMap<u16, Vec<SocketAddr>> = HashMap::new();
+        for listener in &self.listeners {
+            by_port
+                .entry(listener.address.port())
+                .or_default()
+                .push(listener.address);
         }
+        for addrs in by_port.values() {
+            if addrs.len() <= 1 {
+                continue;
+            }
+            if let Some(wildcard) = addrs.iter().find(|a| a.ip().is_unspecified()) {
+                let other = addrs
+                    .iter()
+                    .find(|a| *a != wildcard)
+                    .copied()
+                    .expect("len > 1 and wildcard found, so a different addr must exist");
+                return Err(ConfigError::OverlappingListenerAddress {
+                    wildcard: *wildcard,
+                    other,
+                });
+            }
+        }
+
+        // pool name uniqueness
+        let mut seen_pools: HashSet<&str> = HashSet::new();
+        for pool in &self.pools {
+            if !seen_pools.insert(pool.name.as_str()) {
+                return Err(ConfigError::DuplicatePoolName {
+                    name: pool.name.clone(),
+                });
+            }
+        }
+
+        // listener pool references
+        for listener in &self.listeners {
+            if !seen_pools.contains(listener.pool.as_str()) {
+                return Err(ConfigError::UnknownPoolReference {
+                    listener: listener.address,
+                    pool: listener.pool.clone(),
+                });
+            }
+        }
+
+        // pool backends non-empty
+        for pool in &self.pools {
+            if pool.backends.is_empty() {
+                return Err(ConfigError::EmptyPoolBackends {
+                    pool: pool.name.clone(),
+                });
+            }
+        }
+
+        // per-listener validation
+        for listener in &self.listeners {
+            if listener.max_connections == Some(0) {
+                return Err(ConfigError::InvalidValue {
+                    field: "listener.max_connections",
+                    reason: "must be at least 1".to_owned(),
+                });
+            }
+            if listener.idle_timeout_secs == Some(0) {
+                return Err(ConfigError::InvalidValue {
+                    field: "listener.idle_timeout_secs",
+                    reason: "must be at least 1".to_owned(),
+                });
+            }
+            if listener.connect_timeout_secs == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "listener.connect_timeout_secs",
+                    reason: "must be at least 1".to_owned(),
+                });
+            }
+            if listener.max_connect_attempts == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "listener.max_connect_attempts",
+                    reason: "must be at least 1".to_owned(),
+                });
+            }
+            if listener.drain_timeout_secs == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "listener.drain_timeout_secs",
+                    reason: "must be at least 1".to_owned(),
+                });
+            }
+
+            if let Some(ref tls) = listener.tls {
+                validate_tls_config(tls)?;
+            }
+        }
+
+        // global health defaults
         if self.health.failure_threshold == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "health.failure_threshold",
@@ -268,47 +412,74 @@ impl Config {
                 reason: "must be at least 1".to_owned(),
             });
         }
-        if let Some(ref tls) = self.tls {
-            if tls.certificates.is_empty() {
-                return Err(ConfigError::InvalidValue {
-                    field: "tls.certificates",
-                    reason: "must have at least one certificate".to_owned(),
-                });
-            }
-            if tls.handshake_timeout_secs == 0 {
-                return Err(ConfigError::InvalidValue {
-                    field: "tls.handshake_timeout_secs",
-                    reason: "must be at least 1".to_owned(),
-                });
-            }
-            if tls.min_version != "1.2" && tls.min_version != "1.3" {
-                return Err(ConfigError::InvalidValue {
-                    field: "tls.min_version",
-                    reason: format!("must be '1.2' or '1.3', got '{}'", tls.min_version),
-                });
-            }
-            let multi = tls.certificates.len() > 1;
-            for cert_config in &tls.certificates {
-                if !cert_config.cert.exists() {
-                    return Err(ConfigError::TlsCertFileNotFound {
-                        path: cert_config.cert.clone(),
-                    });
-                }
-                if !cert_config.key.exists() {
-                    return Err(ConfigError::TlsKeyFileNotFound {
-                        path: cert_config.key.clone(),
-                    });
-                }
-                if multi && cert_config.sni_names.is_empty() {
+
+        // per-pool health override
+        for pool in &self.pools {
+            if let Some(ref ovr) = pool.health {
+                if ovr.check_interval_secs == Some(0) {
                     return Err(ConfigError::InvalidValue {
-                        field: "tls.certificates[].sni_names",
-                        reason: "required when multiple certificates are configured".to_owned(),
+                        field: "pool.health.check_interval_secs",
+                        reason: "must be at least 1".to_owned(),
+                    });
+                }
+                if ovr.failure_threshold == Some(0) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "pool.health.failure_threshold",
+                        reason: "must be at least 1".to_owned(),
+                    });
+                }
+                if ovr.recovery_timeout_secs == Some(0) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "pool.health.recovery_timeout_secs",
+                        reason: "must be at least 1".to_owned(),
                     });
                 }
             }
         }
+
         Ok(())
     }
+}
+
+fn validate_tls_config(tls: &TlsConfig) -> Result<(), ConfigError> {
+    if tls.certificates.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            field: "listener.tls.certificates",
+            reason: "must have at least one certificate".to_owned(),
+        });
+    }
+    if tls.handshake_timeout_secs == 0 {
+        return Err(ConfigError::InvalidValue {
+            field: "listener.tls.handshake_timeout_secs",
+            reason: "must be at least 1".to_owned(),
+        });
+    }
+    if tls.min_version != "1.2" && tls.min_version != "1.3" {
+        return Err(ConfigError::InvalidValue {
+            field: "listener.tls.min_version",
+            reason: format!("must be '1.2' or '1.3', got '{}'", tls.min_version),
+        });
+    }
+    let multi = tls.certificates.len() > 1;
+    for cert_config in &tls.certificates {
+        if !cert_config.cert.exists() {
+            return Err(ConfigError::TlsCertFileNotFound {
+                path: cert_config.cert.clone(),
+            });
+        }
+        if !cert_config.key.exists() {
+            return Err(ConfigError::TlsKeyFileNotFound {
+                path: cert_config.key.clone(),
+            });
+        }
+        if multi && cert_config.sni_names.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "listener.tls.certificates[].sni_names",
+                reason: "required when multiple certificates are configured".to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -322,113 +493,371 @@ mod tests {
         file
     }
 
-    #[test]
-    fn parse_valid_config() {
-        let file = write_temp_config(
-            r#"
-            [listener]
-            address = "0.0.0.0:8080"
-
-            [[backends]]
-            address = "127.0.0.1:3001"
-
-            [[backends]]
-            address = "127.0.0.1:3002"
-            "#,
-        );
-
-        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
-        assert_eq!(config.listener.address, "0.0.0.0:8080".parse().unwrap());
-        assert_eq!(config.backends.len(), 2);
-        assert_eq!(
-            config.backends[0].address,
-            "127.0.0.1:3001".parse().unwrap()
-        );
+    fn write_pem_files() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        use rcgen::generate_simple_self_signed;
+        let cert = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        (dir, cert_path, key_path)
     }
 
     #[test]
-    fn defaults_when_optional_sections_omitted() {
+    fn parse_minimal_valid_config() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
             "#,
         );
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.listeners.len(), 1);
+        assert_eq!(config.listeners[0].address, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(config.listeners[0].pool, "web");
+        assert_eq!(config.pools.len(), 1);
+        assert_eq!(config.pools[0].name, "web");
+        assert_eq!(config.pools[0].backends.len(), 1);
+    }
 
+    #[test]
+    fn parse_multi_listener_multi_pool() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[listeners]]
+            address = "0.0.0.0:8081"
+            pool = "api"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3002"
+
+            [[pools]]
+            name = "api"
+
+            [[pools.backends]]
+            address = "127.0.0.1:4001"
+            "#,
+        );
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.listeners.len(), 2);
+        assert_eq!(config.pools.len(), 2);
+        assert_eq!(config.pools[0].backends.len(), 2);
+        assert_eq!(config.pools[1].backends.len(), 1);
+    }
+
+    #[test]
+    fn parse_per_pool_health_override() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "api"
+
+            [[pools]]
+            name = "api"
+
+            [pools.health]
+            check_interval_secs = 5
+            failure_threshold = 2
+
+            [[pools.backends]]
+            address = "127.0.0.1:4001"
+            "#,
+        );
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        let ovr = config.pools[0].health.as_ref().unwrap();
+        assert_eq!(ovr.check_interval_secs, Some(5));
+        assert_eq!(ovr.failure_threshold, Some(2));
+        assert!(ovr.recovery_timeout_secs.is_none());
+
+        // effective_health merges with global defaults
+        let effective = config.pools[0].effective_health(&config.health);
+        assert_eq!(effective.check_interval_secs, Some(5));
+        assert_eq!(effective.failure_threshold, 2);
+        assert_eq!(effective.recovery_timeout_secs, 10); // from global default
+    }
+
+    #[test]
+    fn defaults_applied() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
         assert_eq!(config.logging.level, "info");
         assert!(config.metrics.is_none());
-    }
-
-    #[test]
-    fn explicit_logging_overrides_default() {
-        let file = write_temp_config(
-            r#"
-            [listener]
-            address = "0.0.0.0:8080"
-
-            [[backends]]
-            address = "127.0.0.1:3001"
-
-            [logging]
-            level = "debug"
-            "#,
-        );
-
-        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
-        assert_eq!(config.logging.level, "debug");
+        assert_eq!(config.listeners[0].drain_timeout_secs, 30);
+        assert_eq!(config.listeners[0].connect_timeout_secs, 5);
+        assert_eq!(config.listeners[0].max_connect_attempts, 3);
+        assert!(config.listeners[0].idle_timeout_secs.is_none());
+        assert!(config.listeners[0].max_connections.is_none());
+        assert_eq!(config.listeners[0].mode, ListenerMode::L4);
     }
 
     #[test]
     fn metrics_parsed_when_present() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
 
             [metrics]
             address = "0.0.0.0:9090"
             "#,
         );
-
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
-        let metrics = config.metrics.unwrap();
-        assert_eq!(metrics.address, "0.0.0.0:9090".parse().unwrap());
+        assert_eq!(
+            config.metrics.unwrap().address,
+            "0.0.0.0:9090".parse().unwrap()
+        );
     }
 
     #[test]
-    fn reject_no_backends() {
+    fn reject_empty_listeners() {
         let file = write_temp_config(
             r#"
-            [listener]
-            address = "0.0.0.0:8080"
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
             "#,
         );
-
         let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
-        assert!(matches!(err, ConfigError::NoBackends));
+        assert!(matches!(err, ConfigError::EmptyListeners));
     }
 
     #[test]
-    fn reject_empty_backends_list() {
+    fn reject_empty_pools() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::EmptyPools));
+    }
 
+    #[test]
+    fn reject_duplicate_pool_name() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3002"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::DuplicatePoolName { .. }));
+    }
+
+    #[test]
+    fn reject_duplicate_listener_address() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::DuplicateListenerAddress { .. }));
+    }
+
+    #[test]
+    fn reject_wildcard_overlaps_specific_address_same_port() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[listeners]]
+            address = "127.0.0.1:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::OverlappingListenerAddress { .. }
+        ));
+    }
+
+    #[test]
+    fn reject_wildcard_overlaps_regardless_of_declaration_order() {
+        // specific listed first, wildcard second — overlap detection must still fire
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "127.0.0.1:8080"
+            pool = "web"
+
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::OverlappingListenerAddress { .. }
+        ));
+    }
+
+    #[test]
+    fn allow_distinct_specific_addresses_on_same_port() {
+        // two specific (non-wildcard) IPs on the same port don't overlap;
+        // the kernel allows binding distinct interfaces to the same port
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "127.0.0.1:8080"
+            pool = "web"
+
+            [[listeners]]
+            address = "127.0.0.2:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        Config::from_file(file.path().to_str().unwrap())
+            .expect("two distinct specific addresses on same port must be allowed");
+    }
+
+    #[test]
+    fn allow_wildcard_on_different_ports() {
+        // 0.0.0.0:8080 and 0.0.0.0:8081 don't overlap (different ports)
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[listeners]]
+            address = "0.0.0.0:8081"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        Config::from_file(file.path().to_str().unwrap())
+            .expect("wildcards on different ports must be allowed");
+    }
+
+    #[test]
+    fn reject_unknown_pool_reference() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "nonexistent"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownPoolReference { .. }));
+    }
+
+    #[test]
+    fn reject_empty_pool_backends() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
             backends = []
             "#,
         );
-
-        // `backends = []` (inline array) vs `[[backends]]` (table array) parse
-        // differently  - either way, no backends means rejection
         let result = Config::from_file(file.path().to_str().unwrap());
+        // empty backends array is either a parse error (inline array) or EmptyPoolBackends
         assert!(result.is_err());
     }
 
@@ -436,27 +865,24 @@ mod tests {
     fn reject_invalid_address() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "not_an_address"
+            pool = "web"
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
             "#,
         );
-
         let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }));
     }
 
     #[test]
-    fn reject_missing_listener() {
-        let file = write_temp_config(
-            r#"
-            [[backends]]
-            address = "127.0.0.1:3001"
-            "#,
-        );
-
+    fn reject_malformed_toml() {
+        let file = write_temp_config("this is not [valid toml");
         let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }));
     }
@@ -471,14 +897,17 @@ mod tests {
     fn forwarding_strategy_defaults_to_userspace() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
             "#,
         );
-
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
         assert_eq!(config.forwarding.strategy, ForwardingStrategy::Userspace);
     }
@@ -487,38 +916,37 @@ mod tests {
     fn forwarding_strategy_parsed() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
 
             [forwarding]
             strategy = "userspace"
             "#,
         );
-
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
         assert_eq!(config.forwarding.strategy, ForwardingStrategy::Userspace);
-    }
-
-    #[test]
-    fn reject_malformed_toml() {
-        let file = write_temp_config("this is not [valid toml");
-
-        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
-        assert!(matches!(err, ConfigError::Parse { .. }));
     }
 
     #[test]
     fn reject_zero_max_connections() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
             max_connections = 0
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
             "#,
         );
@@ -530,14 +958,16 @@ mod tests {
     fn reject_zero_idle_timeout() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
-
-            [[backends]]
-            address = "127.0.0.1:3001"
-
-            [connection]
+            pool = "web"
             idle_timeout_secs = 0
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
             "#,
         );
         let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
@@ -545,35 +975,80 @@ mod tests {
     }
 
     #[test]
-    fn connection_defaults_applied() {
+    fn reject_zero_connect_timeout() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
+            connect_timeout_secs = 0
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
             "#,
         );
-
-        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
-        assert_eq!(config.connection.connect_timeout_secs, 5);
-        assert_eq!(config.connection.max_connect_attempts, 3);
-        assert!(config.connection.idle_timeout_secs.is_none());
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
     }
 
     #[test]
-    fn health_defaults_applied_when_section_omitted() {
+    fn reject_zero_max_connect_attempts() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
+            max_connect_attempts = 0
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
             "#,
         );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
 
+    #[test]
+    fn reject_zero_drain_timeout() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+            drain_timeout_secs = 0
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn health_defaults_applied() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
         assert!(config.health.check_interval_secs.is_none());
         assert_eq!(config.health.failure_threshold, 3);
@@ -584,10 +1059,14 @@ mod tests {
     fn health_values_parsed() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
 
             [health]
@@ -596,7 +1075,6 @@ mod tests {
             recovery_timeout_secs = 30
             "#,
         );
-
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
         assert_eq!(config.health.check_interval_secs, Some(5));
         assert_eq!(config.health.failure_threshold, 2);
@@ -604,31 +1082,17 @@ mod tests {
     }
 
     #[test]
-    fn reject_zero_connect_timeout() {
-        let file = write_temp_config(
-            r#"
-            [listener]
-            address = "0.0.0.0:8080"
-
-            [[backends]]
-            address = "127.0.0.1:3001"
-
-            [connection]
-            connect_timeout_secs = 0
-            "#,
-        );
-        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidValue { .. }));
-    }
-
-    #[test]
     fn reject_zero_failure_threshold() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
 
             [health]
@@ -643,10 +1107,14 @@ mod tests {
     fn reject_zero_recovery_timeout() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
 
             [health]
@@ -661,10 +1129,14 @@ mod tests {
     fn reject_zero_check_interval() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
 
             [health]
@@ -675,32 +1147,67 @@ mod tests {
         assert!(matches!(err, ConfigError::InvalidValue { .. }));
     }
 
-    // --- TLS config tests ---
+    #[test]
+    fn reject_zero_pool_override_interval() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
 
-    fn write_pem_files() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-        use rcgen::generate_simple_self_signed;
-        let cert = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let cert_path = dir.path().join("cert.pem");
-        let key_path = dir.path().join("key.pem");
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-        (dir, cert_path, key_path)
+            [[pools]]
+            name = "web"
+
+            [pools.health]
+            check_interval_secs = 0
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn reject_zero_pool_override_failure_threshold() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [pools.health]
+            failure_threshold = 0
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { .. }));
     }
 
     #[test]
     fn tls_section_absent_is_plain_mode() {
         let file = write_temp_config(
             r#"
-            [listener]
+            [[listeners]]
             address = "0.0.0.0:8080"
+            pool = "web"
 
-            [[backends]]
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
             address = "127.0.0.1:3001"
             "#,
         );
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
-        assert!(config.tls.is_none());
+        assert!(config.listeners[0].tls.is_none());
     }
 
     #[test]
@@ -708,22 +1215,26 @@ mod tests {
         let (_dir, cert_path, key_path) = write_pem_files();
         let content = format!(
             r#"
-            [listener]
-            address = "0.0.0.0:8080"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            pool = "web"
 
-            [[backends]]
-            address = "127.0.0.1:3001"
-
-            [[tls.certificates]]
+            [[listeners.tls.certificates]]
             cert = "{}"
             key = "{}"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
             "#,
             cert_path.display(),
             key_path.display(),
         );
         let file = write_temp_config(&content);
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
-        let tls = config.tls.unwrap();
+        let tls = config.listeners[0].tls.as_ref().unwrap();
         assert_eq!(tls.certificates.len(), 1);
         assert_eq!(tls.handshake_timeout_secs, 5);
         assert_eq!(tls.min_version, "1.2");
@@ -735,21 +1246,25 @@ mod tests {
         let (_dir2, cert2, key2) = write_pem_files();
         let content = format!(
             r#"
-            [listener]
-            address = "0.0.0.0:8080"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            pool = "web"
 
-            [[backends]]
-            address = "127.0.0.1:3001"
-
-            [[tls.certificates]]
+            [[listeners.tls.certificates]]
             cert = "{}"
             key = "{}"
             sni_names = ["a.test"]
 
-            [[tls.certificates]]
+            [[listeners.tls.certificates]]
             cert = "{}"
             key = "{}"
             sni_names = ["b.test"]
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
             "#,
             cert1.display(),
             key1.display(),
@@ -758,7 +1273,7 @@ mod tests {
         );
         let file = write_temp_config(&content);
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
-        let tls = config.tls.unwrap();
+        let tls = config.listeners[0].tls.as_ref().unwrap();
         assert_eq!(tls.certificates.len(), 2);
         assert_eq!(tls.certificates[0].sni_names, ["a.test"]);
         assert_eq!(tls.certificates[1].sni_names, ["b.test"]);
@@ -769,22 +1284,26 @@ mod tests {
         let (_dir, cert_path, key_path) = write_pem_files();
         let content = format!(
             r#"
-            [listener]
-            address = "0.0.0.0:8080"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            pool = "web"
 
-            [[backends]]
-            address = "127.0.0.1:3001"
-
-            [[tls.certificates]]
+            [[listeners.tls.certificates]]
             cert = "{}"
             key = "{}"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
             "#,
             cert_path.display(),
             key_path.display(),
         );
         let file = write_temp_config(&content);
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
-        let tls = config.tls.unwrap();
+        let tls = config.listeners[0].tls.as_ref().unwrap();
         assert_eq!(tls.handshake_timeout_secs, 5);
         assert_eq!(tls.min_version, "1.2");
     }
@@ -793,14 +1312,18 @@ mod tests {
     fn reject_empty_certificates() {
         let file = write_temp_config(
             r#"
-            [listener]
-            address = "0.0.0.0:8080"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            pool = "web"
 
-            [[backends]]
-            address = "127.0.0.1:3001"
-
-            [tls]
+            [listeners.tls]
             certificates = []
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
             "#,
         );
         let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
@@ -812,18 +1335,22 @@ mod tests {
         let (_dir, cert_path, key_path) = write_pem_files();
         let content = format!(
             r#"
-            [listener]
-            address = "0.0.0.0:8080"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            pool = "web"
 
-            [[backends]]
-            address = "127.0.0.1:3001"
-
-            [tls]
+            [listeners.tls]
             min_version = "1.1"
 
-            [[tls.certificates]]
+            [[listeners.tls.certificates]]
             cert = "{}"
             key = "{}"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
             "#,
             cert_path.display(),
             key_path.display(),
@@ -837,15 +1364,19 @@ mod tests {
     fn reject_missing_cert_file_path() {
         let file = write_temp_config(
             r#"
-            [listener]
-            address = "0.0.0.0:8080"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            pool = "web"
 
-            [[backends]]
-            address = "127.0.0.1:3001"
-
-            [[tls.certificates]]
+            [[listeners.tls.certificates]]
             cert = "/nonexistent/cert.pem"
             key = "/nonexistent/key.pem"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
             "#,
         );
         let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
@@ -857,15 +1388,19 @@ mod tests {
         let (_dir, cert_path, _key_path) = write_pem_files();
         let content = format!(
             r#"
-            [listener]
-            address = "0.0.0.0:8080"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            pool = "web"
 
-            [[backends]]
-            address = "127.0.0.1:3001"
-
-            [[tls.certificates]]
+            [[listeners.tls.certificates]]
             cert = "{}"
             key = "/nonexistent/key.pem"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
             "#,
             cert_path.display(),
         );

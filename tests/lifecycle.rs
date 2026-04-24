@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
 
 use kntx::balancer::RoundRobin;
 use kntx::config::ForwardingStrategy;
@@ -27,7 +26,12 @@ fn test_resources() -> Resources {
 }
 
 fn test_pool(addrs: &[SocketAddr]) -> Arc<BackendPool> {
-    Arc::new(BackendPool::new(addrs.to_vec(), 3, Duration::from_secs(10)))
+    Arc::new(BackendPool::new(
+        "test".into(),
+        addrs.to_vec(),
+        3,
+        Duration::from_secs(10),
+    ))
 }
 
 fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
@@ -41,6 +45,7 @@ fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
         max_connect_attempts: 3,
         tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     }
 }
 
@@ -57,18 +62,15 @@ async fn start_proxy_with_config(backend_addrs: &[SocketAddr], config: ServeConf
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    tokio::spawn(listener::serve(
-        tcp_listener,
-        balancer,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        let _tx = shutdown_tx;
+        std::future::pending::<()>().await
+    });
+    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
 
     proxy_addr
 }
-
-// verify FIN propagation: client half-closes, backend sends data after
-// seeing the FIN, proxy delivers it back to the client.
 
 async fn verify_half_close(strategy: ForwardingStrategy) {
     let backend = HalfCloseServer::start().await;
@@ -76,11 +78,9 @@ async fn verify_half_close(strategy: ForwardingStrategy) {
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
 
-    // send data, then half-close (FIN)
     stream.write_all(b"request data").await.unwrap();
     stream.shutdown().await.unwrap();
 
-    // read response sent by backend AFTER it saw our FIN
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
     assert_eq!(response, b"AFTER_FIN");
@@ -116,22 +116,20 @@ async fn idle_timeout_closes_connection() {
         max_connect_attempts: 3,
         tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     };
 
     let proxy_addr = start_proxy_with_config(&[backend.addr], config).await;
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
 
-    // send one message to establish the connection
     stream.write_all(b"hello").await.unwrap();
     let mut buf = [0u8; 64];
     let n = stream.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"hello");
 
-    // go idle — wait for timeout + margin
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // connection should be closed by proxy
     let n = stream.read(&mut buf).await.unwrap();
     assert_eq!(n, 0, "expected EOF after idle timeout");
 }
@@ -150,15 +148,14 @@ async fn max_connections_rejects_excess() {
         max_connect_attempts: 3,
         tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     };
 
     let proxy_addr = start_proxy_with_config(&[backend.addr], config).await;
 
-    // open 2 connections (should succeed)
     let mut s1 = TcpStream::connect(proxy_addr).await.unwrap();
     let mut s2 = TcpStream::connect(proxy_addr).await.unwrap();
 
-    // verify they work
     s1.write_all(b"one").await.unwrap();
     s2.write_all(b"two").await.unwrap();
     let mut buf = [0u8; 64];
@@ -167,19 +164,15 @@ async fn max_connections_rejects_excess() {
     let n = s2.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"two");
 
-    // small sleep to ensure the proxy has processed the first 2
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // 3rd connection should be rejected
     let mut s3 = TcpStream::connect(proxy_addr).await.unwrap();
     let n = s3.read(&mut buf).await.unwrap();
     assert_eq!(n, 0, "expected rejection (EOF) for connection beyond limit");
 
-    // close one connection
     drop(s1);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // now a new connection should succeed
     let mut s4 = TcpStream::connect(proxy_addr).await.unwrap();
     s4.write_all(b"four").await.unwrap();
     let n = s4.read(&mut buf).await.unwrap();
@@ -202,36 +195,29 @@ async fn graceful_shutdown_drains_connections() {
         max_connect_attempts: 3,
         tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let serve_handle = tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
 
-    let serve_handle = tokio::spawn(listener::serve(tcp_listener, balancer, config, async {
-        let _ = shutdown_rx.await;
-    }));
-
-    // establish a connection
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream.write_all(b"before shutdown").await.unwrap();
     let mut buf = [0u8; 64];
     let n = stream.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"before shutdown");
 
-    // trigger shutdown
-    shutdown_tx.send(()).unwrap();
+    let _ = shutdown_tx.send(());
 
-    // the in-flight connection should still work
     stream.write_all(b"after signal").await.unwrap();
     let n = stream.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"after signal");
 
-    // close the connection to let drain complete
     drop(stream);
 
-    // serve should complete (drain finishes)
     tokio::time::timeout(Duration::from_secs(5), serve_handle)
         .await
         .expect("serve did not complete within timeout")
@@ -257,17 +243,15 @@ async fn backend_dies_mid_connection() {
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream.write_all(b"request").await.unwrap();
 
-    // read whatever the proxy delivers — may be partial data or empty
     let mut received = Vec::new();
     let mut buf = [0u8; 1024];
     loop {
         match stream.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => received.extend_from_slice(&buf[..n]),
-            Err(_) => break, // connection reset is acceptable
+            Err(_) => break,
         }
     }
 
-    // proxy delivered the partial data and ended cleanly — didn't crash or hang
     assert_eq!(&received, b"partial");
 }

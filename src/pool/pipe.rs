@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crossbeam_queue::ArrayQueue;
 
-const DEFAULT_PIPE_POOL_CAPACITY: usize = 512; // 512 pairs = supports 512 concurrent splice connections (1024 fds)
+pub const DEFAULT_PIPE_POOL_CAPACITY: usize = 512; // 512 pairs = supports 512 concurrent splice connections (1024 fds)
 
 /// a pipe pair: (read_end, write_end)
 pub struct Pipe {

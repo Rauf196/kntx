@@ -28,7 +28,12 @@ fn test_resources() -> Resources {
 }
 
 fn test_pool(addrs: &[SocketAddr]) -> Arc<BackendPool> {
-    Arc::new(BackendPool::new(addrs.to_vec(), 3, Duration::from_secs(10)))
+    Arc::new(BackendPool::new(
+        "test".into(),
+        addrs.to_vec(),
+        3,
+        Duration::from_secs(10),
+    ))
 }
 
 fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
@@ -42,10 +47,13 @@ fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
         max_connect_attempts: 3,
         tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     }
 }
 
-async fn start_proxy(backend_addrs: &[SocketAddr]) -> SocketAddr {
+async fn start_proxy(
+    backend_addrs: &[SocketAddr],
+) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
     start_proxy_with_config(
         backend_addrs,
         test_serve_config(ForwardingStrategy::Userspace),
@@ -53,19 +61,18 @@ async fn start_proxy(backend_addrs: &[SocketAddr]) -> SocketAddr {
     .await
 }
 
-async fn start_proxy_with_config(backend_addrs: &[SocketAddr], config: ServeConfig) -> SocketAddr {
+async fn start_proxy_with_config(
+    backend_addrs: &[SocketAddr],
+    config: ServeConfig,
+) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
     let balancer = Arc::new(RoundRobin::new(test_pool(backend_addrs)));
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
-    tokio::spawn(listener::serve(
-        tcp_listener,
-        balancer,
-        config,
-        std::future::pending::<()>(),
-    ));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
 
-    proxy_addr
+    (proxy_addr, shutdown_tx)
 }
 
 // pool exhaustion: 4 buffers, userspace needs 2 per connection -> max 2 concurrent.
@@ -90,9 +97,10 @@ async fn pool_exhaustion_degrades_gracefully() {
         max_connect_attempts: 3,
         tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     };
 
-    let proxy_addr = start_proxy_with_config(&[backend.addr], config).await;
+    let (proxy_addr, _shutdown) = start_proxy_with_config(&[backend.addr], config).await;
 
     // open 5 connections rapidly
     let mut streams = Vec::new();
@@ -136,7 +144,7 @@ async fn pool_exhaustion_degrades_gracefully() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rapid_connection_churn() {
     let backend = EchoServer::start().await;
-    let proxy_addr = start_proxy(&[backend.addr]).await;
+    let (proxy_addr, _shutdown) = start_proxy(&[backend.addr]).await;
 
     for i in 0..100u32 {
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
@@ -154,7 +162,7 @@ async fn rapid_connection_churn() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_connections_under_load() {
     let backend = EchoServer::start().await;
-    let proxy_addr = start_proxy(&[backend.addr]).await;
+    let (proxy_addr, _shutdown) = start_proxy(&[backend.addr]).await;
 
     let mut tasks = JoinSet::new();
 
@@ -204,7 +212,7 @@ async fn multi_backend_concurrent_load() {
     let b1 = EchoServer::start().await;
     let b2 = EchoServer::start().await;
     let b3 = EchoServer::start().await;
-    let proxy_addr = start_proxy(&[b1.addr, b2.addr, b3.addr]).await;
+    let (proxy_addr, _shutdown) = start_proxy(&[b1.addr, b2.addr, b3.addr]).await;
 
     let mut tasks = JoinSet::new();
 
@@ -232,7 +240,7 @@ async fn multi_backend_concurrent_load() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_concurrent_payload() {
     let backend = EchoServer::start().await;
-    let proxy_addr = start_proxy(&[backend.addr]).await;
+    let (proxy_addr, _shutdown) = start_proxy(&[backend.addr]).await;
 
     let mut tasks = JoinSet::new();
 

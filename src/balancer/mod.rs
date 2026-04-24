@@ -22,6 +22,10 @@ impl RoundRobin {
         Arc::clone(&self.pool)
     }
 
+    pub fn current_index(&self) -> usize {
+        self.index.0.load(Ordering::Relaxed)
+    }
+
     pub fn next_backend(&self) -> Option<SocketAddr> {
         let len = self.pool.len();
         if len == 0 {
@@ -51,7 +55,7 @@ mod tests {
 
     fn test_pool(addrs: &[&str]) -> Arc<BackendPool> {
         let addrs: Vec<SocketAddr> = addrs.iter().map(|a| a.parse().unwrap()).collect();
-        Arc::new(BackendPool::new(addrs, 3, Duration::from_secs(10)))
+        Arc::new(BackendPool::new("test".into(), addrs, 3, Duration::from_secs(10)))
     }
 
     #[test]
@@ -74,7 +78,7 @@ mod tests {
             "127.0.0.1:3001".parse().unwrap(),
             "127.0.0.1:3002".parse().unwrap(),
         ];
-        let pool = Arc::new(BackendPool::new(addrs.clone(), 3, Duration::from_secs(10)));
+        let pool = Arc::new(BackendPool::new("test".into(), addrs.clone(), 3, Duration::from_secs(10)));
         let rr = RoundRobin::new(pool);
 
         let mut counts = [0u32; 2];
@@ -102,7 +106,7 @@ mod tests {
 
     #[test]
     fn empty_backends_returns_none() {
-        let pool = Arc::new(BackendPool::new(vec![], 3, Duration::from_secs(10)));
+        let pool = Arc::new(BackendPool::new("test".into(), vec![], 3, Duration::from_secs(10)));
         let rr = RoundRobin::new(pool);
         assert!(rr.next_backend().is_none());
     }
@@ -114,7 +118,7 @@ mod tests {
             "127.0.0.1:3002".parse().unwrap(),
             "127.0.0.1:3003".parse().unwrap(),
         ];
-        let pool = Arc::new(BackendPool::new(addrs.clone(), 3, Duration::from_secs(10)));
+        let pool = Arc::new(BackendPool::new("test".into(), addrs.clone(), 3, Duration::from_secs(10)));
         let rr = RoundRobin::new(pool);
 
         // simulate index near usize::MAX
@@ -136,7 +140,7 @@ mod tests {
             "127.0.0.1:3001".parse().unwrap(),
             "127.0.0.1:3002".parse().unwrap(),
         ];
-        let pool = Arc::new(BackendPool::new(addrs.clone(), 3, Duration::from_secs(10)));
+        let pool = Arc::new(BackendPool::new("test".into(), addrs.clone(), 3, Duration::from_secs(10)));
         let rr = Arc::new(RoundRobin::new(pool));
         let total_per_thread = 5000;
         let thread_count = 4;
@@ -180,7 +184,7 @@ mod tests {
             "127.0.0.1:3002".parse().unwrap(),
             "127.0.0.1:3003".parse().unwrap(),
         ];
-        let pool = Arc::new(BackendPool::new(addrs.clone(), 1, Duration::from_secs(60)));
+        let pool = Arc::new(BackendPool::new("test".into(), addrs.clone(), 1, Duration::from_secs(60)));
         let rr = RoundRobin::new(Arc::clone(&pool));
 
         // open the first backend's circuit

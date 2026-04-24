@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,6 +6,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio::sync::watch;
 use tracing::Instrument;
 
 use crate::balancer::RoundRobin;
@@ -34,6 +34,7 @@ pub struct ServeConfig {
     pub max_connect_attempts: u32,
     pub tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     pub tls_handshake_timeout: Duration,
+    pub listener_label: Arc<str>,
 }
 
 enum ClientConn {
@@ -49,7 +50,6 @@ pub async fn bind(address: SocketAddr) -> Result<TcpListener, ListenerError> {
 
 async fn idle_watchdog(last_activity: &AtomicU64, timeout: Duration) {
     let timeout_millis = timeout.as_millis() as u64;
-    // check at reasonable intervals — fast enough for detection, slow enough to be negligible
     let check_interval = Duration::from_secs(1).min(timeout / 4);
     loop {
         tokio::time::sleep(check_interval).await;
@@ -64,7 +64,7 @@ pub async fn serve(
     listener: TcpListener,
     balancer: Arc<RoundRobin>,
     config: ServeConfig,
-    shutdown: impl Future<Output = ()> + Send,
+    mut shutdown: watch::Receiver<()>,
 ) {
     use tokio::task::JoinSet;
 
@@ -81,21 +81,19 @@ pub async fn serve(
     let max_connect_attempts = config.max_connect_attempts;
     let tls_acceptor = config.tls_acceptor;
     let tls_handshake_timeout = config.tls_handshake_timeout;
+    let listener_label = config.listener_label.clone();
 
     let mut tasks: JoinSet<()> = JoinSet::new();
-    tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((client, peer)) => 'accept: {
-                        // disable nagle  - proxy forwards data immediately, coalescing adds latency
                         if let Err(e) = client.set_nodelay(true) {
                             tracing::warn!(%peer, error = %e, "failed to set tcp_nodelay");
                         }
 
-                        // apply socket buffer tuning if configured
                         #[cfg(target_os = "linux")]
                         if let Some(size) = config.resources.socket_buffer_size {
                             use std::os::fd::AsRawFd;
@@ -104,13 +102,16 @@ pub async fn serve(
                             }
                         }
 
-                        // connection limit: try_acquire_owned is non-blocking — reject immediately
                         let permit = if let Some(ref sem) = connection_semaphore {
                             match sem.clone().try_acquire_owned() {
                                 Ok(permit) => Some(permit),
                                 Err(_) => {
                                     tracing::warn!(%peer, "max connections reached, rejecting");
-                                    metrics::counter!("kntx_connections_rejected_total").increment(1);
+                                    metrics::counter!(
+                                        "kntx_connections_rejected_total",
+                                        "listener" => listener_label.to_string(),
+                                    )
+                                    .increment(1);
                                     break 'accept;
                                 }
                             }
@@ -118,19 +119,25 @@ pub async fn serve(
                             None
                         };
 
-                        metrics::counter!("kntx_connections_total").increment(1);
-                        metrics::gauge!("kntx_connections_active").increment(1.0);
+                        metrics::counter!(
+                            "kntx_connections_total",
+                            "listener" => listener_label.to_string(),
+                        )
+                        .increment(1);
+                        metrics::gauge!(
+                            "kntx_connections_active",
+                            "listener" => listener_label.to_string(),
+                        )
+                        .increment(1.0);
 
                         let balancer = Arc::clone(&balancer);
                         let resources = config.resources.clone();
                         let tls_acceptor = tls_acceptor.clone();
+                        let listener_label = listener_label.clone();
 
                         tasks.spawn(async move {
-                            // permit held for connection lifetime — dropped on task end
                             let _permit = permit;
 
-                            // TLS handshake (if TLS is configured) runs in the spawned task,
-                            // not in the accept loop — a slow handshake here doesn't block accepts
                             let client_conn = if let Some(acceptor) = tls_acceptor {
                                 let handshake_start = std::time::Instant::now();
                                 match tokio::time::timeout(
@@ -142,11 +149,15 @@ pub async fn serve(
                                     Ok(Ok(tls)) => {
                                         let duration = handshake_start.elapsed();
                                         metrics::histogram!(
-                                            "kntx_tls_handshake_duration_seconds"
+                                            "kntx_tls_handshake_duration_seconds",
+                                            "listener" => listener_label.to_string(),
                                         )
                                         .record(duration.as_secs_f64());
-                                        metrics::counter!("kntx_tls_handshakes_total")
-                                            .increment(1);
+                                        metrics::counter!(
+                                            "kntx_tls_handshakes_total",
+                                            "listener" => listener_label.to_string(),
+                                        )
+                                        .increment(1);
 
                                         if let Some(sni) = tls.get_ref().1.server_name() {
                                             tracing::debug!(%peer, %sni, "TLS handshake completed");
@@ -160,20 +171,30 @@ pub async fn serve(
                                         tracing::debug!(%peer, error = %e, "TLS handshake failed");
                                         metrics::counter!(
                                             "kntx_tls_handshake_failures_total",
-                                            "reason" => "protocol_error"
+                                            "listener" => listener_label.to_string(),
+                                            "reason" => "protocol_error",
                                         )
                                         .increment(1);
-                                        metrics::gauge!("kntx_connections_active").decrement(1.0);
+                                        metrics::gauge!(
+                                            "kntx_connections_active",
+                                            "listener" => listener_label.to_string(),
+                                        )
+                                        .decrement(1.0);
                                         return;
                                     }
                                     Err(_) => {
                                         tracing::debug!(%peer, "TLS handshake timed out");
                                         metrics::counter!(
                                             "kntx_tls_handshake_failures_total",
-                                            "reason" => "timeout"
+                                            "listener" => listener_label.to_string(),
+                                            "reason" => "timeout",
                                         )
                                         .increment(1);
-                                        metrics::gauge!("kntx_connections_active").decrement(1.0);
+                                        metrics::gauge!(
+                                            "kntx_connections_active",
+                                            "listener" => listener_label.to_string(),
+                                        )
+                                        .decrement(1.0);
                                         return;
                                     }
                                 }
@@ -182,15 +203,19 @@ pub async fn serve(
                             };
 
                             let pool = balancer.pool();
+                            let pool_name = pool.name().to_string();
 
-                            // retry loop: try connecting to successive healthy backends
                             let mut attempts = 0u32;
                             let (backend_addr, server) = loop {
                                 let addr = match balancer.next_backend() {
                                     Some(a) => a,
                                     None => {
                                         tracing::warn!(%peer, "no healthy backends available");
-                                        metrics::gauge!("kntx_connections_active").decrement(1.0);
+                                        metrics::gauge!(
+                                            "kntx_connections_active",
+                                            "listener" => listener_label.to_string(),
+                                        )
+                                        .decrement(1.0);
                                         return;
                                     }
                                 };
@@ -200,10 +225,19 @@ pub async fn serve(
                                     Err(e) => {
                                         pool.record_failure(addr);
                                         attempts += 1;
-                                        metrics::counter!("kntx_connect_retries_total").increment(1);
+                                        metrics::counter!(
+                                            "kntx_connect_retries_total",
+                                            "pool" => pool_name.clone(),
+                                            "listener" => listener_label.to_string(),
+                                        )
+                                        .increment(1);
                                         if attempts >= max_connect_attempts {
                                             tracing::warn!(%peer, attempts, "all retry attempts exhausted");
-                                            metrics::gauge!("kntx_connections_active").decrement(1.0);
+                                            metrics::gauge!(
+                                                "kntx_connections_active",
+                                                "listener" => listener_label.to_string(),
+                                            )
+                                            .decrement(1.0);
                                             return;
                                         }
                                         tracing::debug!(%peer, %addr, attempt = attempts, error = %e, "retrying");
@@ -211,7 +245,6 @@ pub async fn serve(
                                 }
                             };
 
-                            // span created after retry so backend address is known
                             let span = tracing::info_span!("conn", %peer, backend = %backend_addr);
 
                             async {
@@ -243,10 +276,18 @@ pub async fn serve(
                                 match result {
                                     Some(Ok(fwd)) => {
                                         pool.record_success(backend_addr);
-                                        metrics::counter!("kntx_forwarded_bytes_total", "direction" => "client_to_backend")
-                                            .increment(fwd.client_to_backend);
-                                        metrics::counter!("kntx_forwarded_bytes_total", "direction" => "backend_to_client")
-                                            .increment(fwd.backend_to_client);
+                                        metrics::counter!(
+                                            "kntx_forwarded_bytes_total",
+                                            "direction" => "client_to_backend",
+                                            "listener" => listener_label.to_string(),
+                                        )
+                                        .increment(fwd.client_to_backend);
+                                        metrics::counter!(
+                                            "kntx_forwarded_bytes_total",
+                                            "direction" => "backend_to_client",
+                                            "listener" => listener_label.to_string(),
+                                        )
+                                        .increment(fwd.backend_to_client);
                                         tracing::debug!(
                                             sent = fwd.client_to_backend,
                                             recv = fwd.backend_to_client,
@@ -258,12 +299,19 @@ pub async fn serve(
                                         tracing::warn!(error = %e, "connection failed");
                                     }
                                     None => {
-                                        // idle timeout — connection dropped by select cancellation
-                                        metrics::counter!("kntx_idle_timeouts_total").increment(1);
+                                        metrics::counter!(
+                                            "kntx_idle_timeouts_total",
+                                            "listener" => listener_label.to_string(),
+                                        )
+                                        .increment(1);
                                     }
                                 }
 
-                                metrics::gauge!("kntx_connections_active").decrement(1.0);
+                                metrics::gauge!(
+                                    "kntx_connections_active",
+                                    "listener" => listener_label.to_string(),
+                                )
+                                .decrement(1.0);
                             }
                             .instrument(span)
                             .await;
@@ -274,18 +322,16 @@ pub async fn serve(
                     }
                 }
             }
-            _ = &mut shutdown => {
-                tracing::info!("shutdown signal received");
+            _ = shutdown.changed() => {
+                tracing::info!(%address, "shutdown signal received");
                 break;
             }
-            // reap completed tasks to prevent unbounded JoinSet growth
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
 
-    // drain phase: wait for in-flight connections to finish
     if !tasks.is_empty() {
-        tracing::info!(remaining = tasks.len(), "draining in-flight connections");
+        tracing::info!(%address, remaining = tasks.len(), "draining in-flight connections");
         let drain_deadline = tokio::time::sleep(drain_timeout);
         tokio::pin!(drain_deadline);
         loop {
@@ -293,7 +339,7 @@ pub async fn serve(
                 result = tasks.join_next() => {
                     match result {
                         Some(_) if tasks.is_empty() => {
-                            tracing::info!("all connections drained");
+                            tracing::info!(%address, "all connections drained");
                             break;
                         }
                         Some(_) => {}
@@ -302,6 +348,7 @@ pub async fn serve(
                 }
                 _ = &mut drain_deadline => {
                     tracing::warn!(
+                        %address,
                         remaining = tasks.len(),
                         "drain timeout reached, aborting remaining connections"
                     );
@@ -312,5 +359,5 @@ pub async fn serve(
         }
     }
 
-    tracing::info!("shutdown complete");
+    tracing::info!(%address, "shutdown complete");
 }

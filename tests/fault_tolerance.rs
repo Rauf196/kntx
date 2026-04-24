@@ -36,20 +36,20 @@ fn test_serve_config() -> ServeConfig {
         max_connect_attempts: 3,
         tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
     }
 }
 
-async fn start_proxy_with_pool(pool: Arc<BackendPool>, config: ServeConfig) -> SocketAddr {
+async fn start_proxy_with_pool(
+    pool: Arc<BackendPool>,
+    config: ServeConfig,
+) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
     let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
-    tokio::spawn(listener::serve(
-        tcp_listener,
-        balancer,
-        config,
-        std::future::pending::<()>(),
-    ));
-    proxy_addr
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    (proxy_addr, shutdown_tx)
 }
 
 // (4.9) two backends, one fails: traffic redistributes to the healthy backend.
@@ -62,12 +62,13 @@ async fn backend_failover_redistributes_traffic() {
     let b1_addr = b1.addr;
 
     let pool = Arc::new(BackendPool::new(
+        "test".into(),
         vec![b1_addr, b2.addr],
         2, // circuit opens after 2 failures
         Duration::from_secs(60),
     ));
 
-    let proxy_addr = start_proxy_with_pool(
+    let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
             connect_timeout: Duration::from_secs(5),
@@ -127,12 +128,14 @@ async fn retry_on_connect_failure() {
 
     // dead backend first — round-robin starts there and must retry
     let pool = Arc::new(BackendPool::new(
+        "test".into(),
         vec![dead_addr, live.addr],
         5, // high threshold so circuit stays closed during the test
         Duration::from_secs(60),
     ));
 
-    let proxy_addr = start_proxy_with_pool(Arc::clone(&pool), test_serve_config()).await;
+    let (proxy_addr, _shutdown) =
+        start_proxy_with_pool(Arc::clone(&pool), test_serve_config()).await;
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream.write_all(b"retry test").await.unwrap();
@@ -148,12 +151,13 @@ async fn all_backends_unhealthy_clean_rejection() {
     let dead2: SocketAddr = "127.0.0.1:2".parse().unwrap();
 
     let pool = Arc::new(BackendPool::new(
+        "test".into(),
         vec![dead1, dead2],
         10, // high threshold — circuit stays closed, all retries exhausted instead
         Duration::from_secs(60),
     ));
 
-    let proxy_addr = start_proxy_with_pool(
+    let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
             max_connect_attempts: 2, // 2 attempts total, one per backend
@@ -175,12 +179,13 @@ async fn timeout_enforcement_gives_clean_eof() {
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
     let pool = Arc::new(BackendPool::new(
+        "test".into(),
         vec![dead_addr],
         10,
         Duration::from_secs(60),
     ));
 
-    let proxy_addr = start_proxy_with_pool(
+    let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
             connect_timeout: Duration::from_secs(5),
@@ -203,12 +208,13 @@ async fn circuit_opens_after_connect_failures() {
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
     let pool = Arc::new(BackendPool::new(
+        "test".into(),
         vec![dead_addr],
         2, // circuit opens after 2 failures
         Duration::from_secs(60),
     ));
 
-    let proxy_addr = start_proxy_with_pool(
+    let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
             max_connect_attempts: 1,
@@ -220,8 +226,9 @@ async fn circuit_opens_after_connect_failures() {
     // two connections each fail once → 2 failures → circuit opens
     for _ in 0..2 {
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
-        let mut buf = [0u8; 16];
-        stream.read(&mut buf).await.ok();
+        let mut sink = Vec::new();
+        // read until EOF — proxy gives up after retries and closes the connection
+        let _ = stream.read_to_end(&mut sink).await;
         // brief pause for the proxy task to record the failure before next attempt
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -256,12 +263,13 @@ async fn healthy_backend_serves_after_peer_fails() {
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
     let pool = Arc::new(BackendPool::new(
+        "test".into(),
         vec![dead_addr, live.addr],
         2, // circuit opens quickly
         Duration::from_secs(60),
     ));
 
-    let proxy_addr = start_proxy_with_pool(
+    let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
             max_connect_attempts: 3,
