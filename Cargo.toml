@@ -36,6 +36,12 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 rustls-pemfile = "2"
 
+# L7 HTTP mode
+httparse = "1"
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+bytes = "1"
+
 # linux syscalls (splice, pipe2)
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

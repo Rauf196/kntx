@@ -7,18 +7,23 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use kntx::access_log::AccessLogSink;
 use kntx::balancer::RoundRobin;
-use kntx::config::{CertificateConfig, ForwardingStrategy, TlsConfig};
+use kntx::config::{
+    CertificateConfig, ErrorPagesConfig, ForwardingStrategy, ListenerConfig, ListenerMode,
+    TlsConfig,
+};
 use kntx::health::BackendPool;
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
+use kntx::proxy::l7::ErrorPages;
 use kntx::tls::build_acceptor;
 
-use helpers::{DyingServer, EchoServer, HalfCloseServer};
 use helpers::tls::{
-    client_config_trusting, generate_cert, tls_connect, write_cert_to_tempdir, TestCert,
+    TestCert, client_config_trusting, generate_cert, tls_connect, write_cert_to_tempdir,
 };
+use helpers::{DyingServer, EchoServer, HalfCloseServer};
 
 fn test_resources() -> Resources {
     Resources {
@@ -26,6 +31,40 @@ fn test_resources() -> Resources {
         #[cfg(target_os = "linux")]
         pipe_pool: kntx::pool::pipe::PipePool::new(32).unwrap(),
         socket_buffer_size: None,
+    }
+}
+
+fn test_listener_cfg() -> Arc<ListenerConfig> {
+    Arc::new(ListenerConfig {
+        address: "127.0.0.1:0".parse().unwrap(),
+        mode: ListenerMode::L4,
+        pool: "test".to_owned(),
+        max_connections: None,
+        idle_timeout_secs: None,
+        drain_timeout_secs: 5,
+        connect_timeout_secs: 5,
+        max_connect_attempts: 3,
+        tls: None,
+        header_size_limit_bytes: 16384,
+    })
+}
+
+fn test_serve_config() -> ServeConfig {
+    ServeConfig {
+        strategy: ForwardingStrategy::Userspace,
+        resources: test_resources(),
+        max_connections: None,
+        idle_timeout: None,
+        drain_timeout: Duration::from_secs(5),
+        connect_timeout: Duration::from_secs(5),
+        max_connect_attempts: 3,
+        tls_acceptor: None,
+        tls_handshake_timeout: Duration::from_secs(5),
+        listener_label: "test-listener".into(),
+        listener_cfg: test_listener_cfg(),
+        error_pages: Arc::new(ErrorPages::load(&ErrorPagesConfig::default()).unwrap()),
+        access_log: Arc::new(AccessLogSink::Off),
+        buffer_pool: Arc::new(BufferPool::new(64, 64 * 1024)),
     }
 }
 
@@ -92,16 +131,8 @@ async fn start_tls_proxy(
 
     let balancer = Arc::new(RoundRobin::new(test_pool(backend_addrs)));
     let config = ServeConfig {
-        strategy: ForwardingStrategy::Userspace,
-        resources: test_resources(),
-        max_connections: None,
-        idle_timeout: None,
-        drain_timeout: Duration::from_secs(5),
-        connect_timeout: Duration::from_secs(5),
-        max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
-        tls_handshake_timeout: Duration::from_secs(5),
-        listener_label: "test-listener".into(),
+        ..test_serve_config()
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -203,16 +234,9 @@ async fn tls_handshake_timeout() {
 
     let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
     let config = ServeConfig {
-        strategy: ForwardingStrategy::Userspace,
-        resources: test_resources(),
-        max_connections: None,
-        idle_timeout: None,
-        drain_timeout: Duration::from_secs(5),
-        connect_timeout: Duration::from_secs(5),
-        max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(1),
-        listener_label: "test-listener".into(),
+        ..test_serve_config()
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -242,18 +266,7 @@ async fn tls_plain_regression() {
     let backend = EchoServer::start().await;
 
     let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
-    let config = ServeConfig {
-        strategy: ForwardingStrategy::Userspace,
-        resources: test_resources(),
-        max_connections: None,
-        idle_timeout: None,
-        drain_timeout: Duration::from_secs(5),
-        connect_timeout: Duration::from_secs(5),
-        max_connect_attempts: 3,
-        tls_acceptor: None,
-        tls_handshake_timeout: Duration::from_secs(5),
-        listener_label: "test-listener".into(),
-    };
+    let config = test_serve_config();
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
@@ -295,15 +308,8 @@ async fn tls_splice_strategy_fallback() {
     let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
     let config = ServeConfig {
         strategy: ForwardingStrategy::Splice, // splice configured, but TLS forces userspace
-        resources: test_resources(),
-        max_connections: None,
-        idle_timeout: None,
-        drain_timeout: Duration::from_secs(5),
-        connect_timeout: Duration::from_secs(5),
-        max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
-        tls_handshake_timeout: Duration::from_secs(5),
-        listener_label: "test-listener".into(),
+        ..test_serve_config()
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -352,16 +358,8 @@ async fn tls_sni_multi_cert() {
 
     let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
     let config = ServeConfig {
-        strategy: ForwardingStrategy::Userspace,
-        resources: test_resources(),
-        max_connections: None,
-        idle_timeout: None,
-        drain_timeout: Duration::from_secs(5),
-        connect_timeout: Duration::from_secs(5),
-        max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
-        tls_handshake_timeout: Duration::from_secs(5),
-        listener_label: "test-listener".into(),
+        ..test_serve_config()
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -394,7 +392,10 @@ async fn tls_sni_multi_cert() {
     let connector = TlsConnector::from(cross_client);
     let sn = ServerName::try_from("b.test".to_owned()).unwrap();
     let result = connector.connect(sn, tcp).await;
-    assert!(result.is_err(), "cross-trust should fail: cert_a doesn't cover b.test");
+    assert!(
+        result.is_err(),
+        "cross-trust should fail: cert_a doesn't cover b.test"
+    );
 }
 
 // sending garbage bytes to TLS listener → protocol_error metric increments.
@@ -410,13 +411,10 @@ async fn tls_handshake_failure_garbage_input() {
 
     // proxy should abort the handshake and close the connection
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(
-        Duration::from_secs(3),
-        stream.read(&mut buf),
-    )
-    .await
-    .expect("timed out waiting for proxy to close connection")
-    .unwrap_or(0);
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .expect("timed out waiting for proxy to close connection")
+        .unwrap_or(0);
 
     // EOF (n=0) or TLS alert bytes — either way the handshake was rejected
     // the key assertion is that the proxy didn't hang or panic
@@ -441,7 +439,10 @@ async fn tls_half_close() {
 
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
-    assert_eq!(buf, b"AFTER_FIN", "proxy must deliver backend response sent after client FIN");
+    assert_eq!(
+        buf, b"AFTER_FIN",
+        "proxy must deliver backend response sent after client FIN"
+    );
 }
 
 // TLS connection with idle timeout: proxy closes an idle TLS connection after the configured
@@ -454,16 +455,9 @@ async fn tls_idle_timeout() {
 
     let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
     let config = ServeConfig {
-        strategy: ForwardingStrategy::Userspace,
-        resources: test_resources(),
-        max_connections: None,
         idle_timeout: Some(Duration::from_secs(1)),
-        drain_timeout: Duration::from_secs(5),
-        connect_timeout: Duration::from_secs(5),
-        max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
-        tls_handshake_timeout: Duration::from_secs(5),
-        listener_label: "test-listener".into(),
+        ..test_serve_config()
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -498,16 +492,8 @@ async fn tls_graceful_shutdown() {
 
     let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
     let config = ServeConfig {
-        strategy: ForwardingStrategy::Userspace,
-        resources: test_resources(),
-        max_connections: None,
-        idle_timeout: None,
-        drain_timeout: Duration::from_secs(5),
-        connect_timeout: Duration::from_secs(5),
-        max_connect_attempts: 3,
         tls_acceptor: Some(acceptor),
-        tls_handshake_timeout: Duration::from_secs(5),
-        listener_label: "test-listener".into(),
+        ..test_serve_config()
     };
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -563,5 +549,8 @@ async fn tls_backend_dies_mid_transfer() {
         .expect("proxy hung after backend crash")
         .ok();
 
-    assert_eq!(received, b"partial", "should receive exactly what backend sent before dying");
+    assert_eq!(
+        received, b"partial",
+        "should receive exactly what backend sent before dying"
+    );
 }

@@ -8,12 +8,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
+use kntx::access_log::AccessLogSink;
 use kntx::balancer::RoundRobin;
-use kntx::config::ForwardingStrategy;
+use kntx::config::{ErrorPagesConfig, ForwardingStrategy, ListenerConfig, ListenerMode};
 use kntx::health::BackendPool;
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
+use kntx::proxy::l7::ErrorPages;
 
 use helpers::EchoServer;
 
@@ -36,6 +38,21 @@ fn test_pool(addrs: &[SocketAddr]) -> Arc<BackendPool> {
     ))
 }
 
+fn test_listener_cfg() -> Arc<ListenerConfig> {
+    Arc::new(ListenerConfig {
+        address: "127.0.0.1:0".parse().unwrap(),
+        mode: ListenerMode::L4,
+        pool: "test".to_owned(),
+        max_connections: None,
+        idle_timeout_secs: None,
+        drain_timeout_secs: 5,
+        connect_timeout_secs: 5,
+        max_connect_attempts: 3,
+        tls: None,
+        header_size_limit_bytes: 16384,
+    })
+}
+
 fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
     ServeConfig {
         strategy,
@@ -48,12 +65,14 @@ fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
         tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: "test-listener".into(),
+        listener_cfg: test_listener_cfg(),
+        error_pages: Arc::new(ErrorPages::load(&ErrorPagesConfig::default()).unwrap()),
+        access_log: Arc::new(AccessLogSink::Off),
+        buffer_pool: Arc::new(BufferPool::new(64, 64 * 1024)),
     }
 }
 
-async fn start_proxy(
-    backend_addrs: &[SocketAddr],
-) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
+async fn start_proxy(backend_addrs: &[SocketAddr]) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
     start_proxy_with_config(
         backend_addrs,
         test_serve_config(ForwardingStrategy::Userspace),
@@ -83,21 +102,14 @@ async fn pool_exhaustion_degrades_gracefully() {
     let backend = EchoServer::start().await;
 
     let config = ServeConfig {
-        strategy: ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: BufferPool::new(4, 64 * 1024),
             #[cfg(target_os = "linux")]
             pipe_pool: kntx::pool::pipe::PipePool::new(4).unwrap(),
             socket_buffer_size: None,
         },
-        max_connections: None,
-        idle_timeout: None,
-        drain_timeout: Duration::from_secs(5),
-        connect_timeout: Duration::from_secs(5),
-        max_connect_attempts: 3,
-        tls_acceptor: None,
-        tls_handshake_timeout: Duration::from_secs(5),
-        listener_label: "test-listener".into(),
+        buffer_pool: Arc::new(BufferPool::new(4, 64 * 1024)),
+        ..test_serve_config(ForwardingStrategy::Userspace)
     };
 
     let (proxy_addr, _shutdown) = start_proxy_with_config(&[backend.addr], config).await;

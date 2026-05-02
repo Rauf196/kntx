@@ -7,12 +7,14 @@ use clap::{Parser, ValueEnum};
 use tokio::task::JoinSet;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+use kntx::access_log::AccessLogSink;
 use kntx::balancer::RoundRobin;
 use kntx::config;
 use kntx::health::{BackendPool, HealthChecker};
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
+use kntx::proxy::l7::ErrorPages;
 
 #[derive(Parser)]
 #[command(name = "kntx", version, about = "High-performance L4/L7 reverse proxy")]
@@ -171,6 +173,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "resource pools initialized",
     );
 
+    // build shared L7 resources — both are read-only after construction
+    let error_pages = Arc::new(ErrorPages::load(&config.error_pages)?);
+    let access_log = Arc::new(AccessLogSink::from_config(&config.access_log)?);
+
     // shutdown coordination: all listener tasks and health checkers share this receiver
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     let shutdown_tx = Arc::new(shutdown_tx);
@@ -202,8 +208,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // pre-bind every listener and build TLS acceptors. fail fast on bind / cert errors
     // BEFORE spawning any background task — avoids transient checkers / metrics noise on startup failure.
-    let mut prepared: Vec<(usize, tokio::net::TcpListener, Option<tokio_rustls::TlsAcceptor>)> =
-        Vec::with_capacity(config.listeners.len());
+    let mut prepared: Vec<(
+        usize,
+        tokio::net::TcpListener,
+        Option<tokio_rustls::TlsAcceptor>,
+    )> = Vec::with_capacity(config.listeners.len());
     for (idx, listener_cfg) in config.listeners.iter().enumerate() {
         let tls_acceptor = if let Some(ref tls_cfg) = listener_cfg.tls {
             Some(kntx::tls::build_acceptor(tls_cfg)?)
@@ -273,6 +282,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tls_acceptor,
             tls_handshake_timeout,
             listener_label: listener_cfg.address.to_string().into(),
+            listener_cfg: Arc::new(listener_cfg.clone()),
+            error_pages: Arc::clone(&error_pages),
+            access_log: Arc::clone(&access_log),
+            buffer_pool: Arc::new(resources.buffer_pool.clone()),
         };
 
         tracing::info!(

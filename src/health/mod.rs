@@ -231,11 +231,7 @@ pub struct HealthChecker {
 }
 
 impl HealthChecker {
-    pub fn new(
-        pool: Arc<BackendPool>,
-        interval: Duration,
-        connect_timeout: Duration,
-    ) -> Self {
+    pub fn new(pool: Arc<BackendPool>, interval: Duration, connect_timeout: Duration) -> Self {
         Self {
             pool,
             interval,
@@ -265,8 +261,7 @@ impl HealthChecker {
             let addr = backend.address();
             let start = std::time::Instant::now();
 
-            let result =
-                tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr)).await;
+            let result = tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr)).await;
 
             let duration = start.elapsed();
 

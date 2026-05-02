@@ -51,9 +51,7 @@ pub fn client_config_trusting(cert_der: &[u8]) -> Arc<rustls::ClientConfig> {
         .unwrap_or(());
 
     let mut roots = RootCertStore::empty();
-    roots
-        .add(CertificateDer::from(cert_der.to_vec()))
-        .unwrap();
+    roots.add(CertificateDer::from(cert_der.to_vec())).unwrap();
 
     Arc::new(
         rustls::ClientConfig::builder()

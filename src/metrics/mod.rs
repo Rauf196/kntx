@@ -53,6 +53,35 @@ pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         "TLS handshake duration in seconds (labels: listener)"
     );
 
+    describe_counter!(
+        "kntx_http_requests_total",
+        "L7 HTTP requests completed (any status)."
+    );
+    describe_counter!(
+        "kntx_http_parse_errors_total",
+        "L7 requests rejected due to request head parse failure."
+    );
+    describe_counter!(
+        "kntx_http_smuggling_rejects_total",
+        "L7 requests rejected by request smuggling defense."
+    );
+    describe_histogram!(
+        "kntx_http_request_duration_seconds",
+        "End-to-end L7 request duration from head-read start to response-body complete."
+    );
+    describe_counter!(
+        "kntx_access_log_dropped_total",
+        "Access log lines dropped due to file-sink channel overflow."
+    );
+    describe_counter!(
+        "kntx_l7_buffer_pool_exhausted_total",
+        "L7 requests rejected because the buffer pool was exhausted (labels: listener)."
+    );
+    describe_counter!(
+        "kntx_http_body_parse_errors_total",
+        "L7 request body forwarding aborted due to malformed framing or I/O error (labels: listener, kind)."
+    );
+
     PrometheusBuilder::new()
         .with_http_listener(address)
         .install()?;

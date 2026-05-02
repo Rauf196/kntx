@@ -57,6 +57,9 @@ pub enum ConfigError {
 
     #[error("TLS key file not found: '{path}'")]
     TlsKeyFileNotFound { path: PathBuf },
+
+    #[error("error page file not found for status {status}: '{path}'")]
+    ErrorPageFileNotFound { status: String, path: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -81,12 +84,12 @@ impl fmt::Display for ForwardingStrategy {
 }
 
 /// which protocol mode this listener runs in.
-/// only l4 exists today; l7 and tls-passthrough land in 6b and 6e.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ListenerMode {
     #[default]
     L4,
+    L7,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,9 +106,13 @@ pub struct Config {
     pub forwarding: ForwardingConfig,
     #[serde(default)]
     pub health: HealthConfig,
+    #[serde(default)]
+    pub error_pages: ErrorPagesConfig,
+    #[serde(default)]
+    pub access_log: AccessLogConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ListenerConfig {
     pub address: SocketAddr,
     #[serde(default)]
@@ -120,6 +127,8 @@ pub struct ListenerConfig {
     #[serde(default = "default_max_connect_attempts")]
     pub max_connect_attempts: u32,
     pub tls: Option<TlsConfig>,
+    #[serde(default = "default_header_size_limit")]
+    pub header_size_limit_bytes: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,7 +168,7 @@ pub struct ResolvedHealth {
     pub recovery_timeout_secs: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TlsConfig {
     #[serde(default = "default_handshake_timeout")]
     pub handshake_timeout_secs: u64,
@@ -168,7 +177,7 @@ pub struct TlsConfig {
     pub certificates: Vec<CertificateConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CertificateConfig {
     pub cert: PathBuf,
     pub key: PathBuf,
@@ -261,6 +270,55 @@ fn default_log_level() -> String {
 #[derive(Debug, Deserialize)]
 pub struct MetricsConfig {
     pub address: SocketAddr,
+}
+
+fn default_header_size_limit() -> usize {
+    16384
+}
+
+/// maps status codes (as strings) to custom error page file paths.
+/// keys are strings because TOML requires string keys for quoted numeric keys.
+#[derive(Debug, Default, Deserialize)]
+pub struct ErrorPagesConfig {
+    #[serde(flatten)]
+    pub pages: std::collections::HashMap<String, std::path::PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AccessLogOutput {
+    Named(String),
+    File { file: std::path::PathBuf },
+}
+
+impl Default for AccessLogOutput {
+    fn default() -> Self {
+        Self::Named("stdout".to_owned())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AccessLogConfig {
+    #[serde(default)]
+    pub output: AccessLogOutput,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default = "default_file_channel_capacity")]
+    pub file_channel_capacity: usize,
+}
+
+impl Default for AccessLogConfig {
+    fn default() -> Self {
+        Self {
+            output: AccessLogOutput::default(),
+            format: None,
+            file_channel_capacity: default_file_channel_capacity(),
+        }
+    }
+}
+
+fn default_file_channel_capacity() -> usize {
+    4096
 }
 
 impl Config {
@@ -391,6 +449,12 @@ impl Config {
             if let Some(ref tls) = listener.tls {
                 validate_tls_config(tls)?;
             }
+            if listener.header_size_limit_bytes < 64 {
+                return Err(ConfigError::InvalidValue {
+                    field: "listener.header_size_limit_bytes",
+                    reason: "must be at least 64".to_owned(),
+                });
+            }
         }
 
         // global health defaults
@@ -435,6 +499,43 @@ impl Config {
                     });
                 }
             }
+        }
+
+        // error pages: missing file is fatal at startup
+        for (status, path) in &self.error_pages.pages {
+            if !path.exists() {
+                return Err(ConfigError::ErrorPageFileNotFound {
+                    status: status.clone(),
+                    path: path.clone(),
+                });
+            }
+        }
+
+        // access log validation
+        if let Some(ref fmt) = self.access_log.format
+            && fmt != "json"
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "access_log.format",
+                reason: format!("only 'json' is supported, got '{fmt}'"),
+            });
+        }
+        if self.access_log.file_channel_capacity < 64 {
+            return Err(ConfigError::InvalidValue {
+                field: "access_log.file_channel_capacity",
+                reason: "must be at least 64".to_owned(),
+            });
+        }
+        // validate named output values
+        if let AccessLogOutput::Named(ref name) = self.access_log.output
+            && name != "stdout"
+            && name != "stderr"
+            && name != "off"
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "access_log.output",
+                reason: format!("must be 'stdout', 'stderr', 'off', or a file table, got '{name}'"),
+            });
         }
 
         Ok(())

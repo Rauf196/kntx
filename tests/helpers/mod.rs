@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod http_backend;
 pub mod tls;
 
 use std::net::SocketAddr;

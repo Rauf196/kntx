@@ -7,12 +7,14 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use kntx::access_log::AccessLogSink;
 use kntx::balancer::RoundRobin;
-use kntx::config::ForwardingStrategy;
+use kntx::config::{ErrorPagesConfig, ForwardingStrategy, ListenerConfig, ListenerMode};
 use kntx::health::{BackendPool, CircuitState};
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
+use kntx::proxy::l7::ErrorPages;
 
 use helpers::EchoServer;
 
@@ -23,6 +25,21 @@ fn test_resources() -> Resources {
         pipe_pool: kntx::pool::pipe::PipePool::new(32).unwrap(),
         socket_buffer_size: None,
     }
+}
+
+fn test_listener_cfg() -> Arc<ListenerConfig> {
+    Arc::new(ListenerConfig {
+        address: "127.0.0.1:0".parse().unwrap(),
+        mode: ListenerMode::L4,
+        pool: "test".to_owned(),
+        max_connections: None,
+        idle_timeout_secs: None,
+        drain_timeout_secs: 5,
+        connect_timeout_secs: 5,
+        max_connect_attempts: 3,
+        tls: None,
+        header_size_limit_bytes: 16384,
+    })
 }
 
 fn test_serve_config() -> ServeConfig {
@@ -37,6 +54,10 @@ fn test_serve_config() -> ServeConfig {
         tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: "test-listener".into(),
+        listener_cfg: test_listener_cfg(),
+        error_pages: Arc::new(ErrorPages::load(&ErrorPagesConfig::default()).unwrap()),
+        access_log: Arc::new(AccessLogSink::Off),
+        buffer_pool: Arc::new(BufferPool::new(64, 64 * 1024)),
     }
 }
 

@@ -9,9 +9,12 @@ use tokio::sync::Semaphore;
 use tokio::sync::watch;
 use tracing::Instrument;
 
+use crate::access_log::AccessLogSink;
 use crate::balancer::RoundRobin;
-use crate::config::ForwardingStrategy;
+use crate::config::{ForwardingStrategy, ListenerConfig, ListenerMode};
+use crate::pool::buffer::BufferPool;
 use crate::proxy::l4::{self, Resources};
+use crate::proxy::l7::{self, ClientStream, ErrorPages};
 use crate::util::monotonic_millis;
 
 #[derive(Debug, Error)]
@@ -35,6 +38,10 @@ pub struct ServeConfig {
     pub tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     pub tls_handshake_timeout: Duration,
     pub listener_label: Arc<str>,
+    pub listener_cfg: Arc<ListenerConfig>,
+    pub error_pages: Arc<ErrorPages>,
+    pub access_log: Arc<AccessLogSink>,
+    pub buffer_pool: Arc<BufferPool>,
 }
 
 enum ClientConn {
@@ -82,6 +89,10 @@ pub async fn serve(
     let tls_acceptor = config.tls_acceptor;
     let tls_handshake_timeout = config.tls_handshake_timeout;
     let listener_label = config.listener_label.clone();
+    let listener_cfg = config.listener_cfg.clone();
+    let error_pages = config.error_pages.clone();
+    let access_log = config.access_log.clone();
+    let buffer_pool = config.buffer_pool.clone();
 
     let mut tasks: JoinSet<()> = JoinSet::new();
 
@@ -134,6 +145,10 @@ pub async fn serve(
                         let resources = config.resources.clone();
                         let tls_acceptor = tls_acceptor.clone();
                         let listener_label = listener_label.clone();
+                        let listener_cfg = listener_cfg.clone();
+                        let error_pages = error_pages.clone();
+                        let access_log = access_log.clone();
+                        let buffer_pool = buffer_pool.clone();
 
                         tasks.spawn(async move {
                             let _permit = permit;
@@ -203,107 +218,144 @@ pub async fn serve(
                             };
 
                             let pool = balancer.pool();
-                            let pool_name = pool.name().to_string();
 
-                            let mut attempts = 0u32;
-                            let (backend_addr, server) = loop {
-                                let addr = match balancer.next_backend() {
-                                    Some(a) => a,
-                                    None => {
-                                        tracing::warn!(%peer, "no healthy backends available");
-                                        metrics::gauge!(
-                                            "kntx_connections_active",
-                                            "listener" => listener_label.to_string(),
-                                        )
-                                        .decrement(1.0);
-                                        return;
-                                    }
-                                };
-
-                                match l4::connect_backend(addr, connect_timeout, resources.socket_buffer_size).await {
-                                    Ok(server) => break (addr, server),
-                                    Err(e) => {
-                                        pool.record_failure(addr);
-                                        attempts += 1;
-                                        metrics::counter!(
-                                            "kntx_connect_retries_total",
-                                            "pool" => pool_name.clone(),
-                                            "listener" => listener_label.to_string(),
-                                        )
-                                        .increment(1);
-                                        if attempts >= max_connect_attempts {
-                                            tracing::warn!(%peer, attempts, "all retry attempts exhausted");
-                                            metrics::gauge!(
-                                                "kntx_connections_active",
-                                                "listener" => listener_label.to_string(),
-                                            )
-                                            .decrement(1.0);
-                                            return;
-                                        }
-                                        tracing::debug!(%peer, %addr, attempt = attempts, error = %e, "retrying");
-                                    }
-                                }
-                            };
-
-                            let span = tracing::info_span!("conn", %peer, backend = %backend_addr);
+                            let span = tracing::info_span!("conn", %peer);
 
                             async {
-                                let last_activity = AtomicU64::new(monotonic_millis());
+                                let last_activity = Arc::new(AtomicU64::new(monotonic_millis()));
 
-                                let forward_fut = async {
-                                    match client_conn {
-                                        ClientConn::Plain(tcp) => {
-                                            l4::forward_connected(tcp, server, strategy, &resources, &last_activity).await
-                                        }
-                                        ClientConn::Tls(tls) => {
-                                            l4::forward_tls(*tls, server, &resources, &last_activity).await
-                                        }
-                                    }
-                                };
+                                match listener_cfg.mode {
+                                    ListenerMode::L7 => {
+                                        let l7_stream = match client_conn {
+                                            ClientConn::Plain(tcp) => ClientStream::Plain(tcp),
+                                            ClientConn::Tls(tls) => ClientStream::Tls(tls),
+                                        };
 
-                                let result = if let Some(timeout) = idle_timeout {
-                                    tokio::select! {
-                                        result = forward_fut => Some(result),
-                                        _ = idle_watchdog(&last_activity, timeout) => {
-                                            tracing::info!("idle timeout");
-                                            None
-                                        }
-                                    }
-                                } else {
-                                    Some(forward_fut.await)
-                                };
-
-                                match result {
-                                    Some(Ok(fwd)) => {
-                                        pool.record_success(backend_addr);
-                                        metrics::counter!(
-                                            "kntx_forwarded_bytes_total",
-                                            "direction" => "client_to_backend",
-                                            "listener" => listener_label.to_string(),
-                                        )
-                                        .increment(fwd.client_to_backend);
-                                        metrics::counter!(
-                                            "kntx_forwarded_bytes_total",
-                                            "direction" => "backend_to_client",
-                                            "listener" => listener_label.to_string(),
-                                        )
-                                        .increment(fwd.backend_to_client);
-                                        tracing::debug!(
-                                            sent = fwd.client_to_backend,
-                                            recv = fwd.backend_to_client,
-                                            "connection closed",
+                                        let forward_fut = l7::forward_l7(
+                                            l7_stream,
+                                            peer,
+                                            listener_cfg.clone(),
+                                            Arc::clone(&pool),
+                                            Arc::clone(&balancer),
+                                            Arc::clone(&error_pages),
+                                            Arc::clone(&access_log),
+                                            Arc::clone(&last_activity),
+                                            Arc::clone(&buffer_pool),
+                                            listener_label.clone(),
                                         );
+
+                                        let result = if let Some(timeout) = idle_timeout {
+                                            tokio::select! {
+                                                r = forward_fut => r.err().map(|e| tracing::warn!(error = %e, "l7 error")),
+                                                _ = idle_watchdog(&last_activity, timeout) => {
+                                                    tracing::info!("idle timeout");
+                                                    metrics::counter!(
+                                                        "kntx_idle_timeouts_total",
+                                                        "listener" => listener_label.to_string(),
+                                                    ).increment(1);
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            if let Err(e) = forward_fut.await { tracing::warn!(error = %e, "l7 error"); }
+                                            None
+                                        };
+                                        let _ = result;
                                     }
-                                    Some(Err(e)) => {
-                                        pool.record_failure(backend_addr);
-                                        tracing::warn!(error = %e, "connection failed");
-                                    }
-                                    None => {
-                                        metrics::counter!(
-                                            "kntx_idle_timeouts_total",
-                                            "listener" => listener_label.to_string(),
-                                        )
-                                        .increment(1);
+                                    ListenerMode::L4 => {
+                                        let pool_name = pool.name().to_string();
+                                        let mut attempts = 0u32;
+                                        let backend_result = loop {
+                                            let addr = match balancer.next_backend() {
+                                                Some(a) => a,
+                                                None => {
+                                                    tracing::warn!(%peer, "no healthy backends available");
+                                                    break None;
+                                                }
+                                            };
+                                            match l4::connect_backend(addr, connect_timeout, resources.socket_buffer_size).await {
+                                                Ok(server) => break Some((addr, server)),
+                                                Err(e) => {
+                                                    pool.record_failure(addr);
+                                                    attempts += 1;
+                                                    metrics::counter!(
+                                                        "kntx_connect_retries_total",
+                                                        "pool" => pool_name.clone(),
+                                                        "listener" => listener_label.to_string(),
+                                                    ).increment(1);
+                                                    if attempts >= max_connect_attempts {
+                                                        tracing::warn!(%peer, attempts, "all retry attempts exhausted");
+                                                        break None;
+                                                    }
+                                                    tracing::debug!(%peer, %addr, attempt = attempts, error = %e, "retrying");
+                                                }
+                                            }
+                                        };
+
+                                        let (backend_addr, server) = match backend_result {
+                                            Some(pair) => pair,
+                                            None => {
+                                                metrics::gauge!(
+                                                    "kntx_connections_active",
+                                                    "listener" => listener_label.to_string(),
+                                                ).decrement(1.0);
+                                                return;
+                                            }
+                                        };
+
+                                        let forward_fut = async {
+                                            match client_conn {
+                                                ClientConn::Plain(tcp) => {
+                                                    l4::forward_connected(tcp, server, strategy, &resources, &last_activity).await
+                                                }
+                                                ClientConn::Tls(tls) => {
+                                                    l4::forward_tls(*tls, server, &resources, &last_activity).await
+                                                }
+                                            }
+                                        };
+
+                                        let result = if let Some(timeout) = idle_timeout {
+                                            tokio::select! {
+                                                result = forward_fut => Some(result),
+                                                _ = idle_watchdog(&last_activity, timeout) => {
+                                                    tracing::info!("idle timeout");
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            Some(forward_fut.await)
+                                        };
+
+                                        match result {
+                                            Some(Ok(fwd)) => {
+                                                pool.record_success(backend_addr);
+                                                metrics::counter!(
+                                                    "kntx_forwarded_bytes_total",
+                                                    "direction" => "client_to_backend",
+                                                    "listener" => listener_label.to_string(),
+                                                ).increment(fwd.client_to_backend);
+                                                metrics::counter!(
+                                                    "kntx_forwarded_bytes_total",
+                                                    "direction" => "backend_to_client",
+                                                    "listener" => listener_label.to_string(),
+                                                ).increment(fwd.backend_to_client);
+                                                tracing::debug!(
+                                                    sent = fwd.client_to_backend,
+                                                    recv = fwd.backend_to_client,
+                                                    "connection closed",
+                                                );
+                                            }
+                                            Some(Err(e)) => {
+                                                pool.record_failure(backend_addr);
+                                                tracing::warn!(error = %e, "connection failed");
+                                            }
+                                            None => {
+                                                metrics::counter!(
+                                                    "kntx_idle_timeouts_total",
+                                                    "listener" => listener_label.to_string(),
+                                                ).increment(1);
+                                            }
+                                        }
                                     }
                                 }
 

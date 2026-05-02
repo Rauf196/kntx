@@ -23,7 +23,15 @@ pub async fn forward(
     let (client_read, client_write) = client.into_split();
     let (server_read, server_write) = server.into_split();
 
-    forward_halves(client_read, client_write, server_read, server_write, buffer_pool, last_activity).await
+    forward_halves(
+        client_read,
+        client_write,
+        server_read,
+        server_write,
+        buffer_pool,
+        last_activity,
+    )
+    .await
 }
 
 /// forward a TLS client stream to a plain TCP backend using pooled userspace buffers.
@@ -41,7 +49,15 @@ pub async fn forward_tls(
     let (client_read, client_write) = tokio::io::split(client);
     let (server_read, server_write) = server.into_split();
 
-    forward_halves(client_read, client_write, server_read, server_write, buffer_pool, last_activity).await
+    forward_halves(
+        client_read,
+        client_write,
+        server_read,
+        server_write,
+        buffer_pool,
+        last_activity,
+    )
+    .await
 }
 
 async fn forward_halves<CR, CW, SR, SW>(
