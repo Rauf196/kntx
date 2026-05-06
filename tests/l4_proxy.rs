@@ -16,7 +16,7 @@ use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
 
-use helpers::EchoServer;
+use helpers::{EchoServer, make_single_pool_router};
 
 fn test_resources() -> Resources {
     Resources {
@@ -40,7 +40,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
     Arc::new(ListenerConfig {
         address: "127.0.0.1:0".parse().unwrap(),
         mode: ListenerMode::L4,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: None,
         drain_timeout_secs: 5,
@@ -78,14 +78,16 @@ async fn start_proxy_with_strategy(
     backend_addrs: &[SocketAddr],
     strategy: ForwardingStrategy,
 ) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
-    let balancer = Arc::new(RoundRobin::new(test_pool(backend_addrs)));
+    let pool = test_pool(backend_addrs);
+    let rr = Arc::new(RoundRobin::new(pool.clone()));
+    let router = make_single_pool_router(pool, rr);
     let config = test_serve_config(strategy);
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
     (proxy_addr, shutdown_tx)
 }
@@ -129,8 +131,8 @@ async fn round_robin_distribution() {
     let b2_addr = b2.addr;
 
     let pool = test_pool(&[b1_addr, b2_addr]);
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
-    let balancer_ref = Arc::clone(&balancer);
+    let rr = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(pool, Arc::clone(&rr));
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
@@ -138,7 +140,7 @@ async fn round_robin_distribution() {
     let (_shutdown_tx2, shutdown_rx2) = tokio::sync::watch::channel(());
     tokio::spawn(listener::serve(
         tcp_listener,
-        balancer_ref,
+        router,
         test_serve_config(ForwardingStrategy::Userspace),
         shutdown_rx2,
     ));
@@ -153,7 +155,7 @@ async fn round_robin_distribution() {
     }
 
     // connections consumed indices 0,1,2,3 - next is 4 % 2 == 0 -> first backend
-    let next = balancer.next_backend().unwrap();
+    let next = rr.next_backend().unwrap();
     assert_eq!(next, b1_addr);
 }
 
@@ -301,8 +303,8 @@ mod splice_tests {
         let b2_addr = b2.addr;
 
         let pool = test_pool(&[b1_addr, b2_addr]);
-        let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
-        let balancer_ref = Arc::clone(&balancer);
+        let rr = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+        let router = make_single_pool_router(pool, Arc::clone(&rr));
 
         let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = tcp_listener.local_addr().unwrap();
@@ -310,7 +312,7 @@ mod splice_tests {
         let (_shutdown_tx_s, shutdown_rx_s) = tokio::sync::watch::channel(());
         tokio::spawn(listener::serve(
             tcp_listener,
-            balancer_ref,
+            router,
             test_serve_config(ForwardingStrategy::Splice),
             shutdown_rx_s,
         ));
@@ -324,7 +326,7 @@ mod splice_tests {
             assert_eq!(&buf[..n], b"ping");
         }
 
-        let next = balancer.next_backend().unwrap();
+        let next = rr.next_backend().unwrap();
         assert_eq!(next, b1_addr);
     }
 

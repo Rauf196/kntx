@@ -144,17 +144,20 @@ run_iperf_test "direct" "$IPERF_PORT"
 KNTX_PID=""
 for strategy in userspace vectored splice; do
     cat > /tmp/kntx-bench-${strategy}.toml <<EOF
-[listener]
-address = "0.0.0.0:$PROXY_PORT"
-
-[[backends]]
-address = "127.0.0.1:$IPERF_PORT"
-
 [forwarding]
 strategy = "$strategy"
 
 [logging]
 level = "warn"
+
+[[listeners]]
+address = "0.0.0.0:$PROXY_PORT"
+mode = "l4"
+pool = "bench"
+
+[[pools]]
+name = "bench"
+backends = [{ address = "127.0.0.1:$IPERF_PORT" }]
 EOF
 
     $KNTX -c "/tmp/kntx-bench-${strategy}.toml" &

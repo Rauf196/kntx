@@ -15,6 +15,7 @@ use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
+use kntx::proxy::l7::router::{Router, build_router};
 
 #[derive(Parser)]
 #[command(name = "kntx", version, about = "High-performance L4/L7 reverse proxy")]
@@ -247,7 +248,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut task_addrs: HashMap<tokio::task::Id, SocketAddr> = HashMap::new();
     for (idx, tcp_listener, tls_acceptor) in prepared {
         let listener_cfg = &config.listeners[idx];
-        let (_, balancer) = pool_map.get(&listener_cfg.pool).unwrap();
+        let router: Arc<dyn Router> =
+            Arc::new(build_router(listener_cfg, &pool_map).expect("pool refs validated"));
 
         if let Some(ref tls_cfg) = listener_cfg.tls {
             tracing::info!(
@@ -290,14 +292,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         tracing::info!(
             address = %listener_cfg.address,
-            pool = %listener_cfg.pool,
+            pool = listener_cfg.pool.as_deref().unwrap_or("(routed)"),
             %strategy,
             "listener starting",
         );
 
-        let balancer = Arc::clone(balancer);
         let rx = shutdown_rx.clone();
-        let abort = listener_tasks.spawn(listener::serve(tcp_listener, balancer, serve_config, rx));
+        let abort = listener_tasks.spawn(listener::serve(tcp_listener, router, serve_config, rx));
         task_addrs.insert(abort.id(), listener_cfg.address);
     }
 

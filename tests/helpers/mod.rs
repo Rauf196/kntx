@@ -4,10 +4,45 @@ pub mod http_backend;
 pub mod tls;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+
+use kntx::balancer::RoundRobin;
+use kntx::health::BackendPool;
+use kntx::proxy::l7::matcher::CompositeMatcher;
+use kntx::proxy::l7::router::{ConfigRouter, PoolHandle, RouteEntry, Router};
+
+/// wrap a single pool into a catch-all `ConfigRouter` suitable for tests.
+pub fn make_single_pool_router(
+    pool: Arc<BackendPool>,
+    rr: Arc<RoundRobin>,
+) -> Arc<dyn Router> {
+    let handle = PoolHandle {
+        name: pool.name().into(),
+        backends: pool,
+        rr,
+    };
+    let entry = RouteEntry {
+        matcher: CompositeMatcher::new(vec![]),
+        pool: handle,
+        route_id: Arc::from("default"),
+    };
+    Arc::new(ConfigRouter::new(vec![entry]))
+}
+
+/// build a test pool with one or more backend addresses.
+pub fn make_test_pool(name: &str, addrs: &[std::net::SocketAddr]) -> Arc<BackendPool> {
+    Arc::new(BackendPool::new(
+        name.into(),
+        addrs.to_vec(),
+        3,
+        Duration::from_secs(10),
+    ))
+}
 
 pub struct EchoServer {
     pub addr: SocketAddr,

@@ -10,6 +10,7 @@ use tokio::sync::watch;
 
 use helpers::http_backend::{BackendRequest, HttpBackend, ResponseSpec};
 use helpers::tls::{client_config_trusting, generate_cert, write_cert_to_tempdir};
+use helpers::make_single_pool_router;
 use kntx::access_log::AccessLogSink;
 use kntx::balancer::RoundRobin;
 use kntx::config::{
@@ -46,12 +47,12 @@ async fn start_l7_proxy_with_limit(backend_addr: SocketAddr, header_limit: usize
         3,
         Duration::from_secs(10),
     ));
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
 
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -96,7 +97,7 @@ async fn start_l7_proxy_with_limit(backend_addr: SocketAddr, header_limit: usize
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, balancer, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
 
     L7Proxy {
         addr,
@@ -120,12 +121,12 @@ async fn start_l7_proxy_no_backends() -> L7Proxy {
     // trip the circuit breaker on all backends
     pool.record_failure(dead_addr);
     pool.record_failure(dead_addr);
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
 
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -170,7 +171,7 @@ async fn start_l7_proxy_no_backends() -> L7Proxy {
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, balancer, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     L7Proxy {
@@ -212,12 +213,12 @@ async fn start_l7_proxy_tls(backend_addr: SocketAddr) -> L7TlsProxy {
         3,
         Duration::from_secs(10),
     ));
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
 
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -262,7 +263,7 @@ async fn start_l7_proxy_tls(backend_addr: SocketAddr) -> L7TlsProxy {
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, balancer, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
 
     L7TlsProxy {
         addr,
@@ -675,7 +676,7 @@ async fn custom_error_page_served() {
         Duration::from_secs(10),
     ));
     pool.record_failure(backend_addr); // trip circuit
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
 
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -685,7 +686,7 @@ async fn custom_error_page_served() {
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -730,7 +731,7 @@ async fn custom_error_page_served() {
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, balancer, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let resp = raw_request(addr, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
@@ -805,12 +806,12 @@ async fn connect_timeout_returns_504() {
         3,
         Duration::from_secs(10),
     ));
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
 
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -854,7 +855,7 @@ async fn connect_timeout_returns_504() {
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, balancer, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let resp = raw_request(addr, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
@@ -883,7 +884,7 @@ async fn access_log_emits_line() {
         3,
         Duration::from_secs(10),
     ));
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -892,7 +893,7 @@ async fn access_log_emits_line() {
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -936,7 +937,7 @@ async fn access_log_emits_line() {
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, balancer, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     raw_request(addr, b"GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
@@ -967,7 +968,7 @@ async fn access_log_trace_id_propagates() {
         3,
         Duration::from_secs(10),
     ));
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -976,7 +977,7 @@ async fn access_log_trace_id_propagates() {
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -1020,7 +1021,7 @@ async fn access_log_trace_id_propagates() {
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, balancer, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -1162,7 +1163,7 @@ async fn mid_body_backend_failure_records_passive_health() {
         1,
         Duration::from_secs(60),
     ));
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
 
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -1172,7 +1173,7 @@ async fn mid_body_backend_failure_records_passive_health() {
     let listener_cfg = Arc::new(ListenerConfig {
         address: proxy_addr,
         mode: ListenerMode::L7,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -1217,7 +1218,7 @@ async fn mid_body_backend_failure_records_passive_health() {
     };
 
     let pool_ref = Arc::clone(&pool);
-    tokio::spawn(listener::serve(listener, balancer, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     // round-robin picks bad_addr first (idx 0); backend closes → record_failure
@@ -1257,7 +1258,7 @@ async fn start_l7_proxy_logged(
         3,
         Duration::from_secs(10),
     ));
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -1265,7 +1266,7 @@ async fn start_l7_proxy_logged(
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -1307,7 +1308,7 @@ async fn start_l7_proxy_logged(
         buffer_pool,
     };
     let shutdown_tx_ret = shutdown_tx.clone();
-    tokio::spawn(listener::serve(listener, balancer, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
     (
         L7Proxy {
             addr,
@@ -1329,7 +1330,7 @@ async fn start_l7_proxy_no_backends_logged(
     ));
     pool.record_failure(dead_addr);
     pool.record_failure(dead_addr);
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -1337,7 +1338,7 @@ async fn start_l7_proxy_no_backends_logged(
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -1379,7 +1380,7 @@ async fn start_l7_proxy_no_backends_logged(
         buffer_pool,
     };
     let shutdown_tx_ret = shutdown_tx.clone();
-    tokio::spawn(listener::serve(listener, balancer, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
     tokio::time::sleep(Duration::from_millis(10)).await;
     (
         L7Proxy {
@@ -1483,7 +1484,7 @@ async fn access_log_request_id_round_trips() {
         3,
         Duration::from_secs(10),
     ));
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -1492,7 +1493,7 @@ async fn access_log_request_id_round_trips() {
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -1536,7 +1537,7 @@ async fn access_log_request_id_round_trips() {
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, balancer, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     raw_request(

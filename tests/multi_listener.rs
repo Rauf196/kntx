@@ -16,8 +16,9 @@ use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
+use kntx::proxy::l7::router::Router;
 
-use helpers::EchoServer;
+use helpers::{EchoServer, make_single_pool_router};
 
 fn test_resources() -> Resources {
     Resources {
@@ -41,7 +42,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
     Arc::new(ListenerConfig {
         address: "127.0.0.1:0".parse().unwrap(),
         mode: ListenerMode::L4,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: None,
         drain_timeout_secs: 5,
@@ -74,7 +75,7 @@ fn serve_config(label: &str) -> ServeConfig {
 /// start a listener and return its bound address.
 /// the returned Sender keeps the listener alive — drop it to shut down.
 async fn start_listener(
-    balancer: Arc<RoundRobin>,
+    router: Arc<dyn Router>,
     label: &str,
 ) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -82,7 +83,7 @@ async fn start_listener(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     tokio::spawn(listener::serve(
         tcp_listener,
-        balancer,
+        router,
         serve_config(label),
         shutdown_rx,
     ));
@@ -109,11 +110,11 @@ async fn two_listeners_different_pools_are_isolated() {
     let pool1 = make_pool_named("p1", &[b1.addr]);
     let pool2 = make_pool_named("p2", &[b2.addr]);
 
-    let balancer1 = Arc::new(RoundRobin::new(Arc::clone(&pool1)));
-    let balancer2 = Arc::new(RoundRobin::new(Arc::clone(&pool2)));
+    let rr1 = Arc::new(RoundRobin::new(Arc::clone(&pool1)));
+    let rr2 = Arc::new(RoundRobin::new(Arc::clone(&pool2)));
 
-    let (l1_addr, _tx1) = start_listener(balancer1, "l1").await;
-    let (l2_addr, _tx2) = start_listener(balancer2, "l2").await;
+    let (l1_addr, _tx1) = start_listener(make_single_pool_router(pool1, rr1), "l1").await;
+    let (l2_addr, _tx2) = start_listener(make_single_pool_router(pool2, rr2), "l2").await;
 
     // connections through L1 hit b1
     for _ in 0..4 {
@@ -151,11 +152,14 @@ async fn two_listeners_shared_pool_share_rr_counter() {
     ));
     let shared_rr = Arc::new(RoundRobin::new(Arc::clone(&shared_pool)));
 
-    let (l1_addr, _tx1) = start_listener(Arc::clone(&shared_rr), "l1").await;
-    let (l2_addr, _tx2) = start_listener(Arc::clone(&shared_rr), "l2").await;
+    // both routers hold a clone of shared_rr → strong_count = 1 + 1 + 1 = 3
+    let router1 = make_single_pool_router(Arc::clone(&shared_pool), Arc::clone(&shared_rr));
+    let router2 = make_single_pool_router(Arc::clone(&shared_pool), Arc::clone(&shared_rr));
+    let (l1_addr, _tx1) = start_listener(router1, "l1").await;
+    let (l2_addr, _tx2) = start_listener(router2, "l2").await;
 
-    // before traffic: test holds 1, each listener task holds 1 → exactly 3.
-    // if a listener had cloned into its own RoundRobin this would be 1.
+    // before traffic: test holds 1, each router task holds 1 → exactly 3.
+    // if routers used independent RoundRobins this would be 1.
     assert_eq!(
         Arc::strong_count(&shared_rr),
         3,
@@ -205,8 +209,10 @@ async fn shutdown_drains_all_listeners_independently() {
     let pool1 = make_pool_named("p1", &[b1.addr]);
     let pool2 = make_pool_named("p2", &[b2.addr]);
 
-    let balancer1 = Arc::new(RoundRobin::new(pool1));
-    let balancer2 = Arc::new(RoundRobin::new(pool2));
+    let rr1 = Arc::new(RoundRobin::new(pool1.clone()));
+    let rr2 = Arc::new(RoundRobin::new(pool2.clone()));
+    let router1 = make_single_pool_router(pool1, rr1);
+    let router2 = make_single_pool_router(pool2, rr2);
 
     let tcp_l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tcp_l2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -217,7 +223,7 @@ async fn shutdown_drains_all_listeners_independently() {
 
     let h1 = tokio::spawn(listener::serve(
         tcp_l1,
-        balancer1,
+        router1,
         ServeConfig {
             drain_timeout: Duration::from_secs(5),
             ..serve_config("l1")
@@ -226,7 +232,7 @@ async fn shutdown_drains_all_listeners_independently() {
     ));
     let h2 = tokio::spawn(listener::serve(
         tcp_l2,
-        balancer2,
+        router2,
         ServeConfig {
             drain_timeout: Duration::from_secs(5),
             ..serve_config("l2")

@@ -16,7 +16,7 @@ use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
 
-use helpers::EchoServer;
+use helpers::{EchoServer, make_single_pool_router};
 
 fn test_resources() -> Resources {
     Resources {
@@ -31,7 +31,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
     Arc::new(ListenerConfig {
         address: "127.0.0.1:0".parse().unwrap(),
         mode: ListenerMode::L4,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: None,
         drain_timeout_secs: 5,
@@ -65,11 +65,12 @@ async fn start_proxy_with_pool(
     pool: Arc<BackendPool>,
     config: ServeConfig,
 ) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let rr = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    let router = make_single_pool_router(pool, rr);
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
     (proxy_addr, shutdown_tx)
 }
 

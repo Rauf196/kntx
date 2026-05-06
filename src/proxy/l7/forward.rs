@@ -9,11 +9,11 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt
 use tokio::net::TcpStream;
 
 use crate::access_log::{AccessLogLine, AccessLogSink, extract_trace_id};
-use crate::balancer::RoundRobin;
 use crate::config::ListenerConfig;
-use crate::health::BackendPool;
 use crate::pool::buffer::BufferPool;
 use crate::proxy::l4;
+use crate::proxy::l7::matcher::RouteContext;
+use crate::proxy::l7::router::Router;
 use crate::util::monotonic_millis;
 
 use super::error::{ErrorPages, synthesize_error};
@@ -45,9 +45,9 @@ impl ClientStream {
 pub async fn forward_l7(
     client: ClientStream,
     client_addr: SocketAddr,
+    sni: Option<Arc<str>>,
     listener_cfg: Arc<ListenerConfig>,
-    pool: Arc<BackendPool>,
-    rr: Arc<RoundRobin>,
+    router: Arc<dyn Router>,
     error_pages: Arc<ErrorPages>,
     access_log: Arc<AccessLogSink>,
     last_activity: Arc<AtomicU64>,
@@ -55,23 +55,19 @@ pub async fn forward_l7(
     metrics_listener_label: Arc<str>,
 ) -> Result<(), L7Error> {
     let is_tls = client.is_tls();
-    let client_ip = client_addr.ip().to_string();
-    let pool_name = pool.name().to_string();
-
     match client {
         ClientStream::Plain(tcp) => {
             handle_l7(
                 tcp,
-                client_ip,
+                client_addr,
                 is_tls,
+                sni,
                 listener_cfg,
-                pool,
-                rr,
+                router,
                 error_pages,
                 access_log,
                 last_activity,
                 buffer_pool,
-                pool_name,
                 metrics_listener_label,
             )
             .await
@@ -79,16 +75,15 @@ pub async fn forward_l7(
         ClientStream::Tls(tls) => {
             handle_l7(
                 *tls,
-                client_ip,
+                client_addr,
                 is_tls,
+                sni,
                 listener_cfg,
-                pool,
-                rr,
+                router,
                 error_pages,
                 access_log,
                 last_activity,
                 buffer_pool,
-                pool_name,
                 metrics_listener_label,
             )
             .await
@@ -99,22 +94,24 @@ pub async fn forward_l7(
 #[allow(clippy::too_many_arguments)]
 async fn handle_l7<S>(
     client: S,
-    client_ip: String,
+    client_addr: SocketAddr,
     is_tls: bool,
+    sni: Option<Arc<str>>,
     listener_cfg: Arc<ListenerConfig>,
-    pool: Arc<BackendPool>,
-    rr: Arc<RoundRobin>,
+    router: Arc<dyn Router>,
     error_pages: Arc<ErrorPages>,
     access_log: Arc<AccessLogSink>,
     last_activity: Arc<AtomicU64>,
     buffer_pool: Arc<BufferPool>,
-    pool_name: String,
     listener_label: Arc<str>,
 ) -> Result<(), L7Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let start = Instant::now();
+    let client_ip = client_addr.ip().to_string();
+    // pool_name/route_id are unknown until routing; empty string used for pre-route error logs
+    let pool_name = String::new();
     let header_limit = listener_cfg.header_size_limit_bytes;
     let connect_timeout = std::time::Duration::from_secs(listener_cfg.connect_timeout_secs);
     let max_retries = listener_cfg.max_connect_attempts;
@@ -303,6 +300,7 @@ where
                 start,
                 None,
                 Some(request_id.clone()),
+                None,
             );
             return Ok(());
         }
@@ -327,6 +325,7 @@ where
             start,
             None,
             Some(request_id.clone()),
+            None,
         );
         return Ok(());
     }
@@ -351,9 +350,61 @@ where
             start,
             None,
             Some(request_id.clone()),
+            None,
         );
         return Ok(());
     }
+
+    // route the request to a pool
+    let host_header = find_header(&req.headers, "host");
+    let ctx = RouteContext {
+        method: Some(req.method.as_str()),
+        host: host_header.as_deref(),
+        path: Some(req.path.as_str()),
+        headers: &req.headers,
+        sni: sni.as_deref(),
+        client_ip: client_addr.ip(),
+    };
+    let entry = match router.route(&ctx) {
+        Some(e) => e,
+        None => {
+            metrics::counter!(
+                "kntx_route_no_match_total",
+                "listener" => listener_label.to_string(),
+            )
+            .increment(1);
+            let resp = synthesize_error(503, accept_ref, &error_pages);
+            let _ = client_wr.write_all(&resp).await;
+            emit_and_count(
+                &access_log,
+                &listener_label,
+                &client_ip,
+                &method,
+                &req.headers,
+                &path,
+                "",
+                None,
+                503,
+                0,
+                0,
+                start,
+                None,
+                Some(request_id.clone()),
+                None,
+            );
+            return Ok(());
+        }
+    };
+    let pool = entry.pool.backends.clone();
+    let rr = entry.pool.rr.clone();
+    let route_id = entry.route_id.clone();
+    let pool_name = entry.pool.name.to_string();
+    metrics::counter!(
+        "kntx_route_matches_total",
+        "listener" => listener_label.to_string(),
+        "route_id" => route_id.to_string(),
+    )
+    .increment(1);
 
     // backend selection with retry
     let backend_wait_start = Instant::now();
@@ -421,6 +472,7 @@ where
                 start,
                 None,
                 Some(request_id.clone()),
+                Some(route_id.as_ref()),
             );
             return Ok(());
         }
@@ -465,6 +517,7 @@ where
             start,
             None,
             Some(request_id),
+            Some(route_id.as_ref()),
         );
         return Ok(());
     }
@@ -556,6 +609,7 @@ where
             start,
             None,
             Some(request_id),
+            Some(route_id.as_ref()),
         );
         return Ok(());
     }
@@ -599,6 +653,7 @@ where
                     start,
                     None,
                     Some(request_id.clone()),
+                    Some(route_id.as_ref()),
                 );
                 return Ok(());
             }
@@ -626,6 +681,7 @@ where
                     start,
                     None,
                     Some(request_id.clone()),
+                    Some(route_id.as_ref()),
                 );
                 return Ok(());
             }
@@ -753,6 +809,7 @@ where
         start,
         backend_wait_ms,
         Some(request_id),
+        Some(route_id.as_ref()),
     );
 
     Ok(())
@@ -897,6 +954,7 @@ fn emit_and_count(
     start: Instant,
     backend_wait_ms: Option<f64>,
     request_id: Option<String>,
+    route_id: Option<&str>,
 ) {
     let host = find_header(headers, "host");
     let trace_id = find_header(headers, "traceparent")
@@ -921,7 +979,7 @@ fn emit_and_count(
         backend_wait_ms,
         backend: backend.map(|s| s.to_owned()),
         pool: pool.to_owned(),
-        route_id: None,
+        route_id: route_id.map(|s| s.to_owned()),
         request_id: req_id,
         trace_id,
         keepalive_index: 0,

@@ -10,11 +10,12 @@ use tokio::sync::watch;
 use tracing::Instrument;
 
 use crate::access_log::AccessLogSink;
-use crate::balancer::RoundRobin;
 use crate::config::{ForwardingStrategy, ListenerConfig, ListenerMode};
 use crate::pool::buffer::BufferPool;
 use crate::proxy::l4::{self, Resources};
 use crate::proxy::l7::{self, ClientStream, ErrorPages};
+use crate::proxy::l7::matcher::RouteContext;
+use crate::proxy::l7::router::Router;
 use crate::util::monotonic_millis;
 
 #[derive(Debug, Error)]
@@ -69,7 +70,7 @@ async fn idle_watchdog(last_activity: &AtomicU64, timeout: Duration) {
 
 pub async fn serve(
     listener: TcpListener,
-    balancer: Arc<RoundRobin>,
+    router: Arc<dyn Router>,
     config: ServeConfig,
     mut shutdown: watch::Receiver<()>,
 ) {
@@ -141,7 +142,7 @@ pub async fn serve(
                         )
                         .increment(1.0);
 
-                        let balancer = Arc::clone(&balancer);
+                        let router = Arc::clone(&router);
                         let resources = config.resources.clone();
                         let tls_acceptor = tls_acceptor.clone();
                         let listener_label = listener_label.clone();
@@ -153,7 +154,7 @@ pub async fn serve(
                         tasks.spawn(async move {
                             let _permit = permit;
 
-                            let client_conn = if let Some(acceptor) = tls_acceptor {
+                            let (client_conn, conn_sni) = if let Some(acceptor) = tls_acceptor {
                                 let handshake_start = std::time::Instant::now();
                                 match tokio::time::timeout(
                                     tls_handshake_timeout,
@@ -174,13 +175,18 @@ pub async fn serve(
                                         )
                                         .increment(1);
 
-                                        if let Some(sni) = tls.get_ref().1.server_name() {
-                                            tracing::debug!(%peer, %sni, "TLS handshake completed");
+                                        let sni: Option<Arc<str>> = tls
+                                            .get_ref()
+                                            .1
+                                            .server_name()
+                                            .map(Arc::from);
+                                        if let Some(ref s) = sni {
+                                            tracing::debug!(%peer, sni = %s, "TLS handshake completed");
                                         } else {
                                             tracing::debug!(%peer, "TLS handshake completed (no SNI)");
                                         }
 
-                                        ClientConn::Tls(Box::new(tls))
+                                        (ClientConn::Tls(Box::new(tls)), sni)
                                     }
                                     Ok(Err(e)) => {
                                         tracing::debug!(%peer, error = %e, "TLS handshake failed");
@@ -214,10 +220,8 @@ pub async fn serve(
                                     }
                                 }
                             } else {
-                                ClientConn::Plain(client)
+                                (ClientConn::Plain(client), None)
                             };
-
-                            let pool = balancer.pool();
 
                             let span = tracing::info_span!("conn", %peer);
 
@@ -234,9 +238,9 @@ pub async fn serve(
                                         let forward_fut = l7::forward_l7(
                                             l7_stream,
                                             peer,
+                                            conn_sni.clone(),
                                             listener_cfg.clone(),
-                                            Arc::clone(&pool),
-                                            Arc::clone(&balancer),
+                                            Arc::clone(&router),
                                             Arc::clone(&error_pages),
                                             Arc::clone(&access_log),
                                             Arc::clone(&last_activity),
@@ -263,10 +267,37 @@ pub async fn serve(
                                         let _ = result;
                                     }
                                     ListenerMode::L4 => {
-                                        let pool_name = pool.name().to_string();
+                                        let l4_ctx = RouteContext {
+                                            method: None,
+                                            host: None,
+                                            path: None,
+                                            headers: &[],
+                                            sni: conn_sni.as_deref(),
+                                            client_ip: peer.ip(),
+                                        };
+                                        let l4_entry = match router.route(&l4_ctx) {
+                                            Some(e) => e,
+                                            None => {
+                                                tracing::warn!(%peer, "no route for L4 connection");
+                                                metrics::counter!(
+                                                    "kntx_route_no_match_total",
+                                                    "listener" => listener_label.to_string(),
+                                                )
+                                                .increment(1);
+                                                metrics::gauge!(
+                                                    "kntx_connections_active",
+                                                    "listener" => listener_label.to_string(),
+                                                )
+                                                .decrement(1.0);
+                                                return;
+                                            }
+                                        };
+                                        let pool = l4_entry.pool.backends.clone();
+                                        let rr = l4_entry.pool.rr.clone();
+                                        let pool_name = l4_entry.pool.name.to_string();
                                         let mut attempts = 0u32;
                                         let backend_result = loop {
-                                            let addr = match balancer.next_backend() {
+                                            let addr = match rr.next_backend() {
                                                 Some(a) => a,
                                                 None => {
                                                     tracing::warn!(%peer, "no healthy backends available");

@@ -6,6 +6,20 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
+/// route entry inside a `[[listeners.routes]]` array.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RouteConfig {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub sni: Option<String>,
+    pub pool: String,
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file '{path}'")]
@@ -45,6 +59,30 @@ pub enum ConfigError {
 
     #[error("listener {listener} references unknown pool '{pool}'")]
     UnknownPoolReference { listener: SocketAddr, pool: String },
+
+    #[error("listener {listener} has both 'pool' and 'routes' — use one or the other")]
+    ListenerHasBothPoolAndRoutes { listener: SocketAddr },
+
+    #[error("listener {listener} has neither 'pool' nor 'routes' — one is required")]
+    ListenerHasNeitherPoolNorRoutes { listener: SocketAddr },
+
+    #[error("listener {listener} has routes but is plain L4 (no TLS) — routes require L7 or L4+TLS")]
+    RoutesOnPlainL4Listener { listener: SocketAddr },
+
+    #[error("route on listener {listener} uses 'sni' but listener has no TLS")]
+    SniMatcherOnNonTlsListener { listener: SocketAddr },
+
+    #[error("route on listener {listener} references unknown pool '{pool}'")]
+    UnknownRoutePoolReference { listener: SocketAddr, pool: String },
+
+    #[error("route on listener {listener} has invalid host pattern '{pattern}'")]
+    InvalidHostPattern { listener: SocketAddr, pattern: String },
+
+    #[error("route on listener {listener} has invalid path prefix '{prefix}'")]
+    InvalidPathPrefix { listener: SocketAddr, prefix: String },
+
+    #[error("route on listener {listener} has invalid method '{method}'")]
+    InvalidRouteMethod { listener: SocketAddr, method: String },
 
     #[error("pool '{pool}' has no backends")]
     EmptyPoolBackends { pool: String },
@@ -117,7 +155,11 @@ pub struct ListenerConfig {
     pub address: SocketAddr,
     #[serde(default)]
     pub mode: ListenerMode,
-    pub pool: String,
+    /// single-pool reference. exactly one of pool or routes must be set.
+    pub pool: Option<String>,
+    /// config-driven route table. exactly one of pool or routes must be set.
+    #[serde(default)]
+    pub routes: Vec<RouteConfig>,
     pub max_connections: Option<usize>,
     pub idle_timeout_secs: Option<u64>,
     #[serde(default = "default_drain_timeout")]
@@ -394,13 +436,81 @@ impl Config {
             }
         }
 
-        // listener pool references
+        // listener routing: exactly one of pool or routes, validated per listener
         for listener in &self.listeners {
-            if !seen_pools.contains(listener.pool.as_str()) {
-                return Err(ConfigError::UnknownPoolReference {
-                    listener: listener.address,
-                    pool: listener.pool.clone(),
-                });
+            match (&listener.pool, listener.routes.is_empty()) {
+                (Some(_), false) => {
+                    return Err(ConfigError::ListenerHasBothPoolAndRoutes {
+                        listener: listener.address,
+                    });
+                }
+                (None, true) => {
+                    return Err(ConfigError::ListenerHasNeitherPoolNorRoutes {
+                        listener: listener.address,
+                    });
+                }
+                (Some(pool), true) => {
+                    // single-pool listener: validate the pool reference
+                    if !seen_pools.contains(pool.as_str()) {
+                        return Err(ConfigError::UnknownPoolReference {
+                            listener: listener.address,
+                            pool: pool.clone(),
+                        });
+                    }
+                }
+                (None, false) => {
+                    // routes-based listener: plain L4 without TLS cannot have routes
+                    if listener.mode == ListenerMode::L4 && listener.tls.is_none() {
+                        return Err(ConfigError::RoutesOnPlainL4Listener {
+                            listener: listener.address,
+                        });
+                    }
+                    for route in &listener.routes {
+                        if !seen_pools.contains(route.pool.as_str()) {
+                            return Err(ConfigError::UnknownRoutePoolReference {
+                                listener: listener.address,
+                                pool: route.pool.clone(),
+                            });
+                        }
+                        if route.sni.is_some() && listener.tls.is_none() {
+                            return Err(ConfigError::SniMatcherOnNonTlsListener {
+                                listener: listener.address,
+                            });
+                        }
+                        if let Some(host) = &route.host
+                            && !is_valid_host_pattern(host)
+                        {
+                            return Err(ConfigError::InvalidHostPattern {
+                                listener: listener.address,
+                                pattern: host.clone(),
+                            });
+                        }
+                        if let Some(sni) = &route.sni
+                            && !is_valid_host_pattern(sni)
+                        {
+                            return Err(ConfigError::InvalidHostPattern {
+                                listener: listener.address,
+                                pattern: sni.clone(),
+                            });
+                        }
+                        if let Some(path) = &route.path_prefix
+                            && !is_valid_path_prefix(path)
+                        {
+                            return Err(ConfigError::InvalidPathPrefix {
+                                listener: listener.address,
+                                prefix: path.clone(),
+                            });
+                        }
+                        if let Some(method) = &route.method
+                            && !is_valid_method_token(method)
+                        {
+                            return Err(ConfigError::InvalidRouteMethod {
+                                listener: listener.address,
+                                method: method.clone(),
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -542,6 +652,35 @@ impl Config {
     }
 }
 
+fn is_valid_host_pattern(pattern: &str) -> bool {
+    if pattern.contains('*') {
+        // must be "*.something" with non-empty something
+        pattern.starts_with("*.") && pattern.len() > 2
+    } else {
+        !pattern.is_empty()
+    }
+}
+
+fn is_valid_path_prefix(prefix: &str) -> bool {
+    if !prefix.starts_with('/') {
+        return false;
+    }
+    // "/" is valid; any other prefix ending with "/" is not
+    if prefix != "/" && prefix.ends_with('/') {
+        return false;
+    }
+    true
+}
+
+fn is_valid_method_token(method: &str) -> bool {
+    if method.is_empty() {
+        return false;
+    }
+    method
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
+}
+
 fn validate_tls_config(tls: &TlsConfig) -> Result<(), ConfigError> {
     if tls.certificates.is_empty() {
         return Err(ConfigError::InvalidValue {
@@ -623,7 +762,7 @@ mod tests {
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
         assert_eq!(config.listeners.len(), 1);
         assert_eq!(config.listeners[0].address, "0.0.0.0:8080".parse().unwrap());
-        assert_eq!(config.listeners[0].pool, "web");
+        assert_eq!(config.listeners[0].pool.as_deref(), Some("web"));
         assert_eq!(config.pools.len(), 1);
         assert_eq!(config.pools[0].name, "web");
         assert_eq!(config.pools[0].backends.len(), 1);
@@ -1508,5 +1647,458 @@ mod tests {
         let file = write_temp_config(&content);
         let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
         assert!(matches!(err, ConfigError::TlsKeyFileNotFound { .. }));
+    }
+
+    // ---- M3: routes config tests ----
+
+    fn base_pool_toml() -> &'static str {
+        r#"
+        [[pools]]
+        name = "web"
+
+        [[pools.backends]]
+        address = "127.0.0.1:3001"
+
+        [[pools]]
+        name = "api"
+
+        [[pools.backends]]
+        address = "127.0.0.1:3002"
+        "#
+    }
+
+    #[test]
+    fn parse_listener_with_single_pool() {
+        // regression: old pool = "X" format still works
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.listeners[0].pool.as_deref(), Some("web"));
+        assert!(config.listeners[0].routes.is_empty());
+    }
+
+    #[test]
+    fn parse_listener_with_routes_array() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            host = "api.example.com"
+            pool = "api"
+
+            [[listeners.routes]]
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert!(config.listeners[0].pool.is_none());
+        assert_eq!(config.listeners[0].routes.len(), 2);
+        assert_eq!(config.listeners[0].routes[0].host.as_deref(), Some("api.example.com"));
+        assert_eq!(config.listeners[0].routes[0].pool, "api");
+        assert_eq!(config.listeners[0].routes[1].host, None);
+        assert_eq!(config.listeners[0].routes[1].pool, "web");
+    }
+
+    #[test]
+    fn parse_listener_with_route_having_all_matchers() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            host = "api.example.com"
+            path_prefix = "/v1"
+            method = "POST"
+            pool = "api"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        let r = &config.listeners[0].routes[0];
+        assert_eq!(r.host.as_deref(), Some("api.example.com"));
+        assert_eq!(r.path_prefix.as_deref(), Some("/v1"));
+        assert_eq!(r.method.as_deref(), Some("POST"));
+        assert_eq!(r.pool, "api");
+    }
+
+    #[test]
+    fn parse_listener_routes_absent_deserializes_to_empty_vec() {
+        // routes field absent in TOML → empty vec; old configs work as-is
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert!(config.listeners[0].routes.is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_listener_with_both_pool_and_routes() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            pool = "web"
+
+            [[listeners.routes]]
+            pool = "api"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ListenerHasBothPoolAndRoutes { .. }),
+            "expected ListenerHasBothPoolAndRoutes, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_listener_with_neither() {
+        // no pool and no routes
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ListenerHasNeitherPoolNorRoutes { .. }),
+            "expected ListenerHasNeitherPoolNorRoutes, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_route_with_unknown_pool() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            pool = "nonexistent"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UnknownRoutePoolReference { .. }),
+            "expected UnknownRoutePoolReference, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_routes_on_plain_l4_listener() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l4"
+
+            [[listeners.routes]]
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::RoutesOnPlainL4Listener { .. }),
+            "expected RoutesOnPlainL4Listener, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_routes_on_l4_with_tls() {
+        let (_dir, cert_path, key_path) = write_pem_files();
+        let content = format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            mode = "l4"
+
+            [[listeners.tls.certificates]]
+            cert = "{}"
+            key = "{}"
+
+            [[listeners.routes]]
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+            cert_path.display(),
+            key_path.display(),
+        );
+        let file = write_temp_config(&content);
+        Config::from_file(file.path().to_str().unwrap())
+            .expect("L4+TLS listener with routes must be allowed");
+    }
+
+    #[test]
+    fn validate_allows_routes_on_l7() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            host = "api.example.com"
+            pool = "api"
+
+            [[listeners.routes]]
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        Config::from_file(file.path().to_str().unwrap())
+            .expect("L7 listener with routes must be allowed");
+    }
+
+    #[test]
+    fn validate_rejects_sni_on_non_tls_listener() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            sni = "api.test"
+            pool = "api"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::SniMatcherOnNonTlsListener { .. }),
+            "expected SniMatcherOnNonTlsListener, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_sni_on_tls_listener() {
+        let (_dir, cert_path, key_path) = write_pem_files();
+        let content = format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            mode = "l7"
+
+            [[listeners.tls.certificates]]
+            cert = "{}"
+            key = "{}"
+
+            [[listeners.routes]]
+            sni = "api.test"
+            pool = "api"
+
+            [[listeners.routes]]
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+
+            [[pools]]
+            name = "api"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3002"
+            "#,
+            cert_path.display(),
+            key_path.display(),
+        );
+        let file = write_temp_config(&content);
+        Config::from_file(file.path().to_str().unwrap())
+            .expect("SNI route on TLS listener must be allowed");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_host_pattern_bare_star() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            host = "*"
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidHostPattern { .. }),
+            "expected InvalidHostPattern, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_host_pattern_mid_string_star() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            host = "foo.*.com"
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidHostPattern { .. }),
+            "expected InvalidHostPattern, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_path_prefix_no_slash() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            path_prefix = "api"
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidPathPrefix { .. }),
+            "expected InvalidPathPrefix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_path_prefix_trailing_slash() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            path_prefix = "/api/"
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidPathPrefix { .. }),
+            "expected InvalidPathPrefix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_root_path_prefix() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            path_prefix = "/"
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        Config::from_file(file.path().to_str().unwrap())
+            .expect("root path prefix '/' must be allowed");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_method_empty() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            method = ""
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        // TOML may serialize "" as empty string; empty is rejected
+        let result = Config::from_file(file.path().to_str().unwrap());
+        assert!(
+            result.is_err(),
+            "empty method should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_method_whitespace() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            method = "G ET"
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidRouteMethod { .. }),
+            "expected InvalidRouteMethod, got: {err}"
+        );
     }
 }

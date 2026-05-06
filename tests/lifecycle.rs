@@ -16,7 +16,7 @@ use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
 
-use helpers::{DyingServer, EchoServer, HalfCloseServer};
+use helpers::{DyingServer, EchoServer, HalfCloseServer, make_single_pool_router};
 
 fn test_resources() -> Resources {
     Resources {
@@ -40,7 +40,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
     Arc::new(ListenerConfig {
         address: "127.0.0.1:0".parse().unwrap(),
         mode: ListenerMode::L4,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: None,
         drain_timeout_secs: 5,
@@ -79,7 +79,9 @@ async fn start_proxy(backend_addrs: &[SocketAddr]) -> SocketAddr {
 }
 
 async fn start_proxy_with_config(backend_addrs: &[SocketAddr], config: ServeConfig) -> SocketAddr {
-    let balancer = Arc::new(RoundRobin::new(test_pool(backend_addrs)));
+    let pool = test_pool(backend_addrs);
+    let rr = Arc::new(RoundRobin::new(pool.clone()));
+    let router = make_single_pool_router(pool, rr);
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
@@ -88,7 +90,7 @@ async fn start_proxy_with_config(backend_addrs: &[SocketAddr], config: ServeConf
         let _tx = shutdown_tx;
         std::future::pending::<()>().await
     });
-    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
     proxy_addr
 }
@@ -189,14 +191,15 @@ async fn graceful_shutdown_drains_connections() {
     let backend = EchoServer::start().await;
 
     let pool = test_pool(&[backend.addr]);
-    let balancer = Arc::new(RoundRobin::new(pool));
+    let rr = Arc::new(RoundRobin::new(pool.clone()));
+    let router = make_single_pool_router(pool, rr);
     let config = test_serve_config(ForwardingStrategy::Userspace);
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    let serve_handle = tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    let serve_handle = tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream.write_all(b"before shutdown").await.unwrap();

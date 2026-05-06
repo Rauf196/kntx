@@ -4,6 +4,12 @@ use metrics::{describe_counter, describe_gauge, describe_histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 
 pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    // recorder must be installed before describe_* — otherwise descriptions go to the
+    // noop recorder and never reach /metrics as # HELP / # TYPE lines.
+    PrometheusBuilder::new()
+        .with_http_listener(address)
+        .install()?;
+
     describe_counter!(
         "kntx_connections_total",
         "total accepted connections (labels: listener)"
@@ -81,10 +87,14 @@ pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         "kntx_http_body_parse_errors_total",
         "L7 request body forwarding aborted due to malformed framing or I/O error (labels: listener, kind)."
     );
-
-    PrometheusBuilder::new()
-        .with_http_listener(address)
-        .install()?;
+    describe_counter!(
+        "kntx_route_matches_total",
+        "Requests that resolved to a configured route, labeled by listener and route_id."
+    );
+    describe_counter!(
+        "kntx_route_no_match_total",
+        "Requests that did not match any configured route."
+    );
 
     Ok(())
 }

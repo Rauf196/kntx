@@ -1,8 +1,13 @@
 use std::io::{BufWriter, Write};
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use tokio::sync::mpsc;
+
+// access log field convention: route_id is "" on no-match / pre-route errors, never null.
+fn ser_opt_str_as_empty<S: Serializer>(v: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(v.as_deref().unwrap_or(""))
+}
 
 use crate::config::{AccessLogConfig, AccessLogOutput};
 
@@ -23,6 +28,7 @@ pub struct AccessLogLine {
     pub backend_wait_ms: Option<f64>,
     pub backend: Option<String>,
     pub pool: String,
+    #[serde(serialize_with = "ser_opt_str_as_empty")]
     pub route_id: Option<String>,
     pub request_id: String,
     pub trace_id: Option<String>,

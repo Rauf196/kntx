@@ -23,7 +23,7 @@ use kntx::tls::build_acceptor;
 use helpers::tls::{
     TestCert, client_config_trusting, generate_cert, tls_connect, write_cert_to_tempdir,
 };
-use helpers::{DyingServer, EchoServer, HalfCloseServer};
+use helpers::{DyingServer, EchoServer, HalfCloseServer, make_single_pool_router};
 
 fn test_resources() -> Resources {
     Resources {
@@ -38,7 +38,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
     Arc::new(ListenerConfig {
         address: "127.0.0.1:0".parse().unwrap(),
         mode: ListenerMode::L4,
-        pool: "test".to_owned(),
+        pool: Some("test".to_owned()), routes: vec![],
         max_connections: None,
         idle_timeout_secs: None,
         drain_timeout_secs: 5,
@@ -129,7 +129,9 @@ async fn start_tls_proxy(
 
     let acceptor = build_acceptor(&tls_config).unwrap();
 
-    let balancer = Arc::new(RoundRobin::new(test_pool(backend_addrs)));
+    let pool = test_pool(backend_addrs);
+    let rr = Arc::new(RoundRobin::new(pool.clone()));
+    let router = make_single_pool_router(pool, rr);
     let config = ServeConfig {
         tls_acceptor: Some(acceptor),
         ..test_serve_config()
@@ -139,7 +141,7 @@ async fn start_tls_proxy(
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
     (proxy_addr, dir, shutdown_tx)
 }
@@ -232,7 +234,8 @@ async fn tls_handshake_timeout() {
     };
     let acceptor = build_acceptor(&tls_config).unwrap();
 
-    let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
+    let pool = test_pool(&[backend.addr]);
+    let router = make_single_pool_router(pool.clone(), Arc::new(RoundRobin::new(pool)));
     let config = ServeConfig {
         tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(1),
@@ -243,7 +246,7 @@ async fn tls_handshake_timeout() {
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
     // connect TCP but send no ClientHello — just idle
     let mut idle = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
@@ -265,14 +268,15 @@ async fn tls_plain_regression() {
 
     let backend = EchoServer::start().await;
 
-    let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
+    let pool = test_pool(&[backend.addr]);
+    let router = make_single_pool_router(pool.clone(), Arc::new(RoundRobin::new(pool)));
     let config = test_serve_config();
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream.write_all(b"plain tcp works").await.unwrap();
@@ -305,7 +309,8 @@ async fn tls_splice_strategy_fallback() {
     };
     let acceptor = build_acceptor(&tls_config).unwrap();
 
-    let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
+    let pool = test_pool(&[backend.addr]);
+    let router = make_single_pool_router(pool.clone(), Arc::new(RoundRobin::new(pool)));
     let config = ServeConfig {
         strategy: ForwardingStrategy::Splice, // splice configured, but TLS forces userspace
         tls_acceptor: Some(acceptor),
@@ -316,7 +321,7 @@ async fn tls_splice_strategy_fallback() {
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
     let client_cfg = client_config_trusting(&tc.cert_der);
     let mut stream = tls_connect(proxy_addr, "localhost", client_cfg).await;
@@ -356,7 +361,8 @@ async fn tls_sni_multi_cert() {
     };
     let acceptor = build_acceptor(&tls_config).unwrap();
 
-    let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
+    let pool = test_pool(&[backend.addr]);
+    let router = make_single_pool_router(pool.clone(), Arc::new(RoundRobin::new(pool)));
     let config = ServeConfig {
         tls_acceptor: Some(acceptor),
         ..test_serve_config()
@@ -366,7 +372,7 @@ async fn tls_sni_multi_cert() {
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
     // client_a trusts only cert_a — connecting with SNI "a.test" must succeed
     let client_a = client_config_trusting(&tc_a.cert_der);
@@ -453,7 +459,8 @@ async fn tls_idle_timeout() {
     let tc = generate_cert(&["localhost"]);
     let (acceptor, _dir) = make_tls_acceptor(&tc);
 
-    let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
+    let pool = test_pool(&[backend.addr]);
+    let router = make_single_pool_router(pool.clone(), Arc::new(RoundRobin::new(pool)));
     let config = ServeConfig {
         idle_timeout: Some(Duration::from_secs(1)),
         tls_acceptor: Some(acceptor),
@@ -464,7 +471,7 @@ async fn tls_idle_timeout() {
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
     let client_cfg = client_config_trusting(&tc.cert_der);
     let mut stream = tls_connect(proxy_addr, "localhost", client_cfg).await;
@@ -490,7 +497,8 @@ async fn tls_graceful_shutdown() {
     let tc = generate_cert(&["localhost"]);
     let (acceptor, _dir) = make_tls_acceptor(&tc);
 
-    let balancer = Arc::new(RoundRobin::new(test_pool(&[backend.addr])));
+    let pool = test_pool(&[backend.addr]);
+    let router = make_single_pool_router(pool.clone(), Arc::new(RoundRobin::new(pool)));
     let config = ServeConfig {
         tls_acceptor: Some(acceptor),
         ..test_serve_config()
@@ -501,7 +509,7 @@ async fn tls_graceful_shutdown() {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
-    let serve_handle = tokio::spawn(listener::serve(tcp_listener, balancer, config, shutdown_rx));
+    let serve_handle = tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
     let client_cfg = client_config_trusting(&tc.cert_der);
     let mut stream = tls_connect(proxy_addr, "localhost", client_cfg).await;
