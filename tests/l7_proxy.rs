@@ -9,13 +9,13 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 
 use helpers::http_backend::{BackendRequest, HttpBackend, ResponseSpec};
-use helpers::tls::{client_config_trusting, generate_cert, write_cert_to_tempdir};
 use helpers::make_single_pool_router;
+use helpers::tls::{client_config_trusting, generate_cert, write_cert_to_tempdir};
 use kntx::access_log::AccessLogSink;
 use kntx::balancer::RoundRobin;
 use kntx::config::{
-    AccessLogConfig, AccessLogOutput, CertificateConfig, ErrorPagesConfig, ListenerConfig,
-    ListenerMode, TlsConfig,
+    AccessLogConfig, AccessLogOutput, CertificateConfig, ErrorPagesConfig, KeepaliveConfig,
+    ListenerConfig, ListenerMode, TlsConfig,
 };
 use kntx::health::{BackendPool, CircuitState};
 use kntx::listener::{self, ServeConfig};
@@ -23,8 +23,6 @@ use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
 use kntx::tls::build_acceptor;
-
-// ── proxy setup helpers ───────────────────────────────────────────────────────
 
 struct L7Proxy {
     addr: SocketAddr,
@@ -46,13 +44,18 @@ async fn start_l7_proxy_with_limit(backend_addr: SocketAddr, header_limit: usize
         vec![backend_addr],
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
-    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
+    let router = make_single_pool_router(
+        Arc::clone(&pool),
+        Arc::new(RoundRobin::new(Arc::clone(&pool))),
+    );
 
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -60,6 +63,7 @@ async fn start_l7_proxy_with_limit(backend_addr: SocketAddr, header_limit: usize
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: header_limit,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -117,16 +121,21 @@ async fn start_l7_proxy_no_backends() -> L7Proxy {
         vec![dead_addr],
         1,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
     // trip the circuit breaker on all backends
     pool.record_failure(dead_addr);
     pool.record_failure(dead_addr);
-    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
+    let router = make_single_pool_router(
+        Arc::clone(&pool),
+        Arc::new(RoundRobin::new(Arc::clone(&pool))),
+    );
 
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -134,6 +143,7 @@ async fn start_l7_proxy_no_backends() -> L7Proxy {
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -212,13 +222,18 @@ async fn start_l7_proxy_tls(backend_addr: SocketAddr) -> L7TlsProxy {
         vec![backend_addr],
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
-    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
+    let router = make_single_pool_router(
+        Arc::clone(&pool),
+        Arc::new(RoundRobin::new(Arc::clone(&pool))),
+    );
 
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -226,6 +241,7 @@ async fn start_l7_proxy_tls(backend_addr: SocketAddr) -> L7TlsProxy {
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -273,11 +289,17 @@ async fn start_l7_proxy_tls(backend_addr: SocketAddr) -> L7TlsProxy {
     }
 }
 
-// ── raw HTTP helpers ──────────────────────────────────────────────────────────
-
 async fn raw_request(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.write_all(req).await.unwrap();
+    // one-shot client: half-close the write side after the request. With
+    // Default-on keep-alive: the proxy's between-request wait would otherwise
+    // block until `keepalive_idle_timeout_secs` (~60s) before closing. A FIN
+    // makes the proxy's `fill_buf` peek observe EOF and end the conn cleanly
+    // right after this response — the standard "client done sending" signal.
+    // Client-side close only; the proxy's keep-alive behavior and timeouts
+    // are not adjusted.
+    let _ = stream.shutdown().await;
     let mut resp = Vec::new();
     // tolerate ECONNRESET: proxy may RST after sending an error response when
     // there is still unread request body in the receive buffer. bytes received
@@ -317,9 +339,7 @@ fn response_header(resp: &[u8], name: &str) -> Option<String> {
     None
 }
 
-// ── tests ─────────────────────────────────────────────────────────────────────
-
-/// 6b.20 — basic GET passes through and response body is correct.
+/// basic GET passes through and response body is correct.
 #[tokio::test]
 async fn get_happy_path() {
     let backend = HttpBackend::start(ResponseSpec::ok("hello world")).await;
@@ -335,7 +355,7 @@ async fn get_happy_path() {
     assert_eq!(response_body(&resp), b"hello world");
 }
 
-/// 6b.21 — POST with Content-Length, body is byte-exact.
+/// POST with Content-Length, body is byte-exact.
 #[tokio::test]
 async fn post_content_length_byte_exact() {
     let body = b"hello";
@@ -354,7 +374,7 @@ async fn post_content_length_byte_exact() {
     assert_eq!(response_body(&resp), b"hello");
 }
 
-/// 6b.22 — POST with chunked body, backend receives full body, response correct.
+/// POST with chunked body, backend receives full body, response correct.
 #[tokio::test]
 async fn post_chunked_byte_exact_with_trailers() {
     let backend =
@@ -370,7 +390,7 @@ async fn post_chunked_byte_exact_with_trailers() {
     assert_eq!(response_body(&resp), b"hello");
 }
 
-/// 6b.23 — HEAD response has no body even when backend sets Content-Length.
+/// HEAD response has no body even when backend sets Content-Length.
 #[tokio::test]
 async fn head_response_no_body_even_with_cl() {
     let backend = HttpBackend::start(ResponseSpec::ok("this body should not appear")).await;
@@ -382,7 +402,7 @@ async fn head_response_no_body_even_with_cl() {
     assert_eq!(response_body(&resp), b"");
 }
 
-/// 6b.24 — 100 Continue interim response is relayed to client.
+/// 100 Continue interim response is relayed to client.
 #[tokio::test]
 async fn expect_100_continue_relayed() {
     // raw backend that sends 100 then waits for body then 200 (handcrafted backend
@@ -414,7 +434,7 @@ async fn expect_100_continue_relayed() {
     assert!(s.contains("200"));
 }
 
-/// 6b.25 — malformed request returns 400 and connection is closed.
+/// malformed request returns 400 and connection is closed.
 #[tokio::test]
 async fn malformed_request_returns_400_close() {
     let backend = HttpBackend::start(ResponseSpec::ok("unreachable")).await;
@@ -424,7 +444,7 @@ async fn malformed_request_returns_400_close() {
     assert_eq!(parse_status(&resp), 400);
 }
 
-/// 6b.26 — request with headers exceeding limit returns 431.
+/// request with headers exceeding limit returns 431.
 #[tokio::test]
 async fn oversized_headers_return_431() {
     let backend = HttpBackend::start(ResponseSpec::ok("unreachable")).await;
@@ -437,7 +457,7 @@ async fn oversized_headers_return_431() {
     assert_eq!(parse_status(&resp), 431);
 }
 
-/// 6b.27 — smuggling: CL + TE rejected.
+/// smuggling: CL + TE rejected.
 #[tokio::test]
 async fn smuggling_cl_te_rejected() {
     let backend = HttpBackend::start(ResponseSpec::ok("unreachable")).await;
@@ -486,7 +506,7 @@ async fn smuggling_obs_fold_rejected() {
     assert!(status == 400 || status == 200, "unexpected status {status}");
 }
 
-/// 6b.35 — malformed chunked body returns 400 quickly, no hang.
+/// malformed chunked body returns 400 quickly, no hang.
 #[tokio::test]
 async fn malformed_chunked_body_returns_400() {
     let backend = HttpBackend::start(ResponseSpec::ok("ok")).await;
@@ -504,7 +524,7 @@ async fn malformed_chunked_body_returns_400() {
     assert_eq!(parse_status(&resp), 400);
 }
 
-/// 6b.28 — hop-by-hop headers stripped on both directions.
+/// hop-by-hop headers stripped on both directions.
 #[tokio::test]
 async fn hop_by_hop_stripped_both_directions() {
     let backend = HttpBackend::start_with_handler(Arc::new(|req: BackendRequest| {
@@ -525,7 +545,7 @@ async fn hop_by_hop_stripped_both_directions() {
     assert_eq!(response_body(&resp), b"pass");
 }
 
-/// 6b.29 — XFF correctly appended; X-Request-ID preserved when client supplies one.
+/// XFF correctly appended; X-Request-ID preserved when client supplies one.
 #[tokio::test]
 async fn xff_appended() {
     let backend = HttpBackend::start_with_handler(Arc::new(|req: BackendRequest| {
@@ -563,7 +583,7 @@ async fn x_request_id_preserved() {
     assert_eq!(response_body(&resp), b"my-known-id");
 }
 
-/// 6b.29a — traceparent passed through unchanged; no trace synthesized when absent.
+/// traceparent passed through unchanged; no trace synthesized when absent.
 #[tokio::test]
 async fn traceparent_passthrough() {
     let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -613,7 +633,7 @@ async fn no_trace_synthesized_when_absent() {
     assert_eq!(response_body(&resp), b"pass");
 }
 
-/// 6b.30 — error content negotiation: JSON on Accept: application/json, HTML otherwise.
+/// error content negotiation: JSON on Accept: application/json, HTML otherwise.
 #[tokio::test]
 async fn error_negotiation_json() {
     let proxy = start_l7_proxy_no_backends().await;
@@ -655,7 +675,7 @@ async fn error_negotiation_html() {
     );
 }
 
-/// 6b.31 — custom error page served from configured file.
+/// custom error page served from configured file.
 #[tokio::test]
 async fn custom_error_page_served() {
     use std::io::Write;
@@ -674,9 +694,13 @@ async fn custom_error_page_served() {
         vec![backend_addr],
         1,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
     pool.record_failure(backend_addr); // trip circuit
-    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
+    let router = make_single_pool_router(
+        Arc::clone(&pool),
+        Arc::new(RoundRobin::new(Arc::clone(&pool))),
+    );
 
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -686,7 +710,8 @@ async fn custom_error_page_served() {
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -694,6 +719,7 @@ async fn custom_error_page_served() {
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -744,7 +770,7 @@ async fn custom_error_page_served() {
     let _ = shutdown_tx.send(());
 }
 
-/// 6b.32 — CONNECT returns 405; Upgrade: h2c returns 405.
+/// CONNECT returns 405; Upgrade: h2c returns 405.
 #[tokio::test]
 async fn connect_returns_405() {
     let backend = HttpBackend::start(ResponseSpec::ok("unreachable")).await;
@@ -771,7 +797,7 @@ async fn upgrade_h2c_returns_405() {
     assert_eq!(parse_status(&resp), 405);
 }
 
-/// 6b.33 — no healthy backend in pool returns 503.
+/// no healthy backend in pool returns 503.
 #[tokio::test]
 async fn no_healthy_backend_returns_503() {
     let proxy = start_l7_proxy_no_backends().await;
@@ -781,7 +807,7 @@ async fn no_healthy_backend_returns_503() {
     assert_eq!(parse_status(&resp), 503);
 }
 
-/// 6b.34 — connect timeout returns 504.
+/// connect timeout returns 504.
 /// Use a TCP listener that accepts but never responds.
 #[tokio::test]
 async fn connect_timeout_returns_504() {
@@ -805,13 +831,18 @@ async fn connect_timeout_returns_504() {
         vec![refused_addr],
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
-    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
+    let router = make_single_pool_router(
+        Arc::clone(&pool),
+        Arc::new(RoundRobin::new(Arc::clone(&pool))),
+    );
 
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -819,6 +850,7 @@ async fn connect_timeout_returns_504() {
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -869,7 +901,7 @@ async fn connect_timeout_returns_504() {
     let _ = shutdown_tx.send(());
 }
 
-/// 6b.19c — access log emits a line per request.
+/// access log emits a line per request.
 #[tokio::test]
 async fn access_log_emits_line() {
     // capture access log to a vec via a file-based sink with a temp file
@@ -883,8 +915,12 @@ async fn access_log_emits_line() {
         vec![backend.addr],
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
-    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
+    let router = make_single_pool_router(
+        Arc::clone(&pool),
+        Arc::new(RoundRobin::new(Arc::clone(&pool))),
+    );
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -893,7 +929,8 @@ async fn access_log_emits_line() {
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -901,6 +938,7 @@ async fn access_log_emits_line() {
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -955,7 +993,7 @@ async fn access_log_emits_line() {
     assert_eq!(parsed["status"], 200);
 }
 
-/// 6b.19c — trace ID from traceparent propagates into log.
+/// trace ID from traceparent propagates into log.
 #[tokio::test]
 async fn access_log_trace_id_propagates() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -967,8 +1005,12 @@ async fn access_log_trace_id_propagates() {
         vec![backend.addr],
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
-    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
+    let router = make_single_pool_router(
+        Arc::clone(&pool),
+        Arc::new(RoundRobin::new(Arc::clone(&pool))),
+    );
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -977,7 +1019,8 @@ async fn access_log_trace_id_propagates() {
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -985,6 +1028,7 @@ async fn access_log_trace_id_propagates() {
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -1051,8 +1095,6 @@ async fn http2_preface_returns_505() {
     let resp = raw_request(proxy.addr, preface).await;
     assert_eq!(parse_status(&resp), 505);
 }
-
-// ── hardening pass tests ──────────────────────────────────────────────────────
 
 /// Fix 1 — Transfer-Encoding: Chunked (capital C) must be accepted, not rejected.
 #[tokio::test]
@@ -1162,8 +1204,12 @@ async fn mid_body_backend_failure_records_passive_health() {
         vec![bad_addr, good_backend.addr],
         1,
         Duration::from_secs(60),
+        KeepaliveConfig::default(),
     ));
-    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
+    let router = make_single_pool_router(
+        Arc::clone(&pool),
+        Arc::new(RoundRobin::new(Arc::clone(&pool))),
+    );
 
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
@@ -1173,7 +1219,8 @@ async fn mid_body_backend_failure_records_passive_health() {
     let listener_cfg = Arc::new(ListenerConfig {
         address: proxy_addr,
         mode: ListenerMode::L7,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -1181,6 +1228,7 @@ async fn mid_body_backend_failure_records_passive_health() {
         max_connect_attempts: 1, // no retry — first attempt goes to bad_addr
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -1246,8 +1294,6 @@ async fn mid_body_backend_failure_records_passive_health() {
     let _ = shutdown_tx.send(());
 }
 
-// ── logged proxy helpers (file sink wired in) ────────────────────────────────
-
 async fn start_l7_proxy_logged(
     backend_addr: SocketAddr,
     log_path: std::path::PathBuf,
@@ -1257,8 +1303,12 @@ async fn start_l7_proxy_logged(
         vec![backend_addr],
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
-    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
+    let router = make_single_pool_router(
+        Arc::clone(&pool),
+        Arc::new(RoundRobin::new(Arc::clone(&pool))),
+    );
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -1266,7 +1316,8 @@ async fn start_l7_proxy_logged(
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -1274,6 +1325,7 @@ async fn start_l7_proxy_logged(
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
     let buffer_pool = Arc::new(BufferPool::with_defaults());
     let error_pages = Arc::new(ErrorPages::load(&ErrorPagesConfig::default()).unwrap());
@@ -1327,10 +1379,14 @@ async fn start_l7_proxy_no_backends_logged(
         vec![dead_addr],
         1,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
     pool.record_failure(dead_addr);
     pool.record_failure(dead_addr);
-    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
+    let router = make_single_pool_router(
+        Arc::clone(&pool),
+        Arc::new(RoundRobin::new(Arc::clone(&pool))),
+    );
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -1338,7 +1394,8 @@ async fn start_l7_proxy_no_backends_logged(
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -1346,6 +1403,7 @@ async fn start_l7_proxy_no_backends_logged(
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
     let buffer_pool = Arc::new(BufferPool::with_defaults());
     let error_pages = Arc::new(ErrorPages::load(&ErrorPagesConfig::default()).unwrap());
@@ -1407,7 +1465,7 @@ fn is_uuid_v4(s: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit())
 }
 
-/// 6b.36 — smuggling reject preserves inbound X-Request-ID in access log.
+/// smuggling reject preserves inbound X-Request-ID in access log.
 #[tokio::test]
 async fn smuggling_reject_preserves_inbound_request_id() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1429,7 +1487,7 @@ async fn smuggling_reject_preserves_inbound_request_id() {
     assert_eq!(parsed["status"], 400);
 }
 
-/// 6b.36 — parse error generates a UUID request_id (not empty).
+/// parse error generates a UUID request_id (not empty).
 #[tokio::test]
 async fn parse_error_generates_uuid_request_id() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1450,7 +1508,7 @@ async fn parse_error_generates_uuid_request_id() {
     assert!(is_uuid_v4(rid), "expected UUID v4 request_id, got: {rid}");
 }
 
-/// 6b.36 — no-healthy-backend 503 preserves inbound X-Request-ID in access log.
+/// no-healthy-backend 503 preserves inbound X-Request-ID in access log.
 #[tokio::test]
 async fn no_healthy_backend_preserves_inbound_request_id() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1471,7 +1529,7 @@ async fn no_healthy_backend_preserves_inbound_request_id() {
     assert_eq!(parsed["status"], 503);
 }
 
-/// 6b.19c — X-Request-ID round-trips through proxy to log.
+/// X-Request-ID round-trips through proxy to log.
 #[tokio::test]
 async fn access_log_request_id_round_trips() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1483,8 +1541,12 @@ async fn access_log_request_id_round_trips() {
         vec![backend.addr],
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
-    let router = make_single_pool_router(Arc::clone(&pool), Arc::new(RoundRobin::new(Arc::clone(&pool))));
+    let router = make_single_pool_router(
+        Arc::clone(&pool),
+        Arc::new(RoundRobin::new(Arc::clone(&pool))),
+    );
     let listener = listener::bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
@@ -1493,7 +1555,8 @@ async fn access_log_request_id_round_trips() {
     let listener_cfg = Arc::new(ListenerConfig {
         address: addr,
         mode: ListenerMode::L7,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
@@ -1501,6 +1564,7 @@ async fn access_log_request_id_round_trips() {
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());

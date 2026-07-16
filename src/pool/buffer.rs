@@ -36,12 +36,31 @@ impl BufferPool {
         Self::new(DEFAULT_POOL_CAPACITY, DEFAULT_BUFFER_SIZE)
     }
 
+    /// build a pool from a configured capacity, falling back to the default.
+    pub fn from_capacity(capacity: Option<usize>) -> Self {
+        Self::new(
+            capacity.unwrap_or(DEFAULT_POOL_CAPACITY),
+            DEFAULT_BUFFER_SIZE,
+        )
+    }
+
     /// borrow a buffer from the pool. returns None if pool is exhausted.
     pub fn get(&self) -> Option<BufferGuard> {
         self.inner.queue.pop().map(|buf| BufferGuard {
             buf: Some(buf),
             pool: Arc::clone(&self.inner),
         })
+    }
+
+    /// Borrow two buffers atomically. Returns `None` if fewer than two are
+    /// available; the first pop, if it succeeded, is released back via its
+    /// RAII guard before returning. The atomicity matters at call sites that
+    /// would otherwise leak the first buffer on error between two `get`
+    /// calls — the WebSocket tunnel checks out a pair before the 101 is on
+    /// the wire and treats any partial result as exhaustion.
+    pub fn try_checkout_pair(&self) -> Option<(BufferGuard, BufferGuard)> {
+        let first = self.get()?;
+        self.get().map(|second| (first, second))
     }
 
     pub fn available(&self) -> usize {
@@ -187,5 +206,39 @@ mod tests {
         assert_eq!(pool.capacity(), DEFAULT_POOL_CAPACITY);
         assert_eq!(pool.buffer_size(), DEFAULT_BUFFER_SIZE);
         assert_eq!(pool.available(), DEFAULT_POOL_CAPACITY);
+    }
+
+    #[test]
+    fn try_checkout_pair_returns_two_buffers() {
+        let pool = BufferPool::new(2, 64);
+        let pair = pool.try_checkout_pair().expect("pair available");
+        assert_eq!(pool.available(), 0);
+        drop(pair);
+        assert_eq!(pool.available(), 2);
+    }
+
+    #[test]
+    fn try_checkout_pair_returns_none_without_consuming_remaining() {
+        let pool = BufferPool::new(2, 64);
+        let _hold = pool.get().expect("first available");
+        assert_eq!(pool.available(), 1);
+        assert!(
+            pool.try_checkout_pair().is_none(),
+            "pair must fail when only one buffer remains"
+        );
+        assert_eq!(
+            pool.available(),
+            1,
+            "the remaining buffer must not be consumed by the failed pair attempt"
+        );
+    }
+
+    #[test]
+    fn try_checkout_pair_returns_none_when_pool_fully_exhausted() {
+        let pool = BufferPool::new(2, 64);
+        let _h1 = pool.get().expect("first available");
+        let _h2 = pool.get().expect("second available");
+        assert_eq!(pool.available(), 0);
+        assert!(pool.try_checkout_pair().is_none());
     }
 }

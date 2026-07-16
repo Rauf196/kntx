@@ -66,7 +66,9 @@ pub enum ConfigError {
     #[error("listener {listener} has neither 'pool' nor 'routes' — one is required")]
     ListenerHasNeitherPoolNorRoutes { listener: SocketAddr },
 
-    #[error("listener {listener} has routes but is plain L4 (no TLS) — routes require L7 or L4+TLS")]
+    #[error(
+        "listener {listener} has routes but is plain L4 (no TLS) — routes require L7 or L4+TLS"
+    )]
     RoutesOnPlainL4Listener { listener: SocketAddr },
 
     #[error("route on listener {listener} uses 'sni' but listener has no TLS")]
@@ -76,13 +78,22 @@ pub enum ConfigError {
     UnknownRoutePoolReference { listener: SocketAddr, pool: String },
 
     #[error("route on listener {listener} has invalid host pattern '{pattern}'")]
-    InvalidHostPattern { listener: SocketAddr, pattern: String },
+    InvalidHostPattern {
+        listener: SocketAddr,
+        pattern: String,
+    },
 
     #[error("route on listener {listener} has invalid path prefix '{prefix}'")]
-    InvalidPathPrefix { listener: SocketAddr, prefix: String },
+    InvalidPathPrefix {
+        listener: SocketAddr,
+        prefix: String,
+    },
 
     #[error("route on listener {listener} has invalid method '{method}'")]
-    InvalidRouteMethod { listener: SocketAddr, method: String },
+    InvalidRouteMethod {
+        listener: SocketAddr,
+        method: String,
+    },
 
     #[error("pool '{pool}' has no backends")]
     EmptyPoolBackends { pool: String },
@@ -171,6 +182,19 @@ pub struct ListenerConfig {
     pub tls: Option<TlsConfig>,
     #[serde(default = "default_header_size_limit")]
     pub header_size_limit_bytes: usize,
+    // phase-specific timeouts; each falls back to idle_timeout_secs when None.
+    pub client_header_timeout_secs: Option<u64>,
+    pub client_body_timeout_secs: Option<u64>,
+    pub proxy_send_timeout_secs: Option<u64>,
+    pub proxy_read_timeout_secs: Option<u64>,
+    // overall request deadline from head-start to response-body-complete.
+    pub request_timeout_secs: Option<u64>,
+    // max request body bytes; None uses proxy default (1 MiB); 0 = unlimited.
+    pub max_body_size_bytes: Option<u64>,
+    // max idle gap between requests on a kept-alive client connection.
+    pub keepalive_idle_timeout_secs: Option<u64>,
+    // max sequential requests on one client keep-alive connection; None = default 1000.
+    pub keepalive_max_requests: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +202,8 @@ pub struct PoolConfig {
     pub name: String,
     pub backends: Vec<BackendConfig>,
     pub health: Option<PoolHealthOverride>,
+    #[serde(default)]
+    pub keepalive: KeepaliveConfig,
 }
 
 impl PoolConfig {
@@ -208,6 +234,32 @@ pub struct ResolvedHealth {
     pub check_interval_secs: Option<u64>,
     pub failure_threshold: u32,
     pub recovery_timeout_secs: u64,
+}
+
+/// backend keep-alive cache configuration. nested as `[pools.keepalive]`.
+///
+/// named `idle_conn_ttl_secs` not `idle_timeout_secs` to avoid collision
+/// with the listener-level `idle_timeout_secs` (completely different semantics:
+/// cache TTL for an idle backend conn vs inter-byte gap on a request stream).
+#[derive(Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct KeepaliveConfig {
+    /// max idle conns per backend; 0 disables backend keep-alive entirely.
+    pub max_idle: usize,
+    /// how long an idle conn stays in the cache before the sweeper drops it.
+    pub idle_conn_ttl_secs: u64,
+    /// max total conns to one backend (active + idle); 0 = unlimited.
+    pub max_total: u64,
+}
+
+impl Default for KeepaliveConfig {
+    fn default() -> Self {
+        Self {
+            max_idle: 32,
+            idle_conn_ttl_secs: 60,
+            max_total: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -242,6 +294,37 @@ pub struct ForwardingConfig {
     pub strategy: ForwardingStrategy,
     /// SO_RCVBUF/SO_SNDBUF size in bytes. None = OS default.
     pub socket_buffer_size: Option<usize>,
+    /// Body-forwarding buffer pool capacity (number of buffers).
+    /// Each L7 connection holds one buffer for its lifetime, so this caps
+    /// concurrent L7 connections; tune up for high-fanout deployments. None
+    /// = built-in default (matches the L4 pipe-pool sizing assumption).
+    pub buffer_pool_capacity: Option<usize>,
+}
+
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        Self {
+            address: "0.0.0.0:0".parse().unwrap(),
+            mode: ListenerMode::default(),
+            pool: None,
+            routes: Vec::new(),
+            max_connections: None,
+            idle_timeout_secs: None,
+            drain_timeout_secs: default_drain_timeout(),
+            connect_timeout_secs: default_connect_timeout(),
+            max_connect_attempts: default_max_connect_attempts(),
+            tls: None,
+            header_size_limit_bytes: default_header_size_limit(),
+            client_header_timeout_secs: None,
+            client_body_timeout_secs: None,
+            proxy_send_timeout_secs: None,
+            proxy_read_timeout_secs: None,
+            request_timeout_secs: None,
+            max_body_size_bytes: None,
+            keepalive_idle_timeout_secs: None,
+            keepalive_max_requests: None,
+        }
+    }
 }
 
 fn default_drain_timeout() -> u64 {
@@ -565,6 +648,96 @@ impl Config {
                     reason: "must be at least 64".to_owned(),
                 });
             }
+
+            // phase-specific timeouts — must be > 0 if explicitly set
+            let phase_timeouts: [(Option<u64>, &'static str); 5] = [
+                (
+                    listener.client_header_timeout_secs,
+                    "listener.client_header_timeout_secs",
+                ),
+                (
+                    listener.client_body_timeout_secs,
+                    "listener.client_body_timeout_secs",
+                ),
+                (
+                    listener.proxy_send_timeout_secs,
+                    "listener.proxy_send_timeout_secs",
+                ),
+                (
+                    listener.proxy_read_timeout_secs,
+                    "listener.proxy_read_timeout_secs",
+                ),
+                (
+                    listener.request_timeout_secs,
+                    "listener.request_timeout_secs",
+                ),
+            ];
+            for (val, field) in phase_timeouts {
+                if val == Some(0) {
+                    return Err(ConfigError::InvalidValue {
+                        field,
+                        reason: "must be at least 1".to_owned(),
+                    });
+                }
+            }
+            if listener.keepalive_idle_timeout_secs == Some(0) {
+                return Err(ConfigError::InvalidValue {
+                    field: "listener.keepalive_idle_timeout_secs",
+                    reason: "must be at least 1".to_owned(),
+                });
+            }
+            if listener.keepalive_max_requests == Some(0) {
+                return Err(ConfigError::InvalidValue {
+                    field: "listener.keepalive_max_requests",
+                    reason: "must be at least 1".to_owned(),
+                });
+            }
+
+            // L7-specific fields are meaningless on L4 listeners
+            if listener.mode == ListenerMode::L4 {
+                let l7_only: &[(&'static str, bool)] = &[
+                    (
+                        "listener.client_header_timeout_secs",
+                        listener.client_header_timeout_secs.is_some(),
+                    ),
+                    (
+                        "listener.client_body_timeout_secs",
+                        listener.client_body_timeout_secs.is_some(),
+                    ),
+                    (
+                        "listener.proxy_send_timeout_secs",
+                        listener.proxy_send_timeout_secs.is_some(),
+                    ),
+                    (
+                        "listener.proxy_read_timeout_secs",
+                        listener.proxy_read_timeout_secs.is_some(),
+                    ),
+                    (
+                        "listener.request_timeout_secs",
+                        listener.request_timeout_secs.is_some(),
+                    ),
+                    (
+                        "listener.max_body_size_bytes",
+                        listener.max_body_size_bytes.is_some(),
+                    ),
+                    (
+                        "listener.keepalive_idle_timeout_secs",
+                        listener.keepalive_idle_timeout_secs.is_some(),
+                    ),
+                    (
+                        "listener.keepalive_max_requests",
+                        listener.keepalive_max_requests.is_some(),
+                    ),
+                ];
+                for &(field, is_set) in l7_only {
+                    if is_set {
+                        return Err(ConfigError::InvalidValue {
+                            field,
+                            reason: "not applicable to L4 listeners".to_owned(),
+                        });
+                    }
+                }
+            }
         }
 
         // global health defaults
@@ -608,6 +781,26 @@ impl Config {
                         reason: "must be at least 1".to_owned(),
                     });
                 }
+            }
+        }
+
+        // per-pool keepalive config validation
+        for pool in &self.pools {
+            let kc = &pool.keepalive;
+            if kc.max_idle > 0 && kc.idle_conn_ttl_secs == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "pools.keepalive.idle_conn_ttl_secs",
+                    reason: "must be at least 1 when max_idle > 0".to_owned(),
+                });
+            }
+            if kc.max_total > 0 && kc.max_idle > 0 && kc.max_total < kc.max_idle as u64 {
+                return Err(ConfigError::InvalidValue {
+                    field: "pools.keepalive.max_total",
+                    reason: format!(
+                        "must be >= max_idle ({}) when both are nonzero",
+                        kc.max_idle
+                    ),
+                });
             }
         }
 
@@ -1649,8 +1842,6 @@ mod tests {
         assert!(matches!(err, ConfigError::TlsKeyFileNotFound { .. }));
     }
 
-    // ---- M3: routes config tests ----
-
     fn base_pool_toml() -> &'static str {
         r#"
         [[pools]]
@@ -1706,7 +1897,10 @@ mod tests {
         let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
         assert!(config.listeners[0].pool.is_none());
         assert_eq!(config.listeners[0].routes.len(), 2);
-        assert_eq!(config.listeners[0].routes[0].host.as_deref(), Some("api.example.com"));
+        assert_eq!(
+            config.listeners[0].routes[0].host.as_deref(),
+            Some("api.example.com")
+        );
         assert_eq!(config.listeners[0].routes[0].pool, "api");
         assert_eq!(config.listeners[0].routes[1].host, None);
         assert_eq!(config.listeners[0].routes[1].pool, "web");
@@ -2074,10 +2268,7 @@ mod tests {
         ));
         // TOML may serialize "" as empty string; empty is rejected
         let result = Config::from_file(file.path().to_str().unwrap());
-        assert!(
-            result.is_err(),
-            "empty method should be rejected"
-        );
+        assert!(result.is_err(), "empty method should be rejected");
     }
 
     #[test]
@@ -2100,5 +2291,449 @@ mod tests {
             matches!(err, ConfigError::InvalidRouteMethod { .. }),
             "expected InvalidRouteMethod, got: {err}"
         );
+    }
+
+    /// minimal valid L7 listener config with an extra field injected into the listeners block.
+    fn l7_listener_with(extra: &str) -> String {
+        format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            pool = "web"
+            {extra}
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#
+        )
+    }
+
+    /// minimal valid L4 listener config with an extra field injected into the listeners block.
+    fn l4_listener_with(extra: &str) -> String {
+        format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+            {extra}
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#
+        )
+    }
+
+    #[test]
+    fn keepalive_defaults_when_section_absent() {
+        let file = write_temp_config(&l7_listener_with(""));
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        let kc = &config.pools[0].keepalive;
+        assert_eq!(kc.max_idle, 32);
+        assert_eq!(kc.idle_conn_ttl_secs, 60);
+        assert_eq!(kc.max_total, 0);
+    }
+
+    #[test]
+    fn keepalive_all_fields_parsed() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [pools.keepalive]
+            max_idle = 16
+            idle_conn_ttl_secs = 30
+            max_total = 64
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        let kc = &config.pools[0].keepalive;
+        assert_eq!(kc.max_idle, 16);
+        assert_eq!(kc.idle_conn_ttl_secs, 30);
+        assert_eq!(kc.max_total, 64);
+    }
+
+    #[test]
+    fn keepalive_max_idle_zero_disables_keepalive() {
+        // max_idle = 0 is a valid opt-out (D2 escape hatch)
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [pools.keepalive]
+            max_idle = 0
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.pools[0].keepalive.max_idle, 0);
+    }
+
+    #[test]
+    fn keepalive_max_total_zero_is_unlimited() {
+        // max_total = 0 means unlimited and must be accepted by validation.
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [pools.keepalive]
+            max_idle = 8
+            max_total = 0
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.pools[0].keepalive.max_total, 0);
+    }
+
+    #[test]
+    fn keepalive_max_idle_zero_with_zero_ttl_allowed() {
+        // when max_idle = 0 (disabled), idle_conn_ttl_secs value is irrelevant
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [pools.keepalive]
+            max_idle = 0
+            idle_conn_ttl_secs = 0
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        // should not reject: keepalive disabled, ttl is don't-care
+        Config::from_file(file.path().to_str().unwrap())
+            .expect("max_idle=0 with idle_conn_ttl_secs=0 must be allowed");
+    }
+
+    #[test]
+    fn reject_keepalive_idle_ttl_zero_when_max_idle_nonzero() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [pools.keepalive]
+            max_idle = 3
+            idle_conn_ttl_secs = 0
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_keepalive_max_total_less_than_max_idle() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [pools.keepalive]
+            max_idle = 5
+            max_total = 2
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn keepalive_max_total_equals_max_idle_allowed() {
+        // max_total == max_idle is valid (tight cap, no growth beyond idle capacity)
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [pools.keepalive]
+            max_idle = 4
+            max_total = 4
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        Config::from_file(file.path().to_str().unwrap())
+            .expect("max_total == max_idle must be allowed");
+    }
+
+    #[test]
+    fn reject_keepalive_max_requests_zero() {
+        let file = write_temp_config(&l7_listener_with("keepalive_max_requests = 0"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_keepalive_idle_timeout_zero() {
+        let file = write_temp_config(&l7_listener_with("keepalive_idle_timeout_secs = 0"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_phase_timeout_header_zero() {
+        let file = write_temp_config(&l7_listener_with("client_header_timeout_secs = 0"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_phase_timeout_body_zero() {
+        let file = write_temp_config(&l7_listener_with("client_body_timeout_secs = 0"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_phase_timeout_proxy_send_zero() {
+        let file = write_temp_config(&l7_listener_with("proxy_send_timeout_secs = 0"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_phase_timeout_proxy_read_zero() {
+        let file = write_temp_config(&l7_listener_with("proxy_read_timeout_secs = 0"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn reject_request_timeout_zero() {
+        let file = write_temp_config(&l7_listener_with("request_timeout_secs = 0"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn max_body_size_zero_is_unlimited() {
+        // 0 means unlimited and must not be rejected by validation.
+        let file = write_temp_config(&l7_listener_with("max_body_size_bytes = 0"));
+        Config::from_file(file.path().to_str().unwrap())
+            .expect("max_body_size_bytes=0 (unlimited) must be allowed");
+    }
+
+    #[test]
+    fn l4_listener_rejects_client_header_timeout() {
+        let file = write_temp_config(&l4_listener_with("client_header_timeout_secs = 30"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn l4_listener_rejects_client_body_timeout() {
+        let file = write_temp_config(&l4_listener_with("client_body_timeout_secs = 30"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn l4_listener_rejects_proxy_send_timeout() {
+        let file = write_temp_config(&l4_listener_with("proxy_send_timeout_secs = 30"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn l4_listener_rejects_proxy_read_timeout() {
+        let file = write_temp_config(&l4_listener_with("proxy_read_timeout_secs = 30"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn l4_listener_rejects_request_timeout() {
+        let file = write_temp_config(&l4_listener_with("request_timeout_secs = 60"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn l4_listener_rejects_max_body_size() {
+        let file = write_temp_config(&l4_listener_with("max_body_size_bytes = 1048576"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn l4_listener_rejects_keepalive_idle_timeout() {
+        let file = write_temp_config(&l4_listener_with("keepalive_idle_timeout_secs = 60"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn l4_listener_rejects_keepalive_max_requests() {
+        let file = write_temp_config(&l4_listener_with("keepalive_max_requests = 1000"));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn l7_listener_accepts_all_new_fields() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+            pool = "web"
+            client_header_timeout_secs = 10
+            client_body_timeout_secs = 20
+            proxy_send_timeout_secs = 30
+            proxy_read_timeout_secs = 40
+            request_timeout_secs = 60
+            max_body_size_bytes = 1048576
+            keepalive_idle_timeout_secs = 60
+            keepalive_max_requests = 500
+
+            [[pools]]
+            name = "web"
+
+            [pools.keepalive]
+            max_idle = 16
+            idle_conn_ttl_secs = 30
+            max_total = 32
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        let l = &config.listeners[0];
+        assert_eq!(l.client_header_timeout_secs, Some(10));
+        assert_eq!(l.client_body_timeout_secs, Some(20));
+        assert_eq!(l.proxy_send_timeout_secs, Some(30));
+        assert_eq!(l.proxy_read_timeout_secs, Some(40));
+        assert_eq!(l.request_timeout_secs, Some(60));
+        assert_eq!(l.max_body_size_bytes, Some(1_048_576));
+        assert_eq!(l.keepalive_idle_timeout_secs, Some(60));
+        assert_eq!(l.keepalive_max_requests, Some(500));
+    }
+
+    #[test]
+    fn new_listener_l7_defaults_are_none() {
+        // all new optional fields default to None when not set
+        let file = write_temp_config(&l7_listener_with(""));
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        let l = &config.listeners[0];
+        assert!(l.client_header_timeout_secs.is_none());
+        assert!(l.client_body_timeout_secs.is_none());
+        assert!(l.proxy_send_timeout_secs.is_none());
+        assert!(l.proxy_read_timeout_secs.is_none());
+        assert!(l.request_timeout_secs.is_none());
+        assert!(l.max_body_size_bytes.is_none());
+        assert!(l.keepalive_idle_timeout_secs.is_none());
+        assert!(l.keepalive_max_requests.is_none());
     }
 }

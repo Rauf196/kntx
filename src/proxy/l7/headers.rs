@@ -26,7 +26,30 @@ impl SkipSet {
         connection_value: Option<&str>,
         extra_skip_names: &[&str],
     ) -> Self {
-        let mut conn_listed: Vec<&str> = Vec::new();
+        Self::build_inner(headers, connection_value, extra_skip_names, false)
+    }
+
+    /// Same as [`build`] but preserves `Connection` and `Upgrade` headers on
+    /// the request even though they are otherwise hop-by-hop. Used on the
+    /// backend-bound side of a WebSocket upgrade: the origin must see the
+    /// upgrade tokens or it cannot decide whether to switch protocols.
+    pub fn build_for_upgrade(
+        headers: &[ParsedHeader],
+        connection_value: Option<&str>,
+        extra_skip_names: &[&str],
+    ) -> Self {
+        Self::build_inner(headers, connection_value, extra_skip_names, true)
+    }
+
+    fn build_inner(
+        headers: &[ParsedHeader],
+        connection_value: Option<&str>,
+        extra_skip_names: &[&str],
+        preserve_upgrade: bool,
+    ) -> Self {
+        // typical `Connection` header has 0-2 tokens; 4-slot starting capacity
+        // avoids a heap grow for the overwhelming majority of requests.
+        let mut conn_listed: Vec<&str> = Vec::with_capacity(4);
         if let Some(val) = connection_value {
             for token in val.split(',') {
                 let t = token.trim();
@@ -36,8 +59,16 @@ impl SkipSet {
             }
         }
 
-        let mut indices = Vec::new();
+        // hop-by-hop matches per request are usually 1-3 (Connection,
+        // sometimes Keep-Alive, occasionally Upgrade). 8-slot capacity
+        // covers normal traffic without a realloc.
+        let mut indices = Vec::with_capacity(8);
         for (i, h) in headers.iter().enumerate() {
+            let name_is_connection = h.name.eq_ignore_ascii_case("connection");
+            let name_is_upgrade = h.name.eq_ignore_ascii_case("upgrade");
+            if preserve_upgrade && (name_is_connection || name_is_upgrade) {
+                continue;
+            }
             if HOP_BY_HOP
                 .iter()
                 .any(|&hop| h.name.eq_ignore_ascii_case(hop))
@@ -169,12 +200,17 @@ fn find_header(headers: &[ParsedHeader], name: &str) -> Option<String> {
 }
 
 /// build request-side SkipSet + Additions for forwarding to backend.
+///
+/// `is_upgrade` switches the hop-by-hop strip into upgrade-preserving mode:
+/// `Connection` and `Upgrade` headers from the client pass through verbatim
+/// so the origin can negotiate the protocol switch (RFC 7230 §6.7).
 pub fn build_request_additions(
     headers: &[ParsedHeader],
     client_ip: &str,
     is_tls: bool,
     version: HttpVersion,
     request_id: &str,
+    is_upgrade: bool,
 ) -> (SkipSet, Additions) {
     let proto = if is_tls { "https" } else { "http" };
     let via_proto = match version {
@@ -203,7 +239,11 @@ pub fn build_request_additions(
         "x-request-id",
         "via",
     ];
-    let skip = SkipSet::build(headers, connection_val.as_deref(), extra_skip);
+    let skip = if is_upgrade {
+        SkipSet::build_for_upgrade(headers, connection_val.as_deref(), extra_skip)
+    } else {
+        SkipSet::build(headers, connection_val.as_deref(), extra_skip)
+    };
 
     let mut additions = Additions::new();
     additions.push("X-Forwarded-For", xff);
@@ -211,15 +251,27 @@ pub fn build_request_additions(
     additions.push("X-Forwarded-Proto", proto);
     additions.push("X-Request-ID", request_id.to_owned());
     additions.push("Via", via);
-    additions.push("Connection", "close");
+    // proxy emits no Connection header on backend-bound requests: hop-by-hop
+    // strip already removed any inbound Connection from the client. backend
+    // applies its own HTTP/1.x default (keep-alive on 1.1, close on 1.0)
+    // which the cache success path picks up via the response's Connection
+    // header.
 
     (skip, additions)
 }
 
 /// build response-side SkipSet + Additions.
+///
+/// `close_after_response` is the proxy's client-side keep-alive decision; it
+/// sets the hop-by-hop `Connection` header the proxy emits to the client.
+/// `client_version` is the request version — it picks the HTTP/1.0 mixed-case
+/// `Keep-Alive` spelling vs HTTP/1.1 `keep-alive`. The backend response's own
+/// `Connection` header is stripped via the hop-by-hop skip set first.
 pub fn build_response_additions(
     headers: &[ParsedHeader],
     version: HttpVersion,
+    close_after_response: bool,
+    client_version: HttpVersion,
 ) -> (SkipSet, Additions) {
     let via_proto = match version {
         HttpVersion::Http10 => "1.0",
@@ -236,8 +288,21 @@ pub fn build_response_additions(
 
     let skip = SkipSet::build(headers, connection_val.as_deref(), &["via"]);
 
+    // `close` is always lowercase regardless of HTTP version. `keep-alive` uses
+    // the HTTP/1.0 mixed-case `Keep-Alive` convention (some old middleboxes
+    // match case-sensitively) and the HTTP/1.1 lowercase `keep-alive` is
+    // always emitted explicitly — belt-and-suspenders for intermediaries that
+    // predate the default-keep-alive rule.
+    let conn_value: &str = if close_after_response {
+        "close"
+    } else if matches!(client_version, HttpVersion::Http10) {
+        "Keep-Alive"
+    } else {
+        "keep-alive"
+    };
+
     let mut additions = Additions::new();
-    additions.push("Connection", "close");
+    additions.push("Connection", conn_value);
     additions.push("Via", via);
 
     (skip, additions)
@@ -292,6 +357,23 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_skip_preserves_connection_and_upgrade() {
+        let headers = vec![
+            h("Host", b"example.com"),
+            h("Connection", b"Upgrade"),
+            h("Upgrade", b"websocket"),
+            h("Sec-WebSocket-Key", b"dGhlIHNhbXBsZSBub25jZQ=="),
+            h("Sec-WebSocket-Version", b"13"),
+        ];
+        let skip = SkipSet::build_for_upgrade(&headers, Some("Upgrade"), &[]);
+        assert!(!skip.contains(0));
+        assert!(!skip.contains(1));
+        assert!(!skip.contains(2));
+        assert!(!skip.contains(3));
+        assert!(!skip.contains(4));
+    }
+
+    #[test]
     fn hop_by_hop_stripped_connection_listed_names() {
         let headers = vec![
             h("Host", b"example.com"),
@@ -311,7 +393,7 @@ mod tests {
         let headers = vec![h("Host", b"example.com"), h("X-Forwarded-For", b"1.2.3.4")];
         let rid = resolve_request_id(&headers);
         let (_, additions) =
-            build_request_additions(&headers, "5.6.7.8", false, HttpVersion::Http11, &rid);
+            build_request_additions(&headers, "5.6.7.8", false, HttpVersion::Http11, &rid, false);
         let xff = additions
             .lines
             .iter()
@@ -325,7 +407,7 @@ mod tests {
         let headers = vec![h("Host", b"example.com")];
         let rid = resolve_request_id(&headers);
         let (_, additions) =
-            build_request_additions(&headers, "1.2.3.4", false, HttpVersion::Http11, &rid);
+            build_request_additions(&headers, "1.2.3.4", false, HttpVersion::Http11, &rid, false);
         let xff = additions
             .lines
             .iter()
@@ -342,7 +424,7 @@ mod tests {
         ];
         let rid = resolve_request_id(&headers);
         let (_, additions) =
-            build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid);
+            build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid, false);
         let entry = additions
             .lines
             .iter()
@@ -356,7 +438,7 @@ mod tests {
         let headers = vec![h("Host", b"example.com")];
         let rid = resolve_request_id(&headers);
         let (_, additions) =
-            build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid);
+            build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid, false);
         let entry = additions
             .lines
             .iter()
@@ -374,7 +456,7 @@ mod tests {
         ];
         let rid = resolve_request_id(&headers);
         let (_, additions) =
-            build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid);
+            build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid, false);
         let entry = additions
             .lines
             .iter()
@@ -388,7 +470,7 @@ mod tests {
         let headers = vec![h("Host", b"example.com"), h("Via", b"1.0 upstream")];
         let rid = resolve_request_id(&headers);
         let (_, additions) =
-            build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid);
+            build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid, false);
         let via = additions.lines.iter().find(|(n, _)| n == "Via").unwrap();
         assert_eq!(via.1, "1.0 upstream, 1.1 kntx");
     }
@@ -398,7 +480,7 @@ mod tests {
         let headers = vec![h("Host", b"example.com")];
         let rid = resolve_request_id(&headers);
         let (_, additions) =
-            build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid);
+            build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid, false);
         let via = additions.lines.iter().find(|(n, _)| n == "Via").unwrap();
         assert_eq!(via.1, "1.1 kntx");
     }

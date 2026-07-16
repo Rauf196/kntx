@@ -13,9 +13,9 @@ use crate::access_log::AccessLogSink;
 use crate::config::{ForwardingStrategy, ListenerConfig, ListenerMode};
 use crate::pool::buffer::BufferPool;
 use crate::proxy::l4::{self, Resources};
-use crate::proxy::l7::{self, ClientStream, ErrorPages};
 use crate::proxy::l7::matcher::RouteContext;
 use crate::proxy::l7::router::Router;
+use crate::proxy::l7::{self, ClientStream, ErrorPages};
 use crate::util::monotonic_millis;
 
 #[derive(Debug, Error)]
@@ -150,6 +150,9 @@ pub async fn serve(
                         let error_pages = error_pages.clone();
                         let access_log = access_log.clone();
                         let buffer_pool = buffer_pool.clone();
+                        // per-conn shutdown receiver: the keep-alive loop selects on
+                        // this to stop looping gracefully on shutdown.
+                        let conn_shutdown = shutdown.clone();
 
                         tasks.spawn(async move {
                             let _permit = permit;
@@ -246,6 +249,7 @@ pub async fn serve(
                                             Arc::clone(&last_activity),
                                             Arc::clone(&buffer_pool),
                                             listener_label.clone(),
+                                            conn_shutdown,
                                         );
 
                                         let result = if let Some(timeout) = idle_timeout {

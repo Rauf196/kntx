@@ -4,9 +4,11 @@ use std::sync::Mutex;
 use serde::{Serialize, Serializer};
 use tokio::sync::mpsc;
 
-// access log field convention: route_id is "" on no-match / pre-route errors, never null.
-fn ser_opt_str_as_empty<S: Serializer>(v: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(v.as_deref().unwrap_or(""))
+// access log field convention: route_id is "-" on no-match / pre-route errors, never null.
+// the dash matches the Common Log Format absent-value marker so log readers see
+// "no route assigned" rather than an empty string they have to interpret.
+fn ser_opt_str_as_dash<S: Serializer>(v: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(v.as_deref().unwrap_or("-"))
 }
 
 use crate::config::{AccessLogConfig, AccessLogOutput};
@@ -28,11 +30,18 @@ pub struct AccessLogLine {
     pub backend_wait_ms: Option<f64>,
     pub backend: Option<String>,
     pub pool: String,
-    #[serde(serialize_with = "ser_opt_str_as_empty")]
+    #[serde(serialize_with = "ser_opt_str_as_dash")]
     pub route_id: Option<String>,
     pub request_id: String,
     pub trace_id: Option<String>,
     pub keepalive_index: u32,
+    // WebSocket tunnel rows set this true; absent on plain HTTP rows so the
+    // existing schema is unchanged on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<bool>,
+    // Tunnel close disposition; only meaningful when `tunnel` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 pub enum AccessLogSink {
@@ -65,15 +74,17 @@ impl AccessLogSink {
                     let mut flush_tick = interval(Duration::from_secs(1));
                     let mut count = 0usize;
                     let mut dirty = false;
+                    let mut buf: Vec<u8> = Vec::with_capacity(512);
                     loop {
                         tokio::select! {
                             biased;
                             maybe_line = rx.recv() => {
                                 match maybe_line {
                                     Some(line) => {
-                                        if let Ok(json) = serde_json::to_string(&line) {
-                                            let _ = writer.write_all(json.as_bytes());
-                                            let _ = writer.write_all(b"\n");
+                                        buf.clear();
+                                        if serde_json::to_writer(&mut buf, &line).is_ok() {
+                                            buf.push(b'\n');
+                                            let _ = writer.write_all(&buf);
                                             count += 1;
                                             dirty = true;
                                             if count.is_multiple_of(64) {
@@ -103,30 +114,36 @@ impl AccessLogSink {
     pub fn emit(&self, line: AccessLogLine) {
         match self {
             Self::Off => {}
-            Self::Stdout(w) => {
-                if let Ok(json) = serde_json::to_string(&line)
-                    && let Ok(mut guard) = w.lock()
-                {
-                    let _ = guard.write_all(json.as_bytes());
-                    let _ = guard.write_all(b"\n");
-                    let _ = guard.flush();
-                }
-            }
-            Self::Stderr(w) => {
-                if let Ok(json) = serde_json::to_string(&line)
-                    && let Ok(mut guard) = w.lock()
-                {
-                    let _ = guard.write_all(json.as_bytes());
-                    let _ = guard.write_all(b"\n");
-                    let _ = guard.flush();
-                }
-            }
+            Self::Stdout(w) => write_line(w, &line),
+            Self::Stderr(w) => write_line(w, &line),
             Self::File(tx) => {
                 if tx.try_send(line).is_err() {
                     metrics::counter!("kntx_access_log_dropped_total").increment(1);
                 }
             }
         }
+    }
+
+    /// Emit a line without yielding to the runtime. The existing `emit`
+    /// implementation is already non-awaiting (stdio writes are blocking,
+    /// the file sink uses `try_send`); this name exists so callers that
+    /// require the no-await guarantee — chiefly the WebSocket tunnel close
+    /// path, which must land its log line before any further await that
+    /// could be cancelled by JoinSet drop at shutdown — surface that
+    /// invariant at the call site.
+    pub fn emit_sync(&self, line: AccessLogLine) {
+        self.emit(line);
+    }
+}
+
+// stream the serialized JSON straight into the BufWriter's internal buffer
+// instead of going via a per-call `serde_json::to_string` allocation. saves
+// one heap String per emit on the stdio sinks (hot path).
+fn write_line<W: std::io::Write>(w: &Mutex<BufWriter<W>>, line: &AccessLogLine) {
+    let Ok(mut guard) = w.lock() else { return };
+    if serde_json::to_writer(&mut *guard, line).is_ok() {
+        let _ = guard.write_all(b"\n");
+        let _ = guard.flush();
     }
 }
 
@@ -171,7 +188,29 @@ mod tests {
             request_id: "abc123".to_owned(),
             trace_id: None,
             keepalive_index: 0,
+            tunnel: None,
+            outcome: None,
         }
+    }
+
+    #[test]
+    fn tunnel_field_absent_on_plain_http_rows() {
+        let line = sample_line();
+        let json = serde_json::to_string(&line).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("tunnel").is_none());
+        assert!(parsed.get("outcome").is_none());
+    }
+
+    #[test]
+    fn tunnel_field_present_when_set() {
+        let mut line = sample_line();
+        line.tunnel = Some(true);
+        line.outcome = Some("peer_closed".to_owned());
+        let json = serde_json::to_string(&line).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["tunnel"], true);
+        assert_eq!(parsed["outcome"], "peer_closed");
     }
 
     #[test]

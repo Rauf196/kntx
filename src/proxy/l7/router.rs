@@ -116,12 +116,13 @@ pub fn build_router(
     pool_map: &HashMap<String, (Arc<BackendPool>, Arc<RoundRobin>)>,
 ) -> Result<ConfigRouter, RouterBuildError> {
     if let Some(pool_name) = &listener.pool {
-        let (backends, rr) = pool_map
-            .get(pool_name)
-            .ok_or_else(|| RouterBuildError::UnknownPool {
-                listener: listener.address.to_string(),
-                pool: pool_name.clone(),
-            })?;
+        let (backends, rr) =
+            pool_map
+                .get(pool_name)
+                .ok_or_else(|| RouterBuildError::UnknownPool {
+                    listener: listener.address.to_string(),
+                    pool: pool_name.clone(),
+                })?;
         let handle = PoolHandle {
             backends: backends.clone(),
             rr: rr.clone(),
@@ -136,12 +137,13 @@ pub fn build_router(
 
     let mut entries = Vec::with_capacity(listener.routes.len());
     for route_cfg in &listener.routes {
-        let (backends, rr) = pool_map
-            .get(&route_cfg.pool)
-            .ok_or_else(|| RouterBuildError::UnknownPool {
-                listener: listener.address.to_string(),
-                pool: route_cfg.pool.clone(),
-            })?;
+        let (backends, rr) =
+            pool_map
+                .get(&route_cfg.pool)
+                .ok_or_else(|| RouterBuildError::UnknownPool {
+                    listener: listener.address.to_string(),
+                    pool: route_cfg.pool.clone(),
+                })?;
         let handle = PoolHandle {
             backends: backends.clone(),
             rr: rr.clone(),
@@ -178,15 +180,20 @@ pub fn build_router(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::KeepaliveConfig;
     use crate::proxy::l7::matcher::{
-        HostMatcher, MethodMatcher, Matcher, PathPrefixMatcher, RouteContext,
+        HostMatcher, Matcher, MethodMatcher, PathPrefixMatcher, RouteContext,
     };
     use std::net::IpAddr;
     use std::time::Duration;
 
     const EMPTY_HEADERS: &[crate::proxy::l7::parse::ParsedHeader] = &[];
 
-    fn make_ctx<'a>(method: Option<&'a str>, host: Option<&'a str>, path: Option<&'a str>) -> RouteContext<'a> {
+    fn make_ctx<'a>(
+        method: Option<&'a str>,
+        host: Option<&'a str>,
+        path: Option<&'a str>,
+    ) -> RouteContext<'a> {
         RouteContext {
             method,
             host,
@@ -203,6 +210,7 @@ mod tests {
             vec!["127.0.0.1:9000".parse().unwrap()],
             3,
             Duration::from_secs(10),
+            KeepaliveConfig::default(),
         ));
         let rr = Arc::new(RoundRobin::new(pool.clone()));
         PoolHandle {
@@ -212,10 +220,7 @@ mod tests {
         }
     }
 
-    fn make_entry(
-        matchers: Vec<Box<dyn Matcher + Send + Sync>>,
-        pool_name: &str,
-    ) -> RouteEntry {
+    fn make_entry(matchers: Vec<Box<dyn Matcher + Send + Sync>>, pool_name: &str) -> RouteEntry {
         RouteEntry {
             matcher: CompositeMatcher::new(matchers),
             pool: make_pool_handle(pool_name),
@@ -272,8 +277,10 @@ mod tests {
 
     #[test]
     fn no_match_returns_none() {
-        let router =
-            ConfigRouter::new(vec![make_entry(vec![host_matcher("api.example.com")], "api")]);
+        let router = ConfigRouter::new(vec![make_entry(
+            vec![host_matcher("api.example.com")],
+            "api",
+        )]);
         let ctx = make_ctx(None, Some("other.com"), None);
         assert!(router.route(&ctx).is_none());
     }

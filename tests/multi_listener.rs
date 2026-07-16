@@ -10,7 +10,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 use kntx::access_log::AccessLogSink;
 use kntx::balancer::RoundRobin;
-use kntx::config::{ErrorPagesConfig, ForwardingStrategy, ListenerConfig, ListenerMode};
+use kntx::config::{
+    ErrorPagesConfig, ForwardingStrategy, KeepaliveConfig, ListenerConfig, ListenerMode,
+};
 use kntx::health::BackendPool;
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
@@ -18,6 +20,7 @@ use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
 use kntx::proxy::l7::router::Router;
 
+use helpers::http_backend::{HttpBackend, ResponseSpec};
 use helpers::{EchoServer, make_single_pool_router};
 
 fn test_resources() -> Resources {
@@ -35,6 +38,7 @@ fn make_pool_named(name: &str, addrs: &[SocketAddr]) -> Arc<BackendPool> {
         addrs.to_vec(),
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ))
 }
 
@@ -42,7 +46,8 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
     Arc::new(ListenerConfig {
         address: "127.0.0.1:0".parse().unwrap(),
         mode: ListenerMode::L4,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: None,
         drain_timeout_secs: 5,
@@ -50,6 +55,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
         max_connect_attempts: 3,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     })
 }
 
@@ -149,6 +155,7 @@ async fn two_listeners_shared_pool_share_rr_counter() {
         vec![b1.addr, b2.addr],
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
     let shared_rr = Arc::new(RoundRobin::new(Arc::clone(&shared_pool)));
 
@@ -265,4 +272,128 @@ async fn shutdown_drains_all_listeners_independently() {
         .await
         .expect("L1 did not complete drain within 3s")
         .expect("L1 serve task panicked");
+}
+
+// L4 forwarding allocates a fresh backend conn per client conn and does not
+// touch the per-BackendState keep-alive cache. When the same pool is shared
+// between an L4 listener and an L7 listener, the L7 listener's idle cache
+// must remain intact across L4 traffic. The test pins the pool's
+// `total_count` (active + idle conns held by the proxy) before and after
+// L4 activity; the L4 path's transient connect/disconnect does not change
+// this gauge, and the subsequent L7 request reuses the cached idle conn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pool_shared_l4_l7_listener() {
+    use std::sync::atomic::Ordering;
+    let backend = HttpBackend::start_keepalive(ResponseSpec::ok("shared")).await;
+
+    let shared_pool = Arc::new(BackendPool::new(
+        "shared".into(),
+        vec![backend.addr],
+        3,
+        Duration::from_secs(10),
+        KeepaliveConfig::default(),
+    ));
+    let shared_rr = Arc::new(RoundRobin::new(Arc::clone(&shared_pool)));
+
+    let l4_router = make_single_pool_router(Arc::clone(&shared_pool), Arc::clone(&shared_rr));
+    let l4_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l4_addr = l4_tcp.local_addr().unwrap();
+    let (l4_shutdown_tx, l4_shutdown_rx) = tokio::sync::watch::channel(());
+    let l4_cfg = ServeConfig {
+        listener_cfg: Arc::new(ListenerConfig {
+            address: l4_addr,
+            mode: ListenerMode::L4,
+            pool: Some("shared".to_owned()),
+            routes: vec![],
+            max_connections: None,
+            idle_timeout_secs: None,
+            drain_timeout_secs: 1,
+            connect_timeout_secs: 2,
+            max_connect_attempts: 1,
+            tls: None,
+            header_size_limit_bytes: 16384,
+            ..Default::default()
+        }),
+        ..serve_config("l4")
+    };
+    tokio::spawn(listener::serve(l4_tcp, l4_router, l4_cfg, l4_shutdown_rx));
+
+    let l7_router = make_single_pool_router(Arc::clone(&shared_pool), Arc::clone(&shared_rr));
+    let l7_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l7_addr = l7_tcp.local_addr().unwrap();
+    let (l7_shutdown_tx, l7_shutdown_rx) = tokio::sync::watch::channel(());
+    let l7_cfg = ServeConfig {
+        listener_cfg: Arc::new(ListenerConfig {
+            address: l7_addr,
+            mode: ListenerMode::L7,
+            pool: Some("shared".to_owned()),
+            routes: vec![],
+            max_connections: None,
+            idle_timeout_secs: None,
+            drain_timeout_secs: 1,
+            connect_timeout_secs: 2,
+            max_connect_attempts: 1,
+            tls: None,
+            header_size_limit_bytes: 16384,
+            ..Default::default()
+        }),
+        ..serve_config("l7")
+    };
+    tokio::spawn(listener::serve(l7_tcp, l7_router, l7_cfg, l7_shutdown_rx));
+
+    // warm the keep-alive cache with one L7 request: the backend conn used
+    // here is returned to the cache, leaving `total_count == 1` for the
+    // single backend.
+    issue_http_request(l7_addr).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let state = shared_pool.state_for(backend.addr).unwrap();
+    assert_eq!(
+        state.total_count.0.load(Ordering::Acquire),
+        1,
+        "L7 request must leave one idle conn in the cache"
+    );
+    assert_eq!(backend.accept_count(), 1);
+
+    // L4 traffic: a fresh backend TCP conn per request, no cache interaction.
+    // accept_count rises but the L7 cache invariant holds.
+    for _ in 0..3 {
+        issue_http_request(l4_addr).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        state.total_count.0.load(Ordering::Acquire),
+        1,
+        "L4 traffic must not perturb the L7 keep-alive cache"
+    );
+
+    // next L7 request reuses the cached idle conn — backend accept count
+    // stays steady relative to the pre-L7 count established above.
+    let before = backend.accept_count();
+    issue_http_request(l7_addr).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        backend.accept_count(),
+        before,
+        "second L7 request must hit the cached backend conn, not open a fresh one"
+    );
+
+    let _ = l4_shutdown_tx.send(());
+    let _ = l7_shutdown_tx.send(());
+}
+
+// fire a single HTTP/1.1 request through `addr` and read the response.
+// `addr` may be either an L4 or L7 proxy front-end; in both cases the
+// backend is HTTP and parses the same bytes.
+async fn issue_http_request(addr: SocketAddr) {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: e.com\r\n\r\n")
+        .await
+        .unwrap();
+    // half-close so the L4 path observes EOF and tears down; for L7 the
+    // proxy's default-on keep-alive would otherwise hold the conn until
+    // idle, blocking the response read here.
+    let _ = s.shutdown().await;
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf).await;
+    assert!(buf.starts_with(b"HTTP/1.1 200"), "got: {buf:?}");
 }

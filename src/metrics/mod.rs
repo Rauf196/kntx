@@ -1,12 +1,34 @@
 use std::net::SocketAddr;
 
 use metrics::{describe_counter, describe_gauge, describe_histogram};
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 
 pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     // recorder must be installed before describe_* — otherwise descriptions go to the
     // noop recorder and never reach /metrics as # HELP / # TYPE lines.
     PrometheusBuilder::new()
+        // proxy-scale latency buckets: 50µs–30s, denser in the 100µs–100ms range
+        .set_buckets_for_metric(
+            Matcher::Full("kntx_http_request_duration_seconds".into()),
+            &[
+                5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 0.1, 0.5, 1.0, 5.0, 30.0,
+            ],
+        )?
+        // TLS handshake: fast-path ~ms, slow-path ~100ms
+        .set_buckets_for_metric(
+            Matcher::Full("kntx_tls_handshake_duration_seconds".into()),
+            &[1e-3, 5e-3, 1e-2, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+        )?
+        // health probe: sub-ms local, up to seconds for cross-region
+        .set_buckets_for_metric(
+            Matcher::Full("kntx_health_check_duration_seconds".into()),
+            &[1e-4, 1e-3, 1e-2, 0.1, 1.0, 5.0],
+        )?
+        // keep-alive requests per connection: 1 to 1000 (default cap)
+        .set_buckets_for_metric(
+            Matcher::Full("kntx_http_keepalive_requests".into()),
+            &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0],
+        )?
         .with_http_listener(address)
         .install()?;
 
@@ -94,6 +116,43 @@ pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     describe_counter!(
         "kntx_route_no_match_total",
         "Requests that did not match any configured route."
+    );
+
+    describe_counter!(
+        "kntx_backend_pool_checkouts_total",
+        "Backend keepalive cache checkouts (labels: pool, backend, outcome=hit|miss|stale)."
+    );
+    describe_counter!(
+        "kntx_backend_pool_returns_total",
+        "Backend keepalive cache returns (labels: pool, backend, outcome=ok|full)."
+    );
+    describe_gauge!(
+        "kntx_backend_pool_size",
+        "Current count of idle backend conns in the keepalive cache (labels: pool, backend)."
+    );
+    describe_counter!(
+        "kntx_pool_full_failovers_total",
+        "Backend checkouts that failed over to a peer because the selected backend was at max_total (labels: pool, backend)."
+    );
+    describe_counter!(
+        "kntx_http_body_too_large_total",
+        "Requests rejected because the request body exceeded max_body_size_bytes (labels: listener)."
+    );
+    describe_counter!(
+        "kntx_http_retry_attempts_total",
+        "Broken-keepalive retries — popped cache conn failed first write; request retried on a fresh conn (labels: listener, pool)."
+    );
+    describe_histogram!(
+        "kntx_http_keepalive_requests",
+        "L7 requests served on a single client connection, recorded at connection close (labels: listener)."
+    );
+    describe_gauge!(
+        "kntx_websocket_tunnels_active",
+        "Currently active WebSocket tunnels (labels: listener)."
+    );
+    describe_counter!(
+        "kntx_websocket_tunnels_total",
+        "WebSocket tunnels opened (labels: listener)."
     );
 
     Ok(())

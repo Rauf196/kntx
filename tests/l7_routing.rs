@@ -8,25 +8,26 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 use tokio::sync::watch;
 
+use helpers::EchoServer;
 use helpers::http_backend::{HttpBackend, ResponseSpec};
 use helpers::tls::{client_config_trusting, generate_cert, write_cert_to_tempdir};
-use helpers::EchoServer;
 use kntx::access_log::AccessLogSink;
-use kntx::config::{AccessLogConfig, AccessLogOutput};
 use kntx::balancer::RoundRobin;
+use kntx::config::{AccessLogConfig, AccessLogOutput};
 use kntx::config::{
-    CertificateConfig, ErrorPagesConfig, ForwardingStrategy, ListenerConfig, ListenerMode, TlsConfig,
+    CertificateConfig, ErrorPagesConfig, ForwardingStrategy, KeepaliveConfig, ListenerConfig,
+    ListenerMode, TlsConfig,
 };
 use kntx::health::BackendPool;
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
-use kntx::proxy::l7::matcher::{CompositeMatcher, HostMatcher, Matcher, PathPrefixMatcher, SniMatcher};
-use kntx::proxy::l7::router::{ConfigRouter, PoolHandle, RouteEntry, Router};
 use kntx::proxy::l7::ErrorPages;
+use kntx::proxy::l7::matcher::{
+    CompositeMatcher, HostMatcher, Matcher, PathPrefixMatcher, SniMatcher,
+};
+use kntx::proxy::l7::router::{ConfigRouter, PoolHandle, RouteEntry, Router};
 use kntx::tls::build_acceptor;
-
-// ── helpers ───────────────────────────────────────────────────────────────────
 
 fn test_resources() -> Resources {
     Resources {
@@ -43,6 +44,7 @@ fn make_pool(name: &str, addr: SocketAddr) -> (Arc<BackendPool>, Arc<RoundRobin>
         vec![addr],
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ));
     let rr = Arc::new(RoundRobin::new(pool.clone()));
     (pool, rr)
@@ -95,6 +97,7 @@ async fn start_routing_proxy(router: Arc<dyn Router>) -> RoutingProxy {
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -153,8 +156,6 @@ async fn get(proxy_addr: SocketAddr, host: &str, path: &str) -> (u16, String) {
 
     (status, body)
 }
-
-// ── tests ─────────────────────────────────────────────────────────────────────
 
 /// 6c.13 — two hosts, each routes to a different pool.
 #[tokio::test]
@@ -345,15 +346,27 @@ async fn wildcard_host_routes_subdomain() {
 
     // single-label subdomain matches
     let (_, body) = get(proxy.addr, "api.example.com", "/").await;
-    assert_eq!(body.trim(), "wildcard", "api.example.com must match *.example.com");
+    assert_eq!(
+        body.trim(),
+        "wildcard",
+        "api.example.com must match *.example.com"
+    );
 
     // multi-label subdomain also matches (cloud-native semantics)
     let (_, body) = get(proxy.addr, "a.b.example.com", "/").await;
-    assert_eq!(body.trim(), "wildcard", "a.b.example.com must match *.example.com");
+    assert_eq!(
+        body.trim(),
+        "wildcard",
+        "a.b.example.com must match *.example.com"
+    );
 
     // apex does NOT match wildcard
     let (_, body) = get(proxy.addr, "example.com", "/").await;
-    assert_eq!(body.trim(), "fallback", "example.com must NOT match *.example.com");
+    assert_eq!(
+        body.trim(),
+        "fallback",
+        "example.com must NOT match *.example.com"
+    );
 }
 
 /// 6c.18 — no matching route and no catch-all returns 503.
@@ -453,13 +466,16 @@ async fn route_id_in_access_log() {
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
     let error_pages = Arc::new(ErrorPages::load(&ErrorPagesConfig::default()).unwrap());
     let access_log = Arc::new(
         AccessLogSink::from_config(&AccessLogConfig {
-            output: AccessLogOutput::File { file: log_path.clone() },
+            output: AccessLogOutput::File {
+                file: log_path.clone(),
+            },
             format: None,
             file_channel_capacity: 64,
         })
@@ -503,8 +519,6 @@ async fn route_id_in_access_log() {
     assert_eq!(parsed["status"], 200);
 }
 
-// ── M5: SNI routing tests ─────────────────────────────────────────────────────
-
 /// 6c.19 — L7+TLS: SNI steers two hostnames to two separate pools.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_sni_routes_two_pools() {
@@ -522,8 +536,16 @@ async fn tls_sni_routes_two_pools() {
         handshake_timeout_secs: 5,
         min_version: "1.2".to_owned(),
         certificates: vec![
-            CertificateConfig { cert: cert_a, key: key_a, sni_names: vec!["a.test".to_owned()] },
-            CertificateConfig { cert: cert_b, key: key_b, sni_names: vec!["b.test".to_owned()] },
+            CertificateConfig {
+                cert: cert_a,
+                key: key_a,
+                sni_names: vec!["a.test".to_owned()],
+            },
+            CertificateConfig {
+                cert: cert_b,
+                key: key_b,
+                sni_names: vec!["b.test".to_owned()],
+            },
         ],
     };
     let acceptor = build_acceptor(&tls_config).unwrap();
@@ -556,7 +578,10 @@ async fn tls_sni_routes_two_pools() {
     let mut buf = Vec::new();
     let _ = stream_a.read_to_end(&mut buf).await;
     let resp_a = String::from_utf8_lossy(&buf);
-    assert!(resp_a.contains("pool-a"), "SNI a.test must route to pool-a, got: {resp_a}");
+    assert!(
+        resp_a.contains("pool-a"),
+        "SNI a.test must route to pool-a, got: {resp_a}"
+    );
 
     // SNI b.test → pool-b
     let cfg_b = client_config_trusting(&tc_b.cert_der);
@@ -568,7 +593,10 @@ async fn tls_sni_routes_two_pools() {
     let mut buf = Vec::new();
     let _ = stream_b.read_to_end(&mut buf).await;
     let resp_b = String::from_utf8_lossy(&buf);
-    assert!(resp_b.contains("pool-b"), "SNI b.test must route to pool-b, got: {resp_b}");
+    assert!(
+        resp_b.contains("pool-b"),
+        "SNI b.test must route to pool-b, got: {resp_b}"
+    );
 }
 
 /// 6c.19 — composite SNI+path: both conditions must hold.
@@ -694,8 +722,16 @@ async fn l4_tls_sni_routes_two_pools() {
         handshake_timeout_secs: 5,
         min_version: "1.2".to_owned(),
         certificates: vec![
-            CertificateConfig { cert: cert_a, key: key_a, sni_names: vec!["a.test".to_owned()] },
-            CertificateConfig { cert: cert_b, key: key_b, sni_names: vec!["b.test".to_owned()] },
+            CertificateConfig {
+                cert: cert_a,
+                key: key_a,
+                sni_names: vec!["a.test".to_owned()],
+            },
+            CertificateConfig {
+                cert: cert_b,
+                key: key_b,
+                sni_names: vec!["b.test".to_owned()],
+            },
         ],
     };
     let acceptor = build_acceptor(&tls_config).unwrap();
@@ -728,7 +764,10 @@ async fn l4_tls_sni_routes_two_pools() {
     let mut buf = Vec::new();
     let _ = stream_a.read_to_end(&mut buf).await;
     let resp_a = String::from_utf8_lossy(&buf);
-    assert!(resp_a.contains("pool-a"), "L4 SNI a.test must route to pool-a, got: {resp_a}");
+    assert!(
+        resp_a.contains("pool-a"),
+        "L4 SNI a.test must route to pool-a, got: {resp_a}"
+    );
 
     let cfg_b = client_config_trusting(&tc_b.cert_der);
     let mut stream_b = helpers::tls::tls_connect(proxy.addr, "b.test", cfg_b).await;
@@ -739,10 +778,11 @@ async fn l4_tls_sni_routes_two_pools() {
     let mut buf = Vec::new();
     let _ = stream_b.read_to_end(&mut buf).await;
     let resp_b = String::from_utf8_lossy(&buf);
-    assert!(resp_b.contains("pool-b"), "L4 SNI b.test must route to pool-b, got: {resp_b}");
+    assert!(
+        resp_b.contains("pool-b"),
+        "L4 SNI b.test must route to pool-b, got: {resp_b}"
+    );
 }
-
-// ── TLS proxy setup helpers ───────────────────────────────────────────────────
 
 async fn start_tls_l7_proxy(
     router: Arc<dyn Router>,
@@ -765,6 +805,7 @@ async fn start_tls_l7_proxy(
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -818,6 +859,7 @@ async fn start_tls_l4_proxy(
         max_connect_attempts: 1,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -854,8 +896,6 @@ async fn start_tls_l4_proxy(
 #[allow(dead_code)]
 fn _use_echo_server(_: EchoServer) {}
 
-// ── metrics tests ─────────────────────────────────────────────────────────────
-
 static METRICS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 fn init_metrics() -> &'static PrometheusHandle {
@@ -882,13 +922,11 @@ async fn metrics_emit_route_matches_with_route_id_label() {
 
     let backend = HttpBackend::start(ResponseSpec::ok("ok")).await;
     let (pool, rr) = make_pool("metrics-match-pool", backend.addr);
-    let router = Arc::new(ConfigRouter::new(vec![
-        route(
-            vec![Box::new(HostMatcher::new("metrics.example.com").unwrap())],
-            pool_handle("metrics-match-pool", pool, rr),
-            "host=metrics.example.com",
-        ),
-    ]));
+    let router = Arc::new(ConfigRouter::new(vec![route(
+        vec![Box::new(HostMatcher::new("metrics.example.com").unwrap())],
+        pool_handle("metrics-match-pool", pool, rr),
+        "host=metrics.example.com",
+    )]));
     let proxy = start_routing_proxy(router).await;
 
     let (status, _) = get(proxy.addr, "metrics.example.com", "/").await;

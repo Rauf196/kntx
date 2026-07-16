@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 pub mod http_backend;
+pub mod keepalive_client;
 pub mod tls;
+pub mod ws_backend;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,15 +14,13 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use kntx::balancer::RoundRobin;
+use kntx::config::KeepaliveConfig;
 use kntx::health::BackendPool;
 use kntx::proxy::l7::matcher::CompositeMatcher;
 use kntx::proxy::l7::router::{ConfigRouter, PoolHandle, RouteEntry, Router};
 
 /// wrap a single pool into a catch-all `ConfigRouter` suitable for tests.
-pub fn make_single_pool_router(
-    pool: Arc<BackendPool>,
-    rr: Arc<RoundRobin>,
-) -> Arc<dyn Router> {
+pub fn make_single_pool_router(pool: Arc<BackendPool>, rr: Arc<RoundRobin>) -> Arc<dyn Router> {
     let handle = PoolHandle {
         name: pool.name().into(),
         backends: pool,
@@ -41,6 +41,7 @@ pub fn make_test_pool(name: &str, addrs: &[std::net::SocketAddr]) -> Arc<Backend
         addrs.to_vec(),
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ))
 }
 
@@ -158,6 +159,94 @@ impl DyingServer {
                                 // send partial response then drop (simulates crash)
                                 let _ = stream.write_all(response).await;
                                 drop(stream);
+                            });
+                        }
+                    }
+                    _ = &mut shutdown_rx => return,
+                }
+            }
+        });
+
+        Self {
+            addr,
+            _shutdown: shutdown_tx,
+        }
+    }
+}
+
+/// accepts connections then makes no progress — never reads, never writes,
+/// holds the socket open at the TCP layer until dropped. The proxy sees a
+/// live backend that stalls forever: a small request-head write succeeds
+/// (kernel buffer absorbs it) but a large body write eventually blocks
+/// (proxy_send timeout) and a response read never completes (proxy_read
+/// timeout). Accepted streams are retained so the kernel does not RST/FIN
+/// them (which would surface as a write error instead of a stall).
+pub struct BlackholeBackend {
+    pub addr: SocketAddr,
+    _shutdown: oneshot::Sender<()>,
+}
+
+impl BlackholeBackend {
+    pub async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let mut held: Vec<tokio::net::TcpStream> = Vec::new();
+            loop {
+                tokio::select! {
+                    accept = listener.accept() => {
+                        if let Ok((stream, _)) = accept {
+                            held.push(stream); // keep alive, never touch
+                        }
+                    }
+                    _ = &mut shutdown_rx => return,
+                }
+            }
+        });
+
+        Self {
+            addr,
+            _shutdown: shutdown_tx,
+        }
+    }
+}
+
+/// reads the request (head, best-effort), waits `delay`, then sends a minimal
+/// 200. Used to trip the total `request_timeout`: the per-phase proxy_read
+/// budget is left large so only the overall cycle deadline clamps the wait.
+pub struct SlowResponseBackend {
+    pub addr: SocketAddr,
+    _shutdown: oneshot::Sender<()>,
+}
+
+impl SlowResponseBackend {
+    pub async fn start(delay: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accept = listener.accept() => {
+                        if let Ok((mut stream, _)) = accept {
+                            tokio::spawn(async move {
+                                // drain whatever the proxy sent (head; the GET
+                                // this backend serves carries no body)
+                                let mut buf = [0u8; 1024];
+                                match stream.read(&mut buf).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(_) => {}
+                                }
+                                tokio::time::sleep(delay).await;
+                                let _ = stream
+                                    .write_all(
+                                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                                    )
+                                    .await;
+                                let _ = stream.shutdown().await;
                             });
                         }
                     }

@@ -9,7 +9,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 use kntx::access_log::AccessLogSink;
 use kntx::balancer::RoundRobin;
-use kntx::config::{ErrorPagesConfig, ForwardingStrategy, ListenerConfig, ListenerMode};
+use kntx::config::{
+    ErrorPagesConfig, ForwardingStrategy, KeepaliveConfig, ListenerConfig, ListenerMode,
+};
 use kntx::health::BackendPool;
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
@@ -33,6 +35,7 @@ fn test_pool(addrs: &[SocketAddr]) -> Arc<BackendPool> {
         addrs.to_vec(),
         3,
         Duration::from_secs(10),
+        KeepaliveConfig::default(),
     ))
 }
 
@@ -40,7 +43,8 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
     Arc::new(ListenerConfig {
         address: "127.0.0.1:0".parse().unwrap(),
         mode: ListenerMode::L4,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: None,
         drain_timeout_secs: 5,
@@ -48,6 +52,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
         max_connect_attempts: 3,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     })
 }
 

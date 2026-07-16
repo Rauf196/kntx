@@ -9,7 +9,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 use kntx::access_log::AccessLogSink;
 use kntx::balancer::RoundRobin;
-use kntx::config::{ErrorPagesConfig, ForwardingStrategy, ListenerConfig, ListenerMode};
+use kntx::config::{
+    ErrorPagesConfig, ForwardingStrategy, KeepaliveConfig, ListenerConfig, ListenerMode,
+};
 use kntx::health::{BackendPool, CircuitState};
 use kntx::listener::{self, ServeConfig};
 use kntx::pool::buffer::BufferPool;
@@ -31,7 +33,8 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
     Arc::new(ListenerConfig {
         address: "127.0.0.1:0".parse().unwrap(),
         mode: ListenerMode::L4,
-        pool: Some("test".to_owned()), routes: vec![],
+        pool: Some("test".to_owned()),
+        routes: vec![],
         max_connections: None,
         idle_timeout_secs: None,
         drain_timeout_secs: 5,
@@ -39,6 +42,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
         max_connect_attempts: 3,
         tls: None,
         header_size_limit_bytes: 16384,
+        ..Default::default()
     })
 }
 
@@ -88,6 +92,7 @@ async fn backend_failover_redistributes_traffic() {
         vec![b1_addr, b2.addr],
         2, // circuit opens after 2 failures
         Duration::from_secs(60),
+        KeepaliveConfig::default(),
     ));
 
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
@@ -154,6 +159,7 @@ async fn retry_on_connect_failure() {
         vec![dead_addr, live.addr],
         5, // high threshold so circuit stays closed during the test
         Duration::from_secs(60),
+        KeepaliveConfig::default(),
     ));
 
     let (proxy_addr, _shutdown) =
@@ -177,6 +183,7 @@ async fn all_backends_unhealthy_clean_rejection() {
         vec![dead1, dead2],
         10, // high threshold — circuit stays closed, all retries exhausted instead
         Duration::from_secs(60),
+        KeepaliveConfig::default(),
     ));
 
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
@@ -205,6 +212,7 @@ async fn timeout_enforcement_gives_clean_eof() {
         vec![dead_addr],
         10,
         Duration::from_secs(60),
+        KeepaliveConfig::default(),
     ));
 
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
@@ -234,6 +242,7 @@ async fn circuit_opens_after_connect_failures() {
         vec![dead_addr],
         2, // circuit opens after 2 failures
         Duration::from_secs(60),
+        KeepaliveConfig::default(),
     ));
 
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
@@ -289,6 +298,7 @@ async fn healthy_backend_serves_after_peer_fails() {
         vec![dead_addr, live.addr],
         2, // circuit opens quickly
         Duration::from_secs(60),
+        KeepaliveConfig::default(),
     ));
 
     let (proxy_addr, _shutdown) = start_proxy_with_pool(

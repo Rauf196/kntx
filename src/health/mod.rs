@@ -6,7 +6,9 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 
-use crate::util::monotonic_millis;
+use crate::config::KeepaliveConfig;
+use crate::proxy::l7::keepalive::KeepaliveCache;
+use crate::util::{CacheLinePadded, monotonic_millis};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,23 +31,33 @@ impl CircuitState {
 
 pub struct BackendState {
     address: SocketAddr,
+    pool_name: Arc<str>,
     pub(crate) circuit: AtomicU8,
     pub(crate) consecutive_failures: AtomicU32,
     pub(crate) open_since: AtomicU64,
+    pub keepalive: KeepaliveCache,
+    pub total_count: CacheLinePadded<AtomicU64>,
 }
 
 impl BackendState {
-    fn new(address: SocketAddr) -> Self {
+    pub fn new(address: SocketAddr, pool_name: Arc<str>, keepalive_cfg: KeepaliveConfig) -> Self {
         Self {
             address,
+            pool_name,
             circuit: AtomicU8::new(CircuitState::Closed as u8),
             consecutive_failures: AtomicU32::new(0),
             open_since: AtomicU64::new(0),
+            keepalive: KeepaliveCache::new(keepalive_cfg),
+            total_count: CacheLinePadded(AtomicU64::new(0)),
         }
     }
 
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    pub fn pool_name(&self) -> &Arc<str> {
+        &self.pool_name
     }
 
     pub fn circuit_state(&self) -> CircuitState {
@@ -77,13 +89,43 @@ impl BackendState {
             }
         }
     }
+
+    /// true when total active+idle conns to this backend has reached max_total.
+    /// observability query only — NOT consulted by RoundRobin (saturation is enforced at checkout).
+    pub fn is_saturated(&self) -> bool {
+        match self.keepalive.max_total {
+            None => false,
+            Some(cap) => self.total_count.0.load(Ordering::Acquire) >= cap.get() as u64,
+        }
+    }
+
+    /// pop and drop stale idle conns from this backend's cache, decrementing total_count per drop.
+    pub fn sweep_stale_keepalive(&self) {
+        let dropped = self.keepalive.sweep_stale(self.keepalive.idle_conn_ttl);
+        if dropped > 0 {
+            self.total_count
+                .0
+                .fetch_sub(dropped as u64, Ordering::Release);
+            for _ in 0..dropped {
+                metrics::gauge!(
+                    "kntx_backend_pool_size",
+                    "pool" => self.pool_name.to_string(),
+                    "backend" => self.address.to_string(),
+                )
+                .decrement(1.0);
+            }
+        }
+    }
 }
 
 pub struct BackendPool {
     pool_name: Arc<str>,
-    backends: Vec<BackendState>,
+    // Arc-wrapped so checkout sites can hand the state to KeepaliveCache::checkout without
+    // re-cloning the heavy BackendState (which owns the keepalive ArrayQueue).
+    backends: Vec<Arc<BackendState>>,
     failure_threshold: u32,
     recovery_timeout: Duration,
+    keepalive_cfg: KeepaliveConfig,
 }
 
 impl BackendPool {
@@ -92,13 +134,31 @@ impl BackendPool {
         addrs: Vec<SocketAddr>,
         failure_threshold: u32,
         recovery_timeout: Duration,
+        keepalive: KeepaliveConfig,
     ) -> Self {
+        let backends = addrs
+            .into_iter()
+            .map(|a| {
+                Arc::new(BackendState::new(
+                    a,
+                    Arc::clone(&pool_name),
+                    keepalive.clone(),
+                ))
+            })
+            .collect();
         Self {
             pool_name,
-            backends: addrs.into_iter().map(BackendState::new).collect(),
+            backends,
             failure_threshold,
             recovery_timeout,
+            keepalive_cfg: keepalive,
         }
+    }
+
+    /// pool-wide keepalive configuration. used by the sweeper to derive its tick interval
+    /// and to skip pools with keepalive disabled.
+    pub fn keepalive_cfg(&self) -> &KeepaliveConfig {
+        &self.keepalive_cfg
     }
 
     pub fn name(&self) -> &str {
@@ -118,11 +178,20 @@ impl BackendPool {
     }
 
     pub fn get(&self, idx: usize) -> &BackendState {
-        &self.backends[idx]
+        self.backends[idx].as_ref()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &BackendState> {
-        self.backends.iter()
+        self.backends.iter().map(|a| a.as_ref())
+    }
+
+    /// look up an Arc-wrapped BackendState by address. used by L7 checkout to thread
+    /// the state into KeepaliveCache::checkout without re-allocating.
+    pub fn state_for(&self, addr: SocketAddr) -> Option<Arc<BackendState>> {
+        self.backends
+            .iter()
+            .find(|b| b.address == addr)
+            .map(Arc::clone)
     }
 
     pub fn record_failure(&self, addr: SocketAddr) {
@@ -153,6 +222,12 @@ impl BackendPool {
                     "backend" => addr.to_string(),
                 )
                 .set(CircuitState::Open as u8 as f64);
+                // flush stale idle conns now that the circuit is open;
+                // circuit was flipped first so concurrent checkouts skip
+                // this backend via is_available() before they pop anything.
+                backend
+                    .keepalive
+                    .flush_all(&backend.total_count, &self.pool_name, addr);
             }
             CircuitState::HalfOpen => {
                 backend
@@ -168,6 +243,9 @@ impl BackendPool {
                     "backend" => addr.to_string(),
                 )
                 .set(CircuitState::Open as u8 as f64);
+                backend
+                    .keepalive
+                    .flush_all(&backend.total_count, &self.pool_name, addr);
             }
             _ => {}
         }
@@ -220,7 +298,10 @@ impl BackendPool {
     }
 
     fn find(&self, addr: SocketAddr) -> Option<&BackendState> {
-        self.backends.iter().find(|b| b.address == addr)
+        self.backends
+            .iter()
+            .find(|b| b.address == addr)
+            .map(|a| a.as_ref())
     }
 }
 
@@ -300,6 +381,7 @@ mod tests {
             addrs,
             threshold,
             Duration::from_secs(recovery_secs),
+            KeepaliveConfig::default(),
         ))
     }
 
@@ -365,6 +447,7 @@ mod tests {
             vec![ADDR.parse().unwrap()],
             1,
             Duration::from_secs(10),
+            KeepaliveConfig::default(),
         ));
 
         pool.get(0)
@@ -461,5 +544,147 @@ mod tests {
         pool.record_success(addr);
 
         assert_eq!(pool.get(0).circuit_state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn not_saturated_when_max_total_zero() {
+        let cfg = KeepaliveConfig {
+            max_idle: 4,
+            idle_conn_ttl_secs: 60,
+            max_total: 0,
+        };
+        let addr: SocketAddr = ADDR.parse().unwrap();
+        let state = BackendState::new(addr, "test".into(), cfg);
+        state.total_count.0.store(999, Ordering::SeqCst);
+        assert!(
+            !state.is_saturated(),
+            "max_total=0 means unlimited, never saturated"
+        );
+    }
+
+    #[test]
+    fn not_saturated_below_cap() {
+        let cfg = KeepaliveConfig {
+            max_idle: 4,
+            idle_conn_ttl_secs: 60,
+            max_total: 5,
+        };
+        let addr: SocketAddr = ADDR.parse().unwrap();
+        let state = BackendState::new(addr, "test".into(), cfg);
+        state.total_count.0.store(4, Ordering::SeqCst);
+        assert!(!state.is_saturated());
+    }
+
+    #[test]
+    fn saturated_at_cap() {
+        let cfg = KeepaliveConfig {
+            max_idle: 4,
+            idle_conn_ttl_secs: 60,
+            max_total: 5,
+        };
+        let addr: SocketAddr = ADDR.parse().unwrap();
+        let state = BackendState::new(addr, "test".into(), cfg);
+        state.total_count.0.store(5, Ordering::SeqCst);
+        assert!(state.is_saturated());
+    }
+
+    #[test]
+    fn is_available_ignores_saturation() {
+        // saturated but circuit closed → is_available must return true;
+        // saturation enforcement lives at the checkout layer, not in RR selection.
+        let cfg = KeepaliveConfig {
+            max_idle: 1,
+            idle_conn_ttl_secs: 60,
+            max_total: 1,
+        };
+        let addr: SocketAddr = ADDR.parse().unwrap();
+        let state = BackendState::new(addr, "test".into(), cfg);
+        state.total_count.0.store(1, Ordering::SeqCst); // at cap
+        assert!(state.is_saturated(), "precondition: backend is saturated");
+        assert!(
+            state.is_available(Duration::from_secs(60)),
+            "is_available must be circuit-only, not consult saturation"
+        );
+    }
+
+    #[test]
+    fn sweep_stale_keepalive_decrements_count() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let cfg = KeepaliveConfig {
+                max_idle: 4,
+                idle_conn_ttl_secs: 1,
+                max_total: 0,
+            };
+            let state = Arc::new(BackendState::new(addr, "test".into(), cfg));
+
+            // push a stale idle (last_used far in the past)
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let _s = listener.accept().await.unwrap();
+            state
+                .keepalive
+                .push_test_idle(stream, std::time::Instant::now() - Duration::from_secs(10));
+            state.total_count.0.store(1, Ordering::SeqCst);
+
+            state.sweep_stale_keepalive();
+
+            assert_eq!(
+                state.total_count.0.load(Ordering::SeqCst),
+                0,
+                "stale conn must be dropped and counter decremented"
+            );
+            assert_eq!(state.keepalive.queue_len(), 0);
+        });
+    }
+
+    #[test]
+    fn flush_on_circuit_open_clears_cache() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let backend_addr = listener.local_addr().unwrap();
+
+            let cfg = KeepaliveConfig {
+                max_idle: 5,
+                idle_conn_ttl_secs: 60,
+                max_total: 0,
+            };
+            let pool = Arc::new(BackendPool::new(
+                "flush_test".into(),
+                vec![backend_addr],
+                1, // circuit opens after 1 failure
+                Duration::from_secs(60),
+                cfg,
+            ));
+
+            // manually fill the keepalive cache with 3 idle conns
+            for _ in 0..3 {
+                let stream = tokio::net::TcpStream::connect(backend_addr).await.unwrap();
+                let _s = listener.accept().await.unwrap();
+                pool.get(0)
+                    .keepalive
+                    .push_test_idle(stream, std::time::Instant::now());
+            }
+            pool.get(0).total_count.0.store(3, Ordering::Relaxed);
+            assert_eq!(pool.get(0).keepalive.queue_len(), 3);
+
+            // trigger circuit open via record_failure
+            pool.record_failure(backend_addr);
+            assert_eq!(pool.get(0).circuit_state(), CircuitState::Open);
+
+            // cache must be flushed and total_count zeroed
+            assert_eq!(
+                pool.get(0).total_count.0.load(Ordering::Relaxed),
+                0,
+                "flush_all must decrement total_count for each drained idle"
+            );
+            assert_eq!(
+                pool.get(0).keepalive.queue_len(),
+                0,
+                "cache must be empty after circuit opens"
+            );
+        });
     }
 }

@@ -156,7 +156,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     preflight_fd_check(&config)?;
 
-    let buffer_pool = BufferPool::with_defaults();
+    let buffer_pool = BufferPool::from_capacity(config.forwarding.buffer_pool_capacity);
 
     #[cfg(target_os = "linux")]
     let pipe_pool = kntx::pool::pipe::PipePool::with_defaults()?;
@@ -199,6 +199,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             addrs,
             health.failure_threshold,
             Duration::from_secs(health.recovery_timeout_secs),
+            pool_cfg.keepalive.clone(),
         ));
         if config.metrics.is_some() {
             pool.emit_initial_metrics();
@@ -239,6 +240,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let handle = checker.spawn(shutdown_rx.clone());
             health_handles.push(handle);
             tracing::info!(pool = %pool_cfg.name, interval_secs, "health checker started");
+        }
+    }
+
+    // spawn one keepalive sweeper per pool that has backend keepalive enabled.
+    // Pools with max_idle = 0 get no sweeper — KeepaliveSweeper::new returns None.
+    let mut sweeper_handles = Vec::new();
+    for pool_cfg in &config.pools {
+        let (pool, _) = pool_map.get(&pool_cfg.name).unwrap();
+        if let Some(sweeper) = kntx::proxy::l7::keepalive::KeepaliveSweeper::new(Arc::clone(pool)) {
+            let handle = sweeper.spawn(shutdown_rx.clone());
+            sweeper_handles.push(handle);
+            tracing::info!(pool = %pool_cfg.name, "keepalive sweeper started");
         }
     }
 
@@ -341,8 +354,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // wait for health checkers to exit after their shutdown receivers fire
+    // wait for health checkers and keepalive sweepers to exit after their shutdown receivers fire
     for handle in health_handles {
+        let _ = handle.await;
+    }
+    for handle in sweeper_handles {
         let _ = handle.await;
     }
 

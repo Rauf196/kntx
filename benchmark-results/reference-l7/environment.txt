@@ -1,0 +1,10 @@
+date:     2026-06-05T10:40:50Z
+kernel:   7.0.3-arch1-2
+cpu:      Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz
+cores:    8
+load_gen: oha oha 1.14.0
+nginx:    nginx version: nginx/1.29.8
+rustc:    rustc 1.95.0 (59807616e 2026-04-14) (Arch Linux rust 1:1.95.0-1)
+kntx:     4e19a10-dirty
+ulimit:   65536
+duration: 30s, warmup: 10s

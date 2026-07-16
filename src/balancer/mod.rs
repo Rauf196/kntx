@@ -53,6 +53,8 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
+    use crate::config::KeepaliveConfig;
+
     fn test_pool(addrs: &[&str]) -> Arc<BackendPool> {
         let addrs: Vec<SocketAddr> = addrs.iter().map(|a| a.parse().unwrap()).collect();
         Arc::new(BackendPool::new(
@@ -60,6 +62,7 @@ mod tests {
             addrs,
             3,
             Duration::from_secs(10),
+            KeepaliveConfig::default(),
         ))
     }
 
@@ -88,6 +91,7 @@ mod tests {
             addrs.clone(),
             3,
             Duration::from_secs(10),
+            KeepaliveConfig::default(),
         ));
         let rr = RoundRobin::new(pool);
 
@@ -121,6 +125,7 @@ mod tests {
             vec![],
             3,
             Duration::from_secs(10),
+            KeepaliveConfig::default(),
         ));
         let rr = RoundRobin::new(pool);
         assert!(rr.next_backend().is_none());
@@ -138,6 +143,7 @@ mod tests {
             addrs.clone(),
             3,
             Duration::from_secs(10),
+            KeepaliveConfig::default(),
         ));
         let rr = RoundRobin::new(pool);
 
@@ -165,6 +171,7 @@ mod tests {
             addrs.clone(),
             3,
             Duration::from_secs(10),
+            KeepaliveConfig::default(),
         ));
         let rr = Arc::new(RoundRobin::new(pool));
         let total_per_thread = 5000;
@@ -214,6 +221,7 @@ mod tests {
             addrs.clone(),
             1,
             Duration::from_secs(60),
+            KeepaliveConfig::default(),
         ));
         let rr = RoundRobin::new(Arc::clone(&pool));
 
@@ -226,5 +234,42 @@ mod tests {
             let next = rr.next_backend().unwrap();
             assert_ne!(next, addrs[0], "should not select open-circuit backend");
         }
+    }
+
+    #[test]
+    fn does_not_skip_saturated_backend() {
+        // saturation is enforced at checkout (KeepaliveCache::checkout), not at RR selection
+        use crate::config::KeepaliveConfig;
+        use std::sync::atomic::Ordering;
+
+        let addr: std::net::SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let cfg = KeepaliveConfig {
+            max_idle: 1,
+            idle_conn_ttl_secs: 60,
+            max_total: 1,
+        };
+        let pool = Arc::new(BackendPool::new(
+            "test".into(),
+            vec![addr],
+            3,
+            Duration::from_secs(60),
+            cfg,
+        ));
+        let rr = RoundRobin::new(Arc::clone(&pool));
+
+        // set total_count = max_total → backend is saturated
+        pool.get(0).total_count.0.store(1, Ordering::Relaxed);
+        assert!(
+            pool.get(0).is_saturated(),
+            "precondition: backend saturated"
+        );
+
+        // RR must still return it (saturation is a checkout-level concern, not RR-level)
+        let selected = rr.next_backend();
+        assert!(
+            selected.is_some(),
+            "RR must select saturated backend with closed circuit"
+        );
+        assert_eq!(selected.unwrap(), addr);
     }
 }
