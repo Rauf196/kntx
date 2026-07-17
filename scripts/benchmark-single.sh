@@ -132,7 +132,7 @@ commands:
   ./scripts/benchmark-single.sh $DURATION
 EOF
 
-echo "note: kntx log level set to 'warn' — you may see teardown warnings at the end of each test"
+echo "note: kntx log level set to 'warn' - you may see teardown warnings at the end of each test"
 echo ""
 
 echo "--- throughput (single stream, ${DURATION}s) ---"

@@ -174,7 +174,7 @@ impl DyingServer {
     }
 }
 
-/// accepts connections then makes no progress — never reads, never writes,
+/// accepts connections then makes no progress - never reads, never writes,
 /// holds the socket open at the TCP layer until dropped. The proxy sees a
 /// live backend that stalls forever: a small request-head write succeeds
 /// (kernel buffer absorbs it) but a large body write eventually blocks

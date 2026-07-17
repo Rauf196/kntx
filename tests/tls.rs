@@ -81,7 +81,7 @@ fn test_pool(addrs: &[SocketAddr]) -> Arc<BackendPool> {
 }
 
 /// build a TlsAcceptor from a test cert, writing PEM files to a TempDir.
-/// caller must hold the returned TempDir — files are read by build_acceptor eagerly,
+/// caller must hold the returned TempDir - files are read by build_acceptor eagerly,
 /// so the dir can be dropped after setup if preferred, but we return it for clarity.
 fn make_tls_acceptor(tc: &TestCert) -> (tokio_rustls::TlsAcceptor, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -104,7 +104,7 @@ fn make_tls_acceptor(tc: &TestCert) -> (tokio_rustls::TlsAcceptor, tempfile::Tem
 }
 
 /// start a proxy with TLS using the given test cert and default userspace strategy.
-/// returns (proxy_addr, tempdir, shutdown_tx) — caller must hold the TempDir to
+/// returns (proxy_addr, tempdir, shutdown_tx) - caller must hold the TempDir to
 /// keep cert files alive AND hold the Sender to keep the listener alive.
 async fn start_tls_proxy(
     backend_addrs: &[SocketAddr],
@@ -166,7 +166,7 @@ async fn tls_echo_basic() {
     assert_eq!(&buf[..n], b"hello kntx");
 }
 
-// (5.6 extended) 50 concurrent TLS clients — each echoes independently.
+// (5.6 extended) 50 concurrent TLS clients - each echoes independently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tls_concurrent_connections() {
     let backend = EchoServer::start().await;
@@ -195,7 +195,7 @@ async fn tls_concurrent_connections() {
     }
 }
 
-// 256 KB through TLS — byte-for-byte integrity.
+// 256 KB through TLS - byte-for-byte integrity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_large_payload() {
     let backend = EchoServer::start().await;
@@ -214,7 +214,7 @@ async fn tls_large_payload() {
     assert_eq!(received, payload, "256KB payload integrity check failed");
 }
 
-// client opens TCP but never sends ClientHello — proxy drops after handshake timeout.
+// client opens TCP but never sends ClientHello - proxy drops after handshake timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_handshake_timeout() {
     let backend = EchoServer::start().await;
@@ -251,7 +251,7 @@ async fn tls_handshake_timeout() {
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
-    // connect TCP but send no ClientHello — just idle
+    // connect TCP but send no ClientHello - just idle
     let mut idle = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
 
     // proxy should close the connection after ~1s timeout
@@ -261,10 +261,10 @@ async fn tls_handshake_timeout() {
         .expect("timed out waiting for proxy to close connection")
         .expect("read error");
     // n=0 means the proxy closed the connection (EOF after handshake timeout)
-    // (it may have sent a TLS alert first — both indicate the handshake was aborted)
+    // (it may have sent a TLS alert first - both indicate the handshake was aborted)
 }
 
-// with no [tls] section, plain TCP still works — regression test.
+// with no [tls] section, plain TCP still works - regression test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_plain_regression() {
     use tokio::net::TcpStream;
@@ -288,7 +288,7 @@ async fn tls_plain_regression() {
     assert_eq!(&buf[..n], b"plain tcp works");
 }
 
-// strategy = "splice" + TLS enabled — traffic flows via userspace fallback.
+// strategy = "splice" + TLS enabled - traffic flows via userspace fallback.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_splice_strategy_fallback() {
@@ -335,7 +335,7 @@ async fn tls_splice_strategy_fallback() {
     assert_eq!(&buf[..n], b"splice fallback");
 }
 
-// (5.4) two certs with different SANs — client connecting with a.test gets cert A,
+// (5.4) two certs with different SANs - client connecting with a.test gets cert A,
 // b.test gets cert B. verified by inspecting the peer cert on the client side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_sni_multi_cert() {
@@ -377,7 +377,7 @@ async fn tls_sni_multi_cert() {
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
 
-    // client_a trusts only cert_a — connecting with SNI "a.test" must succeed
+    // client_a trusts only cert_a - connecting with SNI "a.test" must succeed
     let client_a = client_config_trusting(&tc_a.cert_der);
     let mut stream_a = tls_connect(proxy_addr, "a.test", client_a).await;
     stream_a.write_all(b"hello a").await.unwrap();
@@ -385,7 +385,7 @@ async fn tls_sni_multi_cert() {
     let n = stream_a.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"hello a");
 
-    // client_b trusts only cert_b — connecting with SNI "b.test" must succeed
+    // client_b trusts only cert_b - connecting with SNI "b.test" must succeed
     let client_b = client_config_trusting(&tc_b.cert_der);
     let mut stream_b = tls_connect(proxy_addr, "b.test", client_b).await;
     stream_b.write_all(b"hello b").await.unwrap();
@@ -393,7 +393,7 @@ async fn tls_sni_multi_cert() {
     assert_eq!(&buf[..n], b"hello b");
 
     // cross-trust should fail: client_a trusts cert_a only, connecting with "b.test"
-    // will receive cert_b — which client_a doesn't trust
+    // will receive cert_b - which client_a doesn't trust
     let cross_client = client_config_trusting(&tc_a.cert_der);
     let tcp = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
     use rustls::pki_types::ServerName;
@@ -414,7 +414,7 @@ async fn tls_handshake_failure_garbage_input() {
     let tc = generate_cert(&["localhost"]);
     let (proxy_addr, _dir, _shutdown) = start_tls_proxy(&[backend.addr], &tc).await;
 
-    // connect and immediately send garbage — not a TLS ClientHello
+    // connect and immediately send garbage - not a TLS ClientHello
     let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
     stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
 
@@ -425,7 +425,7 @@ async fn tls_handshake_failure_garbage_input() {
         .expect("timed out waiting for proxy to close connection")
         .unwrap_or(0);
 
-    // EOF (n=0) or TLS alert bytes — either way the handshake was rejected
+    // EOF (n=0) or TLS alert bytes - either way the handshake was rejected
     // the key assertion is that the proxy didn't hang or panic
     let _ = n;
 }
@@ -443,7 +443,7 @@ async fn tls_half_close() {
     let mut stream = tls_connect(proxy_addr, "localhost", client_cfg).await;
 
     stream.write_all(b"data before close").await.unwrap();
-    // shutdown sends TLS close_notify + FIN — proxy must propagate this to the backend
+    // shutdown sends TLS close_notify + FIN - proxy must propagate this to the backend
     stream.shutdown().await.unwrap();
 
     let mut buf = Vec::new();
@@ -485,11 +485,11 @@ async fn tls_idle_timeout() {
     let n = stream.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"ping");
 
-    // go idle — wait for the proxy to close the connection
+    // go idle - wait for the proxy to close the connection
     tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
         .await
         .expect("proxy did not close idle TLS connection within 3s")
-        .ok(); // EOF or error — both indicate the proxy closed its end
+        .ok(); // EOF or error - both indicate the proxy closed its end
 }
 
 // in-flight TLS connection survives a shutdown signal and completes before drain expires.
@@ -523,7 +523,7 @@ async fn tls_graceful_shutdown() {
     let n = stream.read(&mut buf).await.unwrap();
     assert_eq!(&buf[..n], b"before shutdown");
 
-    // trigger shutdown — in-flight connection must still work
+    // trigger shutdown - in-flight connection must still work
     let _ = shutdown_tx.send(());
 
     stream.write_all(b"after signal").await.unwrap();
@@ -540,7 +540,7 @@ async fn tls_graceful_shutdown() {
 }
 
 // backend drops the connection mid-transfer.
-// client should receive whatever data arrived before the crash, then get clean EOF — no hang.
+// client should receive whatever data arrived before the crash, then get clean EOF - no hang.
 // verifies error propagation through the TLS write half.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_backend_dies_mid_transfer() {
@@ -553,7 +553,7 @@ async fn tls_backend_dies_mid_transfer() {
 
     stream.write_all(b"trigger").await.unwrap();
 
-    // read everything — we expect "partial" followed by EOF
+    // read everything - we expect "partial" followed by EOF
     let mut received = Vec::new();
     tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut received))
         .await

@@ -1,3 +1,5 @@
+pub mod passthrough;
+
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,7 +38,7 @@ pub enum TlsError {
 }
 
 pub fn build_acceptor(config: &TlsConfig) -> Result<TlsAcceptor, TlsError> {
-    // install ring as the crypto provider. idempotent — ok if already installed.
+    // install ring as the crypto provider. idempotent - ok if already installed.
     rustls::crypto::ring::default_provider()
         .install_default()
         .unwrap_or(());
@@ -72,7 +74,7 @@ pub fn build_acceptor(config: &TlsConfig) -> Result<TlsAcceptor, TlsError> {
             );
 
             for name in &cert_cfg.sni_names {
-                // CertifiedKey wraps Arc<dyn SigningKey> — cheap to clone per name
+                // CertifiedKey wraps Arc<dyn SigningKey> - cheap to clone per name
                 let certified = CertifiedKey::new(certs.clone(), Arc::clone(&signing_key));
                 resolver
                     .add(name, certified)

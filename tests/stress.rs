@@ -127,7 +127,7 @@ async fn pool_exhaustion_degrades_gracefully() {
         streams.push(TcpStream::connect(proxy_addr).await.unwrap());
     }
 
-    // try to use each — some will succeed, some will get EOF (pool exhausted)
+    // try to use each - some will succeed, some will get EOF (pool exhausted)
     let mut success = 0;
     let mut rejected = 0;
     for stream in &mut streams {
@@ -149,7 +149,7 @@ async fn pool_exhaustion_degrades_gracefully() {
     drop(streams);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // verify proxy recovered — new connection should work
+    // verify proxy recovered - new connection should work
     let mut recovery = TcpStream::connect(proxy_addr).await.unwrap();
     recovery.write_all(b"recovered").await.unwrap();
     let mut buf = [0u8; 64];
@@ -254,7 +254,7 @@ async fn multi_backend_concurrent_load() {
 }
 
 // 20 concurrent connections each send a 256KB payload.
-// exercises multi-buffer-cycle under concurrency — verifies no data corruption
+// exercises multi-buffer-cycle under concurrency - verifies no data corruption
 // when pool buffers are shared across many simultaneous connections.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_concurrent_payload() {

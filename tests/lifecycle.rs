@@ -226,6 +226,64 @@ async fn graceful_shutdown_drains_connections() {
         .expect("serve task panicked");
 }
 
+/// found during manual testing: the listening socket stayed open through the
+/// drain phase, so the kernel kept completing handshakes into a backlog
+/// nobody accepted and clients hung instead of being refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_connections_refused_during_drain() {
+    let backend = EchoServer::start().await;
+
+    let pool = test_pool(&[backend.addr]);
+    let rr = Arc::new(RoundRobin::new(pool.clone()));
+    let router = make_single_pool_router(pool, rr);
+    let config = test_serve_config(ForwardingStrategy::Userspace);
+
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tcp_listener.local_addr().unwrap();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    let serve_handle = tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
+
+    // in-flight connection keeps the drain phase alive
+    let mut held = TcpStream::connect(proxy_addr).await.unwrap();
+    held.write_all(b"hold").await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = held.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"hold");
+
+    let _ = shutdown_tx.send(());
+
+    // new connects must be refused promptly - not parked in a dead backlog.
+    // a connect may race the socket drop and land in leftover backlog, so
+    // retry until refusal; a hang or persistent success is the bug.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(proxy_addr)).await
+        {
+            Ok(Err(_)) => break,
+            Ok(Ok(_)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "connects still succeeding during drain - listener not closed"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(_) => panic!("connect hung during drain - listener backlog still open"),
+        }
+    }
+
+    // the held connection is unaffected mid-drain
+    held.write_all(b"still here").await.unwrap();
+    let n = held.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"still here");
+
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), serve_handle)
+        .await
+        .expect("serve did not complete within timeout")
+        .expect("serve task panicked");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backend_unreachable_clean_close() {
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();

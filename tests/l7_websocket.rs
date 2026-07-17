@@ -1,5 +1,5 @@
 //! Integration tests for L7 WebSocket upgrade detection and L1 tunnel
-//! forwarding. Tunnels are opaque byte pipes after the 101 — these tests
+//! forwarding. Tunnels are opaque byte pipes after the 101 - these tests
 //! verify the handshake gating, the bidirectional copy, the close-time
 //! access log emission, and the buffer-pool exhaustion contract.
 
@@ -83,6 +83,7 @@ async fn start_proxy(backend_addr: SocketAddr, opts: ProxyOpts) -> Proxy {
         proxy_read_timeout_secs: None,
         request_timeout_secs: None,
         max_body_size_bytes: None,
+        clienthello_timeout_secs: 10,
     });
 
     let buffer_pool = Arc::new(opts.buffer_pool.unwrap_or_else(BufferPool::with_defaults));
@@ -210,7 +211,7 @@ async fn websocket_echo_tunnel() {
         "Connection: Upgrade missing or not preserved: {head_str:?}"
     );
 
-    // payload after the handshake — opaque bytes, echoed by backend.
+    // payload after the handshake - opaque bytes, echoed by backend.
     let payload = b"this-is-not-a-real-ws-frame-just-bytes";
     client.write_all(payload).await.unwrap();
 
@@ -270,7 +271,7 @@ async fn websocket_backend_rejects_upgrade() {
         status, 200,
         "non-101 from backend should pass through; got {status}"
     );
-    // Status came from backend, not synthesized — body should follow.
+    // Status came from backend, not synthesized - body should follow.
     drop(proxy);
 }
 
@@ -393,7 +394,7 @@ async fn websocket_idle_timeout_closes_tunnel() {
     let head_end = read_until_double_crlf(&mut client, &mut buf).await;
     assert_eq!(parse_status(&buf[..head_end]), 101);
 
-    // tunnel up. Stay silent — neither side writes. After ~1s the proxy's
+    // tunnel up. Stay silent - neither side writes. After ~1s the proxy's
     // idle watchdog must close the tunnel; the client's next read sees EOF.
     let start = std::time::Instant::now();
     let mut trash = [0u8; 16];
@@ -430,7 +431,7 @@ async fn websocket_graceful_shutdown_closes_tunnel() {
     client.read_exact(&mut echo).await.unwrap();
     assert_eq!(&echo, b"ping");
 
-    // signal shutdown — tunnel must close at the proxy
+    // signal shutdown - tunnel must close at the proxy
     proxy.shutdown_tx.send(()).unwrap();
 
     let mut trash = [0u8; 16];
@@ -500,7 +501,7 @@ async fn websocket_access_log_at_close() {
     let mut echo = vec![0u8; payload.len()];
     client.read_exact(&mut echo).await.unwrap();
 
-    // client closes — backend reads EOF and closes too, tunnel exits, log fires
+    // client closes - backend reads EOF and closes too, tunnel exits, log fires
     let _ = client.shutdown().await;
     drop(client);
 
@@ -602,7 +603,7 @@ fn metric_value(rendered: &str, name: &str, label: (&str, &str)) -> Option<f64> 
 /// `kntx_websocket_tunnels_active` rises to 1 once the 101 has been
 /// relayed and falls back to 0 when the tunnel exits. The total counter
 /// records the opened tunnel exactly once. The gauge sample is taken
-/// while traffic is flowing through the tunnel — racing the open/close
+/// while traffic is flowing through the tunnel - racing the open/close
 /// would let a buggy implementation pass without observing the live
 /// gauge value.
 #[tokio::test]

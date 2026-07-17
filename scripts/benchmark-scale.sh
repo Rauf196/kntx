@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # kntx multi-stream scaling benchmark
-# multi-stream scaling — how throughput changes with concurrent connections
+# multi-stream scaling - how throughput changes with concurrent connections
 #
 # requires: iperf3, cargo, jq
 # optional: nginx with stream module (nginx-mainline + nginx-mainline-mod-stream on arch)
@@ -147,8 +147,8 @@ commands:
   ./scripts/benchmark-scale.sh $DURATION
 EOF
 
-echo "note: default pools — buffer: 1024 (userspace: 2/conn, vectored: 8/conn), pipe: 512 (splice: 2/conn)"
-echo "note: kntx log level set to 'error' — expected teardown warnings at high P are suppressed"
+echo "note: default pools - buffer: 1024 (userspace: 2/conn, vectored: 8/conn), pipe: 512 (splice: 2/conn)"
+echo "note: kntx log level set to 'error' - expected teardown warnings at high P are suppressed"
 echo ""
 
 # --- direct baseline ---

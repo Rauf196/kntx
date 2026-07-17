@@ -66,7 +66,7 @@ impl BackendState {
 
     /// check if this backend can accept traffic.
     /// for Open circuits past recovery timeout, attempts CAS to HalfOpen.
-    /// only one caller wins the CAS — that connection is the probe.
+    /// only one caller wins the CAS - that connection is the probe.
     pub fn is_available(&self, recovery_timeout: Duration) -> bool {
         match self.circuit_state() {
             CircuitState::Closed => true,
@@ -91,7 +91,7 @@ impl BackendState {
     }
 
     /// true when total active+idle conns to this backend has reached max_total.
-    /// observability query only — NOT consulted by RoundRobin (saturation is enforced at checkout).
+    /// observability query only - NOT consulted by RoundRobin (saturation is enforced at checkout).
     pub fn is_saturated(&self) -> bool {
         match self.keepalive.max_total {
             None => false,

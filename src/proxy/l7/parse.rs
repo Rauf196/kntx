@@ -28,7 +28,7 @@ impl ParsedHeader {
     }
 }
 
-/// parsed HTTP request (owned data — avoids lifetime coupling to the read buffer).
+/// parsed HTTP request (owned data - avoids lifetime coupling to the read buffer).
 #[derive(Debug)]
 pub struct Request {
     pub method: String,

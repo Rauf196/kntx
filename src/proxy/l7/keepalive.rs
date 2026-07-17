@@ -15,7 +15,7 @@ use crate::util::CacheLinePadded;
 
 #[derive(Debug)]
 pub enum CheckoutError {
-    /// Semaphore closed mid-acquire (defensive — never closed in practice).
+    /// Semaphore closed mid-acquire (defensive - never closed in practice).
     Saturated,
     ConnectFailed(std::io::Error),
     ConnectTimeout,
@@ -32,8 +32,8 @@ enum ProbeResult {
 fn probe(stream: &TcpStream) -> ProbeResult {
     let mut buf = [0u8; 1];
     match stream.try_read(&mut buf) {
-        Ok(0) => ProbeResult::Dead, // EOF — backend FIN
-        Ok(_) => ProbeResult::Dead, // unexpected data — broken pipeline
+        Ok(0) => ProbeResult::Dead, // EOF - backend FIN
+        Ok(_) => ProbeResult::Dead, // unexpected data - broken pipeline
         Err(e) if e.kind() == ErrorKind::WouldBlock => ProbeResult::Healthy,
         Err(_) => ProbeResult::Dead,
     }
@@ -52,7 +52,7 @@ pub struct KeepaliveCache {
     pub(crate) max_total: Option<NonZeroUsize>,
     // when `max_total` is set, this semaphore caps the number of *active*
     // (in-flight) conns to a single backend. Idle conns sitting in the cache
-    // do NOT hold permits — they are existing TCP sockets, not in-flight work.
+    // do NOT hold permits - they are existing TCP sockets, not in-flight work.
     // Every checkout (cache hit OR fresh connect) acquires a permit and holds
     // it until the conn is returned or discarded. nginx's `keepalive`
     // directive applies the same semantic.
@@ -116,7 +116,7 @@ impl KeepaliveCache {
             let Some(idle) = q.pop() else { break };
             if idle.last_used.elapsed() > ttl {
                 // dropping `idle` also releases its permit (if any) back to
-                // the cache semaphore — capacity is recovered automatically.
+                // the cache semaphore - capacity is recovered automatically.
                 drop(idle);
                 dropped += 1;
             } else {
@@ -258,11 +258,11 @@ impl KeepaliveConn {
 impl Drop for KeepaliveConn {
     fn drop(&mut self) {
         if self.stream.is_some() {
-            // fell through without explicit handling — decrement the counter.
+            // fell through without explicit handling - decrement the counter.
             // stream's own Drop closes the fd.
             self.state.total_count.0.fetch_sub(1, Ordering::Release);
         }
-        // Arc<BackendState> drops normally — refcount correct in every path.
+        // Arc<BackendState> drops normally - refcount correct in every path.
     }
 }
 
@@ -271,13 +271,13 @@ impl KeepaliveCache {
     ///
     /// Phase 1: drain cache (probe for liveness, skip stale). If healthy idle found, return it.
     /// Phase 2: fresh-connect with optimistic increment + saturation gate.
-    /// saturation is checked ONLY on the fresh-connect path — never before cache pop.
+    /// saturation is checked ONLY on the fresh-connect path - never before cache pop.
     pub async fn checkout(
         state: &Arc<BackendState>,
         addr: std::net::SocketAddr,
         connect_timeout: Duration,
     ) -> Result<KeepaliveConn, CheckoutError> {
-        // Permit gate — acquire ONE active slot before either popping from
+        // Permit gate - acquire ONE active slot before either popping from
         // cache or opening a fresh conn. nginx-style queueing: idle conns
         // sitting in cache do not consume a permit; only active in-flight
         // requests do. acquire_owned awaits if max_total is reached; the
@@ -291,7 +291,7 @@ impl KeepaliveCache {
             None
         };
 
-        // Phase 1 — cache drain. Probe + stale check; healthy hit transfers
+        // Phase 1 - cache drain. Probe + stale check; healthy hit transfers
         // the existing conn out of the queue. The permit acquired above
         // covers the active-state slot for the lifetime of this checkout.
         if let Some(q) = &state.keepalive.queue {
@@ -352,7 +352,7 @@ impl KeepaliveCache {
             }
         }
 
-        // Phase 2 — cache empty (or all entries stale/dead). Connect fresh
+        // Phase 2 - cache empty (or all entries stale/dead). Connect fresh
         // under the permit we already hold.
         state.total_count.0.fetch_add(1, Ordering::AcqRel);
 
@@ -453,7 +453,7 @@ pub struct KeepaliveSweeper {
 }
 
 impl KeepaliveSweeper {
-    /// returns `None` when keepalive is disabled for this pool (max_idle = 0) —
+    /// returns `None` when keepalive is disabled for this pool (max_idle = 0) -
     /// no caches to sweep, nothing worth spawning a task for.
     pub fn new(pool: Arc<BackendPool>) -> Option<Self> {
         let cfg = pool.keepalive_cfg();
@@ -470,7 +470,7 @@ impl KeepaliveSweeper {
             let pool_name = self.pool.name().to_string();
             let mut ticker = tokio::time::interval(self.interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // first tick fires immediately; skip — nothing to sweep at startup
+            // first tick fires immediately; skip - nothing to sweep at startup
             ticker.tick().await;
 
             loop {
@@ -519,7 +519,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let stream = TcpStream::connect(addr).await.unwrap();
-            // nothing written — should be WouldBlock
+            // nothing written - should be WouldBlock
             assert_eq!(probe(&stream), ProbeResult::Healthy);
         });
     }
@@ -548,7 +548,7 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let client = TcpStream::connect(addr).await.unwrap();
             let (server, _) = listener.accept().await.unwrap();
-            // server writes one byte — unexpected data is treated as Dead
+            // server writes one byte - unexpected data is treated as Dead
             server.writable().await.unwrap();
             server.try_write(b"x").unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -632,7 +632,7 @@ mod tests {
             )
             .await;
 
-            // checkout never resolved within 200ms — it is waiting on the
+            // checkout never resolved within 200ms - it is waiting on the
             // permit semaphore, not returning Saturated.
             assert!(timed.is_err(), "checkout returned instead of waiting");
             assert!(
@@ -700,7 +700,7 @@ mod tests {
             let conn = KeepaliveConn::fresh(stream, Arc::clone(&state), None);
             KeepaliveCache::return_to_cache(conn);
 
-            // counter unchanged — conn is now idle in queue
+            // counter unchanged - conn is now idle in queue
             assert_eq!(state.total_count.0.load(Ordering::SeqCst), 1);
             // queue has one idle
             assert_eq!(state.keepalive.queue.as_ref().unwrap().len(), 1);
@@ -731,7 +731,7 @@ mod tests {
             state.keepalive.push(idle).unwrap();
             state.total_count.0.store(2, Ordering::SeqCst); // 1 idle + 1 active
 
-            // try to return the active conn — queue full, must drop + decrement
+            // try to return the active conn - queue full, must drop + decrement
             let s2 = TcpStream::connect(addr).await.unwrap();
             let _ss2 = listener.accept().await.unwrap();
             let conn = KeepaliveConn::fresh(s2, Arc::clone(&state), None);

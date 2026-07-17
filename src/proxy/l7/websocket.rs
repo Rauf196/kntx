@@ -36,7 +36,7 @@ impl TunnelOutcome {
     }
 }
 
-/// RFC 6455 §4.1 / §11.3 — the proxy treats a request as a WebSocket upgrade
+/// RFC 6455 §4.1 / §11.3 - the proxy treats a request as a WebSocket upgrade
 /// only when every required handshake input is present and well-formed.
 ///
 /// Returns:
@@ -54,7 +54,7 @@ pub fn is_websocket_upgrade(req: &Request) -> WsDetect {
     let connection = header_value(&req.headers, "connection");
 
     // Anchor: `Upgrade: websocket` token. Without it, this request is not a
-    // WebSocket attempt at all — any other upgrade (h2c, etc.) routes to the
+    // WebSocket attempt at all - any other upgrade (h2c, etc.) routes to the
     // generic 405 path in `forward.rs`, not this module.
     let has_ws_upgrade = upgrade
         .as_deref()
@@ -124,7 +124,7 @@ fn is_valid_sec_ws_key(s: &str) -> bool {
 /// both directions (populated even on partial transfer) and the
 /// `TunnelOutcome` that ended the loop. First-to-finish wins: when one half
 /// completes the other is dropped at its next await, which is acceptable at
-/// L1 — WebSocket close handshakes are symmetric in practice and an
+/// L1 - WebSocket close handshakes are symmetric in practice and an
 /// in-flight write at the moment of cancellation is bounded by one frame.
 #[allow(clippy::too_many_arguments)]
 pub async fn bidirectional_copy_with_timeout<RC, WC, RB, WB>(
@@ -167,7 +167,7 @@ where
 
     // on a shutdown signal the tunnel waits `drain_timeout` before tearing down,
     // letting in-flight traffic flush. peer-close, idle timeout, or peer error
-    // can still resolve the select sooner — the drain branch is a ceiling, not
+    // can still resolve the select sooner - the drain branch is a ceiling, not
     // a floor. matches the listener's drain_timeout for plain HTTP connections.
     let shutdown_then_drain = async {
         let _ = shutdown_rx.changed().await;
@@ -241,7 +241,7 @@ mod tests {
         }
     }
 
-    // RFC 6455 §1.2 example handshake — the canonical valid input.
+    // RFC 6455 §1.2 example handshake - the canonical valid input.
     const VALID_HANDSHAKE: &[u8] = b"\
 GET /chat HTTP/1.1\r\n\
 Host: example.com\r\n\

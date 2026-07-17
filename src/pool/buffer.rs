@@ -56,7 +56,7 @@ impl BufferPool {
     /// available; the first pop, if it succeeded, is released back via its
     /// RAII guard before returning. The atomicity matters at call sites that
     /// would otherwise leak the first buffer on error between two `get`
-    /// calls — the WebSocket tunnel checks out a pair before the 101 is on
+    /// calls - the WebSocket tunnel checks out a pair before the 101 is on
     /// the wire and treats any partial result as exhaustion.
     pub fn try_checkout_pair(&self) -> Option<(BufferGuard, BufferGuard)> {
         let first = self.get()?;

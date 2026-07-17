@@ -127,9 +127,9 @@ impl AccessLogSink {
     /// Emit a line without yielding to the runtime. The existing `emit`
     /// implementation is already non-awaiting (stdio writes are blocking,
     /// the file sink uses `try_send`); this name exists so callers that
-    /// require the no-await guarantee — chiefly the WebSocket tunnel close
+    /// require the no-await guarantee - chiefly the WebSocket tunnel close
     /// path, which must land its log line before any further await that
-    /// could be cancelled by JoinSet drop at shutdown — surface that
+    /// could be cancelled by JoinSet drop at shutdown - surface that
     /// invariant at the call site.
     pub fn emit_sync(&self, line: AccessLogLine) {
         self.emit(line);
@@ -261,12 +261,12 @@ mod tests {
 
     #[tokio::test]
     async fn file_sink_drops_when_channel_full() {
-        // channel capacity 1 — second send should trigger drop counter
+        // channel capacity 1 - second send should trigger drop counter
         let dropped = std::sync::Arc::new(AtomicU64::new(0));
         let (tx, mut rx) = mpsc::channel::<AccessLogLine>(1);
         let sink = AccessLogSink::File(tx);
 
-        // consume one to open a slot, then send 100 fast — most will be dropped
+        // consume one to open a slot, then send 100 fast - most will be dropped
         // but we need a receiver or the channel will appear closed
         let _handle = tokio::spawn(async move {
             // drain slowly

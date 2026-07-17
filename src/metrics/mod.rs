@@ -4,10 +4,10 @@ use metrics::{describe_counter, describe_gauge, describe_histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 
 pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    // recorder must be installed before describe_* — otherwise descriptions go to the
+    // recorder must be installed before describe_* - otherwise descriptions go to the
     // noop recorder and never reach /metrics as # HELP / # TYPE lines.
     PrometheusBuilder::new()
-        // proxy-scale latency buckets: 50µs–30s, denser in the 100µs–100ms range
+        // proxy-scale latency buckets: 50µs-30s, denser in the 100µs-100ms range
         .set_buckets_for_metric(
             Matcher::Full("kntx_http_request_duration_seconds".into()),
             &[
@@ -117,6 +117,18 @@ pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         "kntx_route_no_match_total",
         "Requests that did not match any configured route."
     );
+    describe_counter!(
+        "kntx_tls_passthrough_connections_total",
+        "TLS passthrough connections successfully routed (labels: listener, route_id)."
+    );
+    describe_counter!(
+        "kntx_tls_passthrough_no_sni_total",
+        "TLS passthrough ClientHellos without an SNI extension (labels: listener)."
+    );
+    describe_counter!(
+        "kntx_tls_passthrough_rejects_total",
+        "TLS passthrough connections rejected before routing (labels: listener, reason=not_tls|too_large|multi_record|malformed|eof|buffer_full|io|timeout|buffer_exhausted)."
+    );
 
     describe_counter!(
         "kntx_backend_pool_checkouts_total",
@@ -140,7 +152,7 @@ pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     );
     describe_counter!(
         "kntx_http_retry_attempts_total",
-        "Broken-keepalive retries — popped cache conn failed first write; request retried on a fresh conn (labels: listener, pool)."
+        "Broken-keepalive retries - popped cache conn failed first write; request retried on a fresh conn (labels: listener, pool)."
     );
     describe_histogram!(
         "kntx_http_keepalive_requests",

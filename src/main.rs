@@ -174,7 +174,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "resource pools initialized",
     );
 
-    // build shared L7 resources — both are read-only after construction
+    // build shared L7 resources - both are read-only after construction
     let error_pages = Arc::new(ErrorPages::load(&config.error_pages)?);
     let access_log = Arc::new(AccessLogSink::from_config(&config.access_log)?);
 
@@ -209,7 +209,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // pre-bind every listener and build TLS acceptors. fail fast on bind / cert errors
-    // BEFORE spawning any background task — avoids transient checkers / metrics noise on startup failure.
+    // BEFORE spawning any background task - avoids transient checkers / metrics noise on startup failure.
     let mut prepared: Vec<(
         usize,
         tokio::net::TcpListener,
@@ -225,7 +225,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         prepared.push((idx, tcp, tls_acceptor));
     }
 
-    // all listeners bound — now spawn health checkers
+    // all listeners bound - now spawn health checkers
     let mut health_handles = Vec::new();
     for pool_cfg in &config.pools {
         let health = pool_cfg.effective_health(&config.health);
@@ -234,7 +234,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let checker = HealthChecker::new(
                 Arc::clone(pool),
                 Duration::from_secs(interval_secs),
-                // connect_timeout for health probes: 5s default (D7 — per-pool tuning deferred)
+                // connect_timeout for health probes: 5s default (D7 - per-pool tuning deferred)
                 Duration::from_secs(5),
             );
             let handle = checker.spawn(shutdown_rx.clone());
@@ -244,7 +244,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // spawn one keepalive sweeper per pool that has backend keepalive enabled.
-    // Pools with max_idle = 0 get no sweeper — KeepaliveSweeper::new returns None.
+    // Pools with max_idle = 0 get no sweeper - KeepaliveSweeper::new returns None.
     let mut sweeper_handles = Vec::new();
     for pool_cfg in &config.pools {
         let (pool, _) = pool_map.get(&pool_cfg.name).unwrap();

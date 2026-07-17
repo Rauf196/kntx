@@ -79,7 +79,7 @@ fn call_budget(phase: Duration, deadline: Instant) -> Duration {
     phase.min(deadline.saturating_duration_since(Instant::now()))
 }
 
-/// Which post-route phase tripped — drives the emitted status code. The
+/// Which post-route phase tripped - drives the emitted status code. The
 /// header phase is handled inline before routing (no route context yet) and
 /// is not represented here.
 #[derive(Clone, Copy, PartialEq)]
@@ -118,7 +118,7 @@ fn timeout_status(
 
 /// shared tail for every post-route timeout: synthesize a status response when
 /// one is still possible, then emit exactly one access-log line + request
-/// metrics. backend conn discard is implicit on this error path — the caller
+/// metrics. backend conn discard is implicit on this error path - the caller
 /// returns and `KeepaliveConn`'s Drop decrements total_count.
 #[allow(clippy::too_many_arguments)]
 async fn emit_timeout<W>(
@@ -177,7 +177,7 @@ async fn emit_timeout<W>(
 
 /// Outcome of one request/response cycle, consumed by the keep-alive loop.
 enum CycleOutcome {
-    /// Client closed (or errored) before sending any request bytes — clean
+    /// Client closed (or errored) before sending any request bytes - clean
     /// end, no access-log line, does not count toward the keep-alive
     /// request-per-connection histogram.
     NoRequest,
@@ -219,7 +219,7 @@ pub async fn forward_l7(
 ) -> Result<(), L7Error> {
     let is_tls = client.is_tls();
     match client {
-        // Plain TCP: into_split yields lock-free owned halves — no BiLock
+        // Plain TCP: into_split yields lock-free owned halves - no BiLock
         // on the L7 read/write hot path.
         ClientStream::Plain(tcp) => {
             let (rd, wr) = tcp.into_split();
@@ -267,7 +267,7 @@ pub async fn forward_l7(
 /// Keep-alive request loop over one client connection.
 ///
 /// The client stream is split exactly once in `forward_l7` and the halves
-/// are threaded in — never re-split per request. Plain TCP uses
+/// are threaded in - never re-split per request. Plain TCP uses
 /// `TcpStream::into_split` (lock-free owned halves); TLS uses
 /// `tokio::io::split` (BiLock, required because read/write share handshake
 /// state). The body buffer is acquired once per connection and reused
@@ -323,7 +323,7 @@ where
     let mut keepalive_index: u32 = 0;
 
     loop {
-        // between-request idle wait — skipped on the first request.
+        // between-request idle wait - skipped on the first request.
         if keepalive_index > 0 {
             tokio::select! {
                 peek = client_rd.fill_buf() => {
@@ -341,7 +341,7 @@ where
         // The close decision is computed up front from inputs known at the
         // start of the cycle. `shutdown_signalled` is read here, before the
         // cycle begins, so the response `Connection` header is accurate even
-        // if a shutdown fires mid-response — the client always sees a
+        // if a shutdown fires mid-response - the client always sees a
         // consistent close-or-keep-alive signal.
         let shutdown_signalled = shutdown.has_changed().unwrap_or(true);
 
@@ -381,7 +381,7 @@ where
         // Structural backstop on total cycle time. `forward_one_request`
         // enforces the real request deadline from the inside (so it can emit
         // a proper 504 plus access-log line); this outer wrap with a small
-        // grace only fires if an await ever escaped per-call wrapping —
+        // grace only fires if an await ever escaped per-call wrapping -
         // unreachable in practice, kept so that a stuck cycle cannot pin
         // the connection indefinitely.
         let outcome =
@@ -401,7 +401,7 @@ where
         match outcome {
             CycleOutcome::NoRequest => break,
             CycleOutcome::Done { close } => {
-                // increment AFTER the cycle — the access-log line and request
+                // increment AFTER the cycle - the access-log line and request
                 // metrics were emitted with the current index from inside
                 // `forward_one_request`. Inverting the order would yield a
                 // silent off-by-one in the logged index.
@@ -433,7 +433,7 @@ where
 /// backend keeps the conn alive) or discarded (every other path, including
 /// any error path where request body bytes were already flushed to the
 /// backend). `request_id`, the X-Forwarded-For chain, and the trace context
-/// are all recomputed here per call — values from one iteration never carry
+/// are all recomputed here per call - values from one iteration never carry
 /// over into the next on the same client connection.
 #[allow(clippy::too_many_arguments)]
 async fn forward_one_request<R, W>(
@@ -547,7 +547,7 @@ where
             return CycleOutcome::Done { close: true };
         }
         // client-side read error mid-stream: client is gone. End the conn
-        // cleanly — a vanished client on a kept-alive conn is normal traffic,
+        // cleanly - a vanished client on a kept-alive conn is normal traffic,
         // not a server error worth a log line.
         HeadReadResult::IoError => return CycleOutcome::NoRequest,
         HeadReadResult::Complete => {}
@@ -673,8 +673,8 @@ where
 
     // The client-side close decision is fixed up front (post-parse,
     // pre-forward) so the response `Connection` header is accurate even if
-    // shutdown fires mid-response. Computed here — not in `serve_l7_conn`
-    // — because it needs the parsed request; the loop above passes the raw
+    // shutdown fires mid-response. Computed here - not in `serve_l7_conn`
+    // - because it needs the parsed request; the loop above passes the raw
     // inputs (shutdown flag, index, cap) and reads `close` back via
     // `CycleOutcome::Done`.
     let req_wants_close = conn_header_has_token(&req.headers, "close");
@@ -784,7 +784,7 @@ where
     }
 
     // Classify upgrade intent. `WsDetect::No` covers both "no upgrade
-    // header" and "upgrade to something other than websocket" — the latter
+    // header" and "upgrade to something other than websocket" - the latter
     // still gets the 405 path below. WS-shaped attempts that fail validation
     // get 400, valid WS upgrades fall through and route to a pool like any
     // other request; the tunnel handoff fires after the backend response
@@ -918,7 +918,7 @@ where
     )
     .increment(1);
 
-    // build the rewritten request head once — the result is independent of which
+    // build the rewritten request head once - the result is independent of which
     // backend we land on, so we serialize before backend selection and reuse the
     // same bytes if the broken-keepalive retry below fires.
     let (skip, additions) = build_request_additions(
@@ -944,7 +944,7 @@ where
     //  - Inner: `max_retries` for backend selection (Saturated → next
     //    backend; ConnectFailed / ConnectTimeout → record_failure on the
     //    dead addr + try next, capped by the listener's `max_retries`).
-    //  - Outer: at most one retry for the broken-keepalive race — a popped
+    //  - Outer: at most one retry for the broken-keepalive race - a popped
     //    cached conn whose first write EPIPEs because the backend had
     //    already closed it. Eligibility: `reused` AND the method is
     //    idempotent AND zero body bytes have been flushed to the backend
@@ -956,10 +956,10 @@ where
     // the backend produced no observable output, so this is a TCP-level
     // race rather than a backend-app health signal. Circuit state stays
     // untouched. The same logic applies to the proxy_send timeout fallback
-    // — a stalled write to a freshly-checked-out conn is still "no output
+    // - a stalled write to a freshly-checked-out conn is still "no output
     // observed".
     //
-    // Pass-through forwarding cannot replay request body bytes — once any
+    // Pass-through forwarding cannot replay request body bytes - once any
     // body byte leaves the proxy the cycle is committed, which is why the
     // zero-body gate is required as part of the eligibility check rather
     // than treated as paranoid belt-and-suspenders.
@@ -980,7 +980,7 @@ where
                 Ok(c) => break 'checkout Ok(c),
                 Err(CheckoutError::Saturated) => {
                     // saturation is not a backend failure; the backend is
-                    // operating at capacity. Failover only — never record
+                    // operating at capacity. Failover only - never record
                     // a failure that would count toward the circuit breaker.
                     attempts += 1;
                     metrics::counter!(
@@ -1067,13 +1067,13 @@ where
                 tracing::debug!(error = %e, "failed to write request head to backend");
                 // Broken-keepalive retry eligibility (all required):
                 //   1. conn came from the cache (`reused == true`). Fresh
-                //      connects that immediately fail are not eligible —
+                //      connects that immediately fail are not eligible -
                 //      those signal that something is wrong with the
                 //      backend, not a transient TCP race.
                 //   2. method is idempotent per RFC 7231 §4.2.2.
                 //   3. zero body bytes have been flushed to the backend
-                //      yet. Structurally true here — the body has not
-                //      started — but checked explicitly so the invariant
+                //      yet. Structurally true here - the body has not
+                //      started - but checked explicitly so the invariant
                 //      is auditable.
                 let eligible = conn.reused
                     && is_idempotent_method(&method)
@@ -1082,7 +1082,7 @@ where
 
                 if eligible {
                     // explicit discard (decrements total_count; never
-                    // returns to cache). No `pool.record_failure` — this
+                    // returns to cache). No `pool.record_failure` - this
                     // is a TCP race, not a backend health signal.
                     KeepaliveCache::discard(conn);
                     retry_remaining -= 1;
@@ -1121,7 +1121,7 @@ where
             }
             Err(_) => {
                 // proxy_send timeout: stalled write, not a TCP race. Not
-                // retry-eligible — the broken-keepalive retry targets
+                // retry-eligible - the broken-keepalive retry targets
                 // immediate EPIPE on a popped cache conn, not slow
                 // backends. Still no `record_failure` either, because no
                 // backend output was observed on this attempt.
@@ -1165,7 +1165,7 @@ where
     // stays in scope through function exit; the success path explicitly
     // returns to cache or discards, and error paths drop via the Drop
     // fallback (decrement-only, never re-pool). `body_counter` is an
-    // `&AtomicU64` to conn's body_bytes_sent field — a disjoint borrow
+    // `&AtomicU64` to conn's body_bytes_sent field - a disjoint borrow
     // from the stream, so we can update the counter at each chunk
     // boundary while `server_wr` is alive.
     let (stream_ref, body_counter) = conn.stream_and_body_counter_mut();
@@ -1236,7 +1236,7 @@ where
                             Ok(Ok(())) => {
                                 // Increment after the full chunk has been
                                 // flushed to the backend's kernel send
-                                // buffer — never per-syscall. The counter
+                                // buffer - never per-syscall. The counter
                                 // is the discriminator for backend-conn
                                 // poisoning (any non-zero value means an
                                 // error path must discard the conn) and
@@ -1290,7 +1290,7 @@ where
             while !cr.is_done() {
                 // pump_once interleaves the client read and backend write, so a
                 // single budget = min(body, proxy_send) bounds the per-call gap;
-                // a trip is classified Body (close, no synthetic response — the
+                // a trip is classified Body (close, no synthetic response - the
                 // backend already holds a partial chunked request).
                 let pumped = match tokio::time::timeout(
                     call_budget(tmo.body.min(tmo.proxy_send), deadline),
@@ -1334,16 +1334,16 @@ where
                         bytes_in += n as u64;
                         // For chunked the pump_once boundary is the outer
                         // iteration; `n` includes framing bytes, which is
-                        // fine — the counter answers "did any request
+                        // fine - the counter answers "did any request
                         // bytes hit the backend?", and framing bytes count
                         // toward that.
                         body_counter.fetch_add(n as u64, Ordering::Relaxed);
                         // Chunked body-size enforcement. bytes_in counts
                         // framing too, so the trip fires slightly earlier
-                        // than `max_body_size` would for a pure body —
+                        // than `max_body_size` would for a pure body -
                         // acceptable: errs on protecting the backend, and
                         // chunked framing overhead is on the order of
-                        // 10–50 bytes per chunk. Because the request and
+                        // 10-50 bytes per chunk. Because the request and
                         // response phases are serialized, the response
                         // head is never on the wire during request body
                         // forwarding, so a 413 is always emissible here.
@@ -1572,7 +1572,7 @@ where
 
             // Relay 101 verbatim. Upgrade and Connection: Upgrade are
             // hop-by-hop in general but are exactly the headers the client
-            // needs to see for the protocol switch — strip them and the
+            // needs to see for the protocol switch - strip them and the
             // upgrade silently fails.
             let ws_head_bytes = resp.head_len as u64;
             if client_wr
@@ -1714,7 +1714,7 @@ where
             return CycleOutcome::Done { close: true };
         }
         bump(last_activity);
-        // response head is on the wire — past this point a timeout can no
+        // response head is on the wire - past this point a timeout can no
         // longer synthesize a status response; the proxy must close
         // abruptly to avoid corrupting framing the client has parsed.
         response_head_sent = true;
@@ -1907,7 +1907,7 @@ where
 
     // backend conn fate is independent of the client-side close decision:
     // a backend can close its keep-alive while the client conn stays alive.
-    // error paths still drop conn implicitly — Drop decrements total_count.
+    // error paths still drop conn implicitly - Drop decrements total_count.
     if return_conn {
         KeepaliveCache::return_to_cache(conn);
     } else {
@@ -1967,7 +1967,7 @@ where
             if buf.is_empty() {
                 return HeadReadResult::Eof;
             }
-            // partial head on EOF — caller treats as malformed
+            // partial head on EOF - caller treats as malformed
             return HeadReadResult::Complete;
         }
 
@@ -2042,7 +2042,7 @@ fn backend_response_says_close(headers: &[ParsedHeader], version: HttpVersion) -
 
 /// methods whose spec semantics promise an equivalent end state on repeat
 /// (RFC 7231 §4.2.2). Only these may be retried after a broken-keepalive
-/// race — POST/PATCH (and anything unknown) MUST NOT, because the proxy
+/// race - POST/PATCH (and anything unknown) MUST NOT, because the proxy
 /// has no way to know whether the backend partially processed and committed
 /// a side-effect on the lost conn.
 fn is_idempotent_method(method: &str) -> bool {
@@ -2085,7 +2085,7 @@ fn status_label(code: u16) -> std::borrow::Cow<'static, str> {
     }
 }
 
-// Same idea for HTTP method names — the RFC 7231 + WebDAV set plus the
+// Same idea for HTTP method names - the RFC 7231 + WebDAV set plus the
 // well-known unconventional ones. Falls back to owned for anything outside.
 fn method_label(method: &str) -> std::borrow::Cow<'static, str> {
     use std::borrow::Cow;
@@ -2105,8 +2105,8 @@ fn method_label(method: &str) -> std::borrow::Cow<'static, str> {
 
 // Intern pool / listener labels into &'static str so metric emissions can
 // pass them as Cow::Borrowed instead of allocating a fresh String per emit.
-// The set is bounded by the number of (pool, listener) names in the config —
-// typically under a dozen — so the leak is one-time and tiny.
+// The set is bounded by the number of (pool, listener) names in the config -
+// typically under a dozen - so the leak is one-time and tiny.
 fn intern_label(s: &str) -> &'static str {
     use std::collections::HashMap;
     use std::sync::{OnceLock, RwLock};

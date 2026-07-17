@@ -16,6 +16,7 @@ use crate::proxy::l4::{self, Resources};
 use crate::proxy::l7::matcher::RouteContext;
 use crate::proxy::l7::router::Router;
 use crate::proxy::l7::{self, ClientStream, ErrorPages};
+use crate::tls::passthrough;
 use crate::util::monotonic_millis;
 
 #[derive(Debug, Error)]
@@ -157,7 +158,82 @@ pub async fn serve(
                         tasks.spawn(async move {
                             let _permit = permit;
 
-                            let (client_conn, conn_sni) = if let Some(acceptor) = tls_acceptor {
+                            // peeked is Some only for tls-passthrough: ClientHello bytes the
+                            // client already sent, which must reach the backend first.
+                            let (client_conn, conn_sni, peeked) = if listener_cfg.mode
+                                == ListenerMode::TlsPassthrough
+                            {
+                                let mut client = client;
+                                let Some(mut peek_buf) = buffer_pool.get() else {
+                                    tracing::warn!(%peer, "buffer pool exhausted during ClientHello peek");
+                                    metrics::counter!(
+                                        "kntx_tls_passthrough_rejects_total",
+                                        "listener" => listener_label.to_string(),
+                                        "reason" => "buffer_exhausted",
+                                    )
+                                    .increment(1);
+                                    metrics::gauge!(
+                                        "kntx_connections_active",
+                                        "listener" => listener_label.to_string(),
+                                    )
+                                    .decrement(1.0);
+                                    return;
+                                };
+                                let clienthello_timeout =
+                                    Duration::from_secs(listener_cfg.clienthello_timeout_secs);
+                                match tokio::time::timeout(
+                                    clienthello_timeout,
+                                    passthrough::peek_client_hello(&mut client, &mut peek_buf),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(hello)) => {
+                                        let sni: Option<Arc<str>> =
+                                            hello.sni.as_deref().map(Arc::from);
+                                        if let Some(ref s) = sni {
+                                            tracing::debug!(%peer, sni = %s, len = hello.len, "ClientHello peeked");
+                                        } else {
+                                            tracing::debug!(%peer, len = hello.len, "ClientHello peeked (no SNI)");
+                                            metrics::counter!(
+                                                "kntx_tls_passthrough_no_sni_total",
+                                                "listener" => listener_label.to_string(),
+                                            )
+                                            .increment(1);
+                                        }
+                                        (ClientConn::Plain(client), sni, Some((peek_buf, hello.len)))
+                                    }
+                                    Ok(Err(e)) => {
+                                        tracing::debug!(%peer, error = %e, "ClientHello peek failed");
+                                        metrics::counter!(
+                                            "kntx_tls_passthrough_rejects_total",
+                                            "listener" => listener_label.to_string(),
+                                            "reason" => e.metric_reason(),
+                                        )
+                                        .increment(1);
+                                        metrics::gauge!(
+                                            "kntx_connections_active",
+                                            "listener" => listener_label.to_string(),
+                                        )
+                                        .decrement(1.0);
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        tracing::debug!(%peer, "ClientHello peek timed out");
+                                        metrics::counter!(
+                                            "kntx_tls_passthrough_rejects_total",
+                                            "listener" => listener_label.to_string(),
+                                            "reason" => "timeout",
+                                        )
+                                        .increment(1);
+                                        metrics::gauge!(
+                                            "kntx_connections_active",
+                                            "listener" => listener_label.to_string(),
+                                        )
+                                        .decrement(1.0);
+                                        return;
+                                    }
+                                }
+                            } else if let Some(acceptor) = tls_acceptor {
                                 let handshake_start = std::time::Instant::now();
                                 match tokio::time::timeout(
                                     tls_handshake_timeout,
@@ -189,7 +265,7 @@ pub async fn serve(
                                             tracing::debug!(%peer, "TLS handshake completed (no SNI)");
                                         }
 
-                                        (ClientConn::Tls(Box::new(tls)), sni)
+                                        (ClientConn::Tls(Box::new(tls)), sni, None)
                                     }
                                     Ok(Err(e)) => {
                                         tracing::debug!(%peer, error = %e, "TLS handshake failed");
@@ -223,7 +299,7 @@ pub async fn serve(
                                     }
                                 }
                             } else {
-                                (ClientConn::Plain(client), None)
+                                (ClientConn::Plain(client), None, None)
                             };
 
                             let span = tracing::info_span!("conn", %peer);
@@ -270,7 +346,7 @@ pub async fn serve(
                                         };
                                         let _ = result;
                                     }
-                                    ListenerMode::L4 => {
+                                    ListenerMode::L4 | ListenerMode::TlsPassthrough => {
                                         let l4_ctx = RouteContext {
                                             method: None,
                                             host: None,
@@ -296,6 +372,14 @@ pub async fn serve(
                                                 return;
                                             }
                                         };
+                                        if listener_cfg.mode == ListenerMode::TlsPassthrough {
+                                            metrics::counter!(
+                                                "kntx_tls_passthrough_connections_total",
+                                                "listener" => listener_label.to_string(),
+                                                "route_id" => l4_entry.route_id.to_string(),
+                                            )
+                                            .increment(1);
+                                        }
                                         let pool = l4_entry.pool.backends.clone();
                                         let rr = l4_entry.pool.rr.clone();
                                         let pool_name = l4_entry.pool.name.to_string();
@@ -327,7 +411,7 @@ pub async fn serve(
                                             }
                                         };
 
-                                        let (backend_addr, server) = match backend_result {
+                                        let (backend_addr, mut server) = match backend_result {
                                             Some(pair) => pair,
                                             None => {
                                                 metrics::gauge!(
@@ -337,6 +421,26 @@ pub async fn serve(
                                                 return;
                                             }
                                         };
+
+                                        if let Some((peek_buf, peek_len)) = peeked {
+                                            use tokio::io::AsyncWriteExt;
+                                            if let Err(e) = server.write_all(&peek_buf[..peek_len]).await {
+                                                tracing::warn!(%peer, error = %e, "failed to flush ClientHello to backend");
+                                                pool.record_failure(backend_addr);
+                                                metrics::gauge!(
+                                                    "kntx_connections_active",
+                                                    "listener" => listener_label.to_string(),
+                                                ).decrement(1.0);
+                                                return;
+                                            }
+                                            metrics::counter!(
+                                                "kntx_forwarded_bytes_total",
+                                                "direction" => "client_to_backend",
+                                                "listener" => listener_label.to_string(),
+                                            ).increment(peek_len as u64);
+                                            // guard drops here - buffer returns to the pool
+                                            // before forwarding begins
+                                        }
 
                                         let forward_fut = async {
                                             match client_conn {
@@ -416,6 +520,12 @@ pub async fn serve(
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
+
+    // close the listening socket before draining. the kernel otherwise keeps
+    // completing handshakes into the backlog that nobody will ever accept,
+    // leaving those clients hanging in dead air instead of refused-and-retrying
+    // elsewhere. nginx closes listen sockets at the same point.
+    drop(listener);
 
     if !tasks.is_empty() {
         tracing::info!(%address, remaining = tasks.len(), "draining in-flight connections");

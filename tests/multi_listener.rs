@@ -79,7 +79,7 @@ fn serve_config(label: &str) -> ServeConfig {
 }
 
 /// start a listener and return its bound address.
-/// the returned Sender keeps the listener alive — drop it to shut down.
+/// the returned Sender keeps the listener alive - drop it to shut down.
 async fn start_listener(
     router: Arc<dyn Router>,
     label: &str,
@@ -105,7 +105,7 @@ async fn echo_assert(proxy_addr: SocketAddr, msg: &[u8]) {
     assert_eq!(&buf, msg);
 }
 
-// T9.a: two listeners with different pools — traffic is isolated.
+// T9.a: two listeners with different pools - traffic is isolated.
 // L1 only routes to b1, L2 only routes to b2.
 // connections through L1 must never hit b2 and vice versa.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -132,7 +132,7 @@ async fn two_listeners_different_pools_are_isolated() {
         echo_assert(l2_addr, b"from l2").await;
     }
 
-    // now shut down b1 — L1 should fail but L2 should be unaffected
+    // now shut down b1 - L1 should fail but L2 should be unaffected
     drop(b1);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -142,7 +142,7 @@ async fn two_listeners_different_pools_are_isolated() {
 
 // T9.b: two listeners sharing the same pool share the round-robin counter.
 // verifies the architectural invariant that a single Arc<RoundRobin> backs
-// both listeners — with independent RRs this test would fail two ways:
+// both listeners - with independent RRs this test would fail two ways:
 // the strong_count check catches it at setup, and the current_index readback
 // catches it after traffic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -256,7 +256,7 @@ async fn shutdown_drains_all_listeners_independently() {
 
     // L2 has no in-flight connections
 
-    // fire shutdown — both listeners should begin draining
+    // fire shutdown - both listeners should begin draining
     let _ = shutdown_tx.send(());
 
     // L2 should exit quickly (nothing to drain)
@@ -265,7 +265,7 @@ async fn shutdown_drains_all_listeners_independently() {
         .expect("L2 did not exit within 2s")
         .expect("L2 serve task panicked");
 
-    // L1 is still held open by s1 — close it to let drain complete
+    // L1 is still held open by s1 - close it to let drain complete
     drop(s1);
 
     tokio::time::timeout(Duration::from_secs(3), h1)
@@ -366,7 +366,7 @@ async fn pool_shared_l4_l7_listener() {
         "L4 traffic must not perturb the L7 keep-alive cache"
     );
 
-    // next L7 request reuses the cached idle conn — backend accept count
+    // next L7 request reuses the cached idle conn - backend accept count
     // stays steady relative to the pre-L7 count established above.
     let before = backend.accept_count();
     issue_http_request(l7_addr).await;

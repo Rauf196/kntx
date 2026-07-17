@@ -38,13 +38,13 @@ struct ProxyOpts {
     keepalive_idle_secs: Option<u64>,
     keepalive_max_requests: Option<u32>,
     access_log_file: Option<std::path::PathBuf>,
-    // phase timeouts — all None by default (resolve to 60s); set per test.
+    // phase timeouts - all None by default (resolve to 60s); set per test.
     client_header_timeout_secs: Option<u64>,
     client_body_timeout_secs: Option<u64>,
     proxy_send_timeout_secs: Option<u64>,
     proxy_read_timeout_secs: Option<u64>,
     request_timeout_secs: Option<u64>,
-    // max request body size — None inherits the production default (1 MiB);
+    // max request body size - None inherits the production default (1 MiB);
     // Some(0) opts into unlimited; Some(N) sets an explicit cap.
     max_body_size_bytes: Option<u64>,
 }
@@ -100,6 +100,7 @@ async fn start_proxy_pool(
         proxy_read_timeout_secs: opts.proxy_read_timeout_secs,
         request_timeout_secs: opts.request_timeout_secs,
         max_body_size_bytes: opts.max_body_size_bytes,
+        clienthello_timeout_secs: 10,
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -402,7 +403,7 @@ async fn client_keepalive_clean_eof_between_requests() {
     assert_eq!(r.body_str(), "done");
 
     // half-close write: proxy's between-request fill_buf sees EOF and must
-    // exit serve_l7_conn cleanly (no panic, prompt close — not a 60s hang).
+    // exit serve_l7_conn cleanly (no panic, prompt close - not a 60s hang).
     client.shutdown_write().await.unwrap();
     let trailing = tokio::time::timeout(Duration::from_secs(3), client.read_to_eof())
         .await
@@ -506,7 +507,7 @@ async fn client_keepalive_xff_independent_per_request() {
     );
     assert!(
         xff2.starts_with("5.6.7.8,") && !xff2.contains("1.2.3.4"),
-        "req2 XFF must be `5.6.7.8, <ip>` — NOT accumulated with req1, got {xff2:?}"
+        "req2 XFF must be `5.6.7.8, <ip>` - NOT accumulated with req1, got {xff2:?}"
     );
 }
 
@@ -611,7 +612,7 @@ async fn phase_timeout_proxy_send() {
         // stalls on the body-read phase instead of proxy_send).
         let mut req = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 33554432\r\n\r\n".to_vec();
         req.resize(req.len() + 32 * 1024 * 1024, b'a');
-        // expected to block/error once the proxy stops draining — ignore.
+        // expected to block/error once the proxy stops draining - ignore.
         let _ = wr.write_all(&req).await;
     });
 
@@ -670,7 +671,7 @@ async fn phase_timeout_proxy_read() {
 
 /// Total `request_timeout`: per-phase budgets are large (default 60s); only
 /// the overall cycle deadline clamps. The backend would respond, but not
-/// until after the 1s total deadline — the clamped proxy_read call trips
+/// until after the 1s total deadline - the clamped proxy_read call trips
 /// with deadline_hit and yields 504. Fires well before the backend's own 5s
 /// delay, proving the total cap (not any individual phase) is what tripped.
 #[tokio::test]
@@ -726,7 +727,7 @@ async fn get_one(client: &mut KeepAliveClient) -> helpers::keepalive_client::Par
 }
 
 /// Five sequential client requests over a single keep-alive client conn
-/// reuse one backend conn — `accept_count == 1` proves the cache is being
+/// reuse one backend conn - `accept_count == 1` proves the cache is being
 /// returned to and re-checked-out.
 #[tokio::test]
 async fn backend_pool_reuses_connection() {
@@ -939,7 +940,7 @@ async fn backend_pool_max_idle_enforced() {
 
 /// Two backends; first hits `max_total = 1` on a long-lived request, second
 /// must serve a concurrent request via failover. Saturation does NOT trip
-/// the circuit breaker — saturation is "operating at capacity", not failing.
+/// the circuit breaker - saturation is "operating at capacity", not failing.
 #[tokio::test]
 async fn backend_pool_max_total_failover() {
     let slow = SlowResponseBackend::start(Duration::from_secs(2)).await;
@@ -1128,7 +1129,7 @@ async fn idle_sweeper_drops_stale() {
 
 /// Stress test: many concurrent client tasks churn checkout/return. After
 /// drain, `total_count` for the backend equals the number of idle conns in
-/// the queue — no leaked counter slots.
+/// the queue - no leaked counter slots.
 #[tokio::test]
 async fn keepalive_concurrent_checkout_return_no_leak() {
     let backend = HttpBackend::start_keepalive(ResponseSpec::ok("ok")).await;
@@ -1166,7 +1167,7 @@ async fn keepalive_concurrent_checkout_return_no_leak() {
 
 /// Backend returns 502 with `Connection: close`. Proxy must (a) pass the 502
 /// through to the client, (b) discard the backend conn from the cache, but
-/// (c) keep the client conn alive — the proxy-emitted Connection header on
+/// (c) keep the client conn alive - the proxy-emitted Connection header on
 /// the client response is independent of the backend's.
 #[tokio::test]
 async fn client_keepalive_backend_502_keeps_client_alive() {
@@ -1352,7 +1353,7 @@ async fn body_chunked_exceeds_pre_response_413() {
         "chunked body > limit must be rejected with 413"
     );
 
-    // poisoned conn must not survive in the cache — Drop on the KeepaliveConn
+    // poisoned conn must not survive in the cache - Drop on the KeepaliveConn
     // decrements total_count without re-pooling.
     tokio::time::sleep(Duration::from_millis(50)).await;
     use std::sync::atomic::Ordering;
@@ -1414,7 +1415,7 @@ async fn retry_get_on_broken_keepalive() {
         );
     }
 
-    // Broken-keepalive races are TCP-level — no backend output was observed,
+    // Broken-keepalive races are TCP-level - no backend output was observed,
     // so they do not count as backend failures. B1's circuit must remain
     // Closed even though its cached idles routinely die.
     let b1_state = pool.state_for(b1.addr).unwrap();
@@ -1424,7 +1425,7 @@ async fn retry_get_on_broken_keepalive() {
     );
 }
 
-/// PUT (idempotent by spec) with body — once any body byte has been flushed
+/// PUT (idempotent by spec) with body - once any body byte has been flushed
 /// to the backend socket, retry is structurally blocked: pass-through
 /// forwarding cannot replay body bytes it has already consumed from the
 /// client. Expected: 502 to client, broken backend conn discarded.
@@ -1444,7 +1445,7 @@ async fn no_retry_put_mid_body() {
     let r = client.request(&req).await.unwrap();
     assert_eq!(
         r.status, 502,
-        "PUT with body bytes already sent must NOT retry — pass-through can't replay"
+        "PUT with body bytes already sent must NOT retry - pass-through can't replay"
     );
 
     // backend conn poisoned by partial body → discarded, never re-pooled.
@@ -1458,7 +1459,7 @@ async fn no_retry_put_mid_body() {
     );
 }
 
-/// POST (non-idempotent) with body — never retried in any case. With body
+/// POST (non-idempotent) with body - never retried in any case. With body
 /// bytes already sent the backend conn is poisoned and must be discarded.
 #[tokio::test]
 async fn no_retry_post_with_body_started() {
@@ -1484,7 +1485,7 @@ async fn no_retry_post_with_body_started() {
 }
 
 /// PATCH (non-idempotent) is not retry-eligible even when no body has been
-/// sent yet — the method gate alone blocks retry. Sending PATCH against a
+/// sent yet - the method gate alone blocks retry. Sending PATCH against a
 /// single backend that always FINs without responding routes through the
 /// "ineligible" branch and consistently yields 502, never 200.
 #[tokio::test]
@@ -1514,7 +1515,7 @@ async fn no_retry_patch_zero_bytes() {
         .unwrap();
     assert_eq!(
         r.status, 502,
-        "PATCH (non-idempotent) on a backend that always FINs must 502 — never retried"
+        "PATCH (non-idempotent) on a backend that always FINs must 502 - never retried"
     );
 
     let _ = stop_tx.send(());
@@ -1522,7 +1523,7 @@ async fn no_retry_patch_zero_bytes() {
 
 /// Backend-conn poisoning canary: a backend that FINs mid-body must NOT
 /// have its broken conn returned to the cache. After the failure,
-/// `total_count` for the backend reads 0 — the broken conn was discarded.
+/// `total_count` for the backend reads 0 - the broken conn was discarded.
 /// An implementation that re-pools the conn would leave `total_count >= 1`
 /// here, and subsequent requests would pop the broken conn and pay an extra
 /// round-trip.
@@ -1565,7 +1566,7 @@ async fn broken_keepalive_does_not_trip_circuit() {
         start_proxy_pool(vec![b1.addr, b2.addr], KA_DEFAULT, ProxyOpts::default()).await;
 
     let mut client = KeepAliveClient::connect(proxy.addr).await;
-    // ten sequential requests — well past failure_threshold of 3. If any path
+    // ten sequential requests - well past failure_threshold of 3. If any path
     // mis-attributed a broken-keepalive race as a backend failure, the circuit
     // would have flipped Open before iteration 10.
     for i in 0..10 {
@@ -1655,7 +1656,7 @@ async fn start_head_compliant_backend() -> HeadCompliantBackend {
 
 /// First request on a kept-alive conn is HEAD; the backend returns a response
 /// with Content-Length advertising a body it does not send. The proxy must
-/// recognize HEAD and skip body framing on both sides — if it tries to read
+/// recognize HEAD and skip body framing on both sides - if it tries to read
 /// the phantom CL bytes from the backend, the next request on the same
 /// client conn would either hang or parse the next response wrong.
 #[tokio::test]
@@ -1799,7 +1800,7 @@ async fn start_continue_backend() -> ContinueBackend {
 /// First request advertises Expect: 100-continue; the backend emits a 100
 /// interim before consuming the body and finally replies 200. The proxy
 /// must forward the 100 to the client and keep the backend conn pooled
-/// after the final response — the second request on the same client conn
+/// after the final response - the second request on the same client conn
 /// must reach the SAME backend conn (accept_count stays at 1).
 #[tokio::test]
 async fn client_keepalive_100_continue_then_returns_to_pool() {
@@ -2001,7 +2002,7 @@ async fn drain_chunked_body(
 /// Chunked request body with trailers forwarded byte-for-byte to the
 /// backend; the trailer line lands AFTER the final 0-chunk. The backend
 /// conn must return to the cache, and the next request on the same client
-/// conn must hit the same backend conn — verifies the keep-alive loop
+/// conn must hit the same backend conn - verifies the keep-alive loop
 /// observes the chunked-with-trailers terminator correctly and leaves no
 /// stray bytes that would corrupt the next iteration's framing.
 #[tokio::test]
@@ -2178,7 +2179,7 @@ async fn tls_l7_keepalive_sequential() {
         1,
         "single backend conn must serve all five TLS-fronted requests"
     );
-    // explicit close — proxy would otherwise hold the conn until idle.
+    // explicit close - proxy would otherwise hold the conn until idle.
     let _ = tls.shutdown().await;
 }
 

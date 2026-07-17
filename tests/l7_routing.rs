@@ -157,7 +157,7 @@ async fn get(proxy_addr: SocketAddr, host: &str, path: &str) -> (u16, String) {
     (status, body)
 }
 
-/// 6c.13 — two hosts, each routes to a different pool.
+/// two hosts, each routes to a different pool.
 #[tokio::test]
 async fn host_routing_two_hosts_two_pools() {
     let backend_a = HttpBackend::start(ResponseSpec::ok("pool-a")).await;
@@ -190,7 +190,7 @@ async fn host_routing_two_hosts_two_pools() {
     assert_eq!(body_b.trim(), "pool-b");
 }
 
-/// 6c.14 — /api → pool-a, /static → pool-b, catch-all → pool-c.
+/// /api → pool-a, /static → pool-b, catch-all → pool-c.
 #[tokio::test]
 async fn path_prefix_routing_three_pools() {
     let backend_a = HttpBackend::start(ResponseSpec::ok("pool-a")).await;
@@ -227,7 +227,7 @@ async fn path_prefix_routing_three_pools() {
     assert_eq!(body.trim(), "pool-c");
 }
 
-/// 6c.15 — more specific route listed first wins.
+/// more specific route listed first wins.
 #[tokio::test]
 async fn declaration_order_specific_first_wins() {
     let backend_a = HttpBackend::start(ResponseSpec::ok("specific")).await;
@@ -258,7 +258,7 @@ async fn declaration_order_specific_first_wins() {
     assert_eq!(body.trim(), "general");
 }
 
-/// 6c.15 — more specific listed second never matches when general is first.
+/// more specific listed second never matches when general is first.
 #[tokio::test]
 async fn declaration_order_specific_after_general_never_matches() {
     let backend_a = HttpBackend::start(ResponseSpec::ok("specific")).await;
@@ -267,7 +267,7 @@ async fn declaration_order_specific_after_general_never_matches() {
     let (pool_a, rr_a) = make_pool("specific", backend_a.addr);
     let (pool_b, rr_b) = make_pool("general", backend_b.addr);
 
-    // general listed before specific — specific never gets traffic
+    // general listed before specific - specific never gets traffic
     let router = Arc::new(ConfigRouter::new(vec![
         route(
             vec![Box::new(PathPrefixMatcher::new("/api").unwrap())],
@@ -283,12 +283,12 @@ async fn declaration_order_specific_after_general_never_matches() {
 
     let proxy = start_routing_proxy(router).await;
 
-    // /api/v1/foo matches /api first — specific route never reached
+    // /api/v1/foo matches /api first - specific route never reached
     let (_, body) = get(proxy.addr, "example.com", "/api/v1/foo").await;
     assert_eq!(body.trim(), "general");
 }
 
-/// 6c.17 — composite host+path: both conditions must hold.
+/// composite host+path: both conditions must hold.
 #[tokio::test]
 async fn composite_host_and_path_required_both() {
     let backend_a = HttpBackend::start(ResponseSpec::ok("matched")).await;
@@ -324,7 +324,7 @@ async fn composite_host_and_path_required_both() {
     assert_eq!(body.trim(), "fallback");
 }
 
-/// 6c.16 — *.example.com matches single-label and multi-label subdomains.
+/// *.example.com matches single-label and multi-label subdomains.
 #[tokio::test]
 async fn wildcard_host_routes_subdomain() {
     let backend_a = HttpBackend::start(ResponseSpec::ok("wildcard")).await;
@@ -369,7 +369,7 @@ async fn wildcard_host_routes_subdomain() {
     );
 }
 
-/// 6c.18 — no matching route and no catch-all returns 503.
+/// no matching route and no catch-all returns 503.
 #[tokio::test]
 async fn no_match_returns_503() {
     let backend = HttpBackend::start(ResponseSpec::ok("pool-a")).await;
@@ -388,7 +388,7 @@ async fn no_match_returns_503() {
     assert_eq!(status, 503, "no-match route must return 503");
 }
 
-/// 6c.18 — catch-all as last route serves unmatched requests.
+/// catch-all as last route serves unmatched requests.
 #[tokio::test]
 async fn catch_all_route_serves_unmatched() {
     let backend_a = HttpBackend::start(ResponseSpec::ok("specific")).await;
@@ -419,7 +419,7 @@ async fn catch_all_route_serves_unmatched() {
     assert_eq!(body.trim(), "catch-all");
 }
 
-/// regression — single-pool listener (old pool = "X" style) still works.
+/// regression - single-pool listener (old pool = "X" style) still works.
 #[tokio::test]
 async fn existing_single_pool_listener_unchanged() {
     let backend = HttpBackend::start(ResponseSpec::ok("single-pool")).await;
@@ -433,7 +433,7 @@ async fn existing_single_pool_listener_unchanged() {
     assert_eq!(body.trim(), "single-pool");
 }
 
-/// 6c — route_id appears in access log for matched routes.
+/// route_id appears in the access log for matched routes.
 #[tokio::test]
 async fn route_id_in_access_log() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -519,7 +519,7 @@ async fn route_id_in_access_log() {
     assert_eq!(parsed["status"], 200);
 }
 
-/// 6c.19 — L7+TLS: SNI steers two hostnames to two separate pools.
+/// L7+TLS: SNI steers two hostnames to two separate pools.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_sni_routes_two_pools() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -599,7 +599,7 @@ async fn tls_sni_routes_two_pools() {
     );
 }
 
-/// 6c.19 — composite SNI+path: both conditions must hold.
+/// composite SNI+path: both conditions must hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_sni_with_l7_path_composite() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -666,7 +666,7 @@ async fn tls_sni_with_l7_path_composite() {
     );
 }
 
-/// regression — TLS listener without routes (single pool) works as before.
+/// regression - TLS listener without routes (single pool) works as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_passthrough_listener_unchanged() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -705,7 +705,7 @@ async fn tls_passthrough_listener_unchanged() {
     );
 }
 
-/// 6c.11 — L4+TLS with SNI routing: two SNIs routed to two echo pools.
+/// L4+TLS with SNI routing: two SNIs routed to two echo pools.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l4_tls_sni_routes_two_pools() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -915,7 +915,7 @@ fn init_metrics() -> &'static PrometheusHandle {
     })
 }
 
-/// 6c.12 — route_matches counter emitted with route_id label after a matched request.
+/// route_matches counter emitted with route_id label after a matched request.
 #[tokio::test]
 async fn metrics_emit_route_matches_with_route_id_label() {
     let handle = init_metrics();
@@ -941,7 +941,7 @@ async fn metrics_emit_route_matches_with_route_id_label() {
     );
 }
 
-/// 6c.12 — route_no_match counter emitted when no route resolves.
+/// route_no_match counter emitted when no route resolves.
 #[tokio::test]
 async fn metrics_emit_route_no_match_on_unmatched_request() {
     let handle = init_metrics();
@@ -968,7 +968,7 @@ async fn metrics_emit_route_no_match_on_unmatched_request() {
     );
 }
 
-/// 6c.12 — HELP lines for both route metrics appear in /metrics output.
+/// HELP lines for both route metrics appear in /metrics output.
 #[tokio::test]
 async fn describe_metrics_present() {
     let handle = init_metrics();

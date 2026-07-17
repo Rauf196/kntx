@@ -104,7 +104,7 @@ pub fn classify_request_body(req: &Request) -> Result<BodyFraming, SmugglingErro
         return Err(SmugglingError::MultipleCL);
     }
 
-    // 4. Transfer-Encoding count — multiple TE headers have the same smuggling
+    // 4. Transfer-Encoding count - multiple TE headers have the same smuggling
     // risk as multiple CL headers: different backends parse differently.
     let te_count = header_count(&req.headers, "transfer-encoding");
     if te_count > 1 {
@@ -130,7 +130,7 @@ pub fn classify_request_body(req: &Request) -> Result<BodyFraming, SmugglingErro
         return Ok(BodyFraming::Chunked);
     }
 
-    // 7. Content-Length framing — reject leading zeros (octal ambiguity in legacy parsers)
+    // 7. Content-Length framing - reject leading zeros (octal ambiguity in legacy parsers)
     if let Some(cl_val) = header_str(&req.headers, "content-length") {
         let trimmed = cl_val.trim();
         if !is_valid_cl_format(trimmed) {

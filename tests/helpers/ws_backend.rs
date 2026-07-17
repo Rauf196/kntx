@@ -16,7 +16,7 @@ pub enum WsBackendMode {
     /// Respond 101 with a static Sec-WebSocket-Accept value, then echo
     /// every byte received until the client closes.
     EchoTunnel,
-    /// Respond 200 with a small body — the proxy treats this as a
+    /// Respond 200 with a small body - the proxy treats this as a
     /// non-upgrade response and falls back to normal forwarding then close.
     Reject200,
     /// Respond 101 reflecting the requested `Sec-WebSocket-Protocol` if any

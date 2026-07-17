@@ -20,7 +20,7 @@ pub trait Matcher: Send + Sync {
 #[derive(Debug, Clone)]
 pub(crate) enum HostPattern {
     Exact(String),
-    /// stored as ".example.com" — host must end with this and have a non-empty prefix.
+    /// stored as ".example.com" - host must end with this and have a non-empty prefix.
     Wildcard(String),
 }
 
@@ -222,7 +222,7 @@ impl Matcher for CompositeMatcher {
 /// "[::1]"            -> "[::1]"
 pub fn host_for_routing(host: &str) -> &str {
     if host.starts_with('[') {
-        // IPv6 literal — find closing bracket
+        // IPv6 literal - find closing bracket
         if let Some(close) = host.find(']') {
             return &host[..=close];
         }
@@ -296,8 +296,6 @@ mod tests {
         }
     }
 
-    // --- HostMatcher ---
-
     #[test]
     fn host_exact_case_insensitive() {
         let m = HostMatcher::new("example.com").unwrap();
@@ -348,8 +346,6 @@ mod tests {
         assert!(!m.matches(&ctx_with_host("api.example.org")));
     }
 
-    // --- PathPrefixMatcher ---
-
     #[test]
     fn path_prefix_exact_match() {
         let m = PathPrefixMatcher::new("/api").unwrap();
@@ -380,8 +376,6 @@ mod tests {
         assert!(m.matches(&ctx_with_path("/api/v1/resource")));
     }
 
-    // --- MethodMatcher ---
-
     #[test]
     fn method_exact_case_sensitive() {
         let m = MethodMatcher::new("GET").unwrap();
@@ -391,8 +385,6 @@ mod tests {
         assert!(!m.matches(&ctx_with_method("POST")));
     }
 
-    // --- SniMatcher ---
-
     #[test]
     fn sni_wildcard_multi_label() {
         let m = SniMatcher::new("*.example.com").unwrap();
@@ -401,8 +393,6 @@ mod tests {
         assert!(!m.matches(&ctx_with_sni("example.com")));
         assert!(!m.matches(&ctx_with_sni("api.other.com")));
     }
-
-    // --- CompositeMatcher ---
 
     #[test]
     fn composite_and_all_required() {
@@ -446,8 +436,6 @@ mod tests {
         assert!(composite.matches(&ctx_with_path("/any/path")));
     }
 
-    // --- host_for_routing ---
-
     #[test]
     fn host_for_routing_strips_port() {
         assert_eq!(host_for_routing("example.com:8080"), "example.com");
@@ -465,8 +453,6 @@ mod tests {
         assert_eq!(host_for_routing("example.com"), "example.com");
         assert_eq!(host_for_routing("[::1]"), "[::1]");
     }
-
-    // --- parse_host_pattern ---
 
     #[test]
     fn parses_exact_pattern() {
@@ -502,8 +488,6 @@ mod tests {
         assert!(parse_host_pattern("*.").is_err());
     }
 
-    // --- PathPrefixMatcher validation ---
-
     #[test]
     fn rejects_path_prefix_without_leading_slash() {
         assert!(PathPrefixMatcher::new("api").is_err());
@@ -521,8 +505,6 @@ mod tests {
         // "/" alone is allowed even though it ends with '/'
         assert!(PathPrefixMatcher::new("/").is_ok());
     }
-
-    // --- MethodMatcher validation ---
 
     #[test]
     fn rejects_empty_method() {

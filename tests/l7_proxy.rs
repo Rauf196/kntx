@@ -296,7 +296,7 @@ async fn raw_request(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     // Default-on keep-alive: the proxy's between-request wait would otherwise
     // block until `keepalive_idle_timeout_secs` (~60s) before closing. A FIN
     // makes the proxy's `fill_buf` peek observe EOF and end the conn cleanly
-    // right after this response — the standard "client done sending" signal.
+    // right after this response - the standard "client done sending" signal.
     // Client-side close only; the proxy's keep-alive behavior and timeouts
     // are not adjusted.
     let _ = stream.shutdown().await;
@@ -490,7 +490,7 @@ async fn smuggling_te_gzip_rejected() {
 
 #[tokio::test]
 async fn smuggling_obs_fold_rejected() {
-    // obs-fold: header value with \r\n followed by space — injected raw TCP
+    // obs-fold: header value with \r\n followed by space - injected raw TCP
     // Note: httparse may strip obs-fold before we see it. Test that we handle it.
     // We send a raw byte sequence and check we get 400 or 200 depending on httparse behavior.
     // The important thing is we don't crash or produce a wrong result.
@@ -528,7 +528,7 @@ async fn malformed_chunked_body_returns_400() {
 #[tokio::test]
 async fn hop_by_hop_stripped_both_directions() {
     let backend = HttpBackend::start_with_handler(Arc::new(|req: BackendRequest| {
-        // proxy injects Connection: close — that is expected. We assert the original
+        // proxy injects Connection: close - that is expected. We assert the original
         // Keep-Alive header (a hop-by-hop) does not reach the backend.
         if req.header("keep-alive").is_some() {
             ResponseSpec::ok("FAIL: keep-alive reached backend")
@@ -811,13 +811,13 @@ async fn no_healthy_backend_returns_503() {
 /// Use a TCP listener that accepts but never responds.
 #[tokio::test]
 async fn connect_timeout_returns_504() {
-    // port 9 is the "discard" port — usually filtered at the OS level which
+    // port 9 is the "discard" port - usually filtered at the OS level which
     // causes connect to time out rather than refuse. Use a listener that accepts
-    // but never writes — that should trigger a read timeout. But our current
+    // but never writes - that should trigger a read timeout. But our current
     // code has a connect timeout, not a read timeout. So we need a backend
     // that never accepts connections (blackhole port).
     // Since we can't easily simulate a TCP blackhole in tests, we use a
-    // high-numbered port that's not listening — connect will fail with refused
+    // high-numbered port that's not listening - connect will fail with refused
     // (502), not timeout (504). For the real 504, we'd need firewall rules.
     // We test here that refused backends produce 502, not crash.
     let refused_addr: SocketAddr = "127.0.0.1:19999".parse().unwrap();
@@ -1084,7 +1084,7 @@ async fn access_log_trace_id_propagates() {
     );
 }
 
-/// Fix 3 — HTTP/2 connection preface returns 505, not 400.
+/// Fix 3 - HTTP/2 connection preface returns 505, not 400.
 #[tokio::test]
 async fn http2_preface_returns_505() {
     let backend = HttpBackend::start(ResponseSpec::ok("unreachable")).await;
@@ -1096,7 +1096,7 @@ async fn http2_preface_returns_505() {
     assert_eq!(parse_status(&resp), 505);
 }
 
-/// Fix 1 — Transfer-Encoding: Chunked (capital C) must be accepted, not rejected.
+/// Fix 1 - Transfer-Encoding: Chunked (capital C) must be accepted, not rejected.
 #[tokio::test]
 async fn smuggling_te_chunked_uppercase_accepted() {
     let backend =
@@ -1114,7 +1114,7 @@ async fn smuggling_te_chunked_uppercase_accepted() {
     );
 }
 
-/// Fix 2 — two Transfer-Encoding headers must be rejected with 400.
+/// Fix 2 - two Transfer-Encoding headers must be rejected with 400.
 #[tokio::test]
 async fn smuggling_multi_te_rejected() {
     let backend = HttpBackend::start(ResponseSpec::ok("unreachable")).await;
@@ -1125,7 +1125,7 @@ async fn smuggling_multi_te_rejected() {
     assert_eq!(parse_status(&resp), 400);
 }
 
-/// Fix 3 — Content-Length: 010 (leading zero) must be rejected with 400.
+/// Fix 3 - Content-Length: 010 (leading zero) must be rejected with 400.
 #[tokio::test]
 async fn smuggling_leading_zero_cl_rejected() {
     let backend = HttpBackend::start(ResponseSpec::ok("unreachable")).await;
@@ -1136,7 +1136,7 @@ async fn smuggling_leading_zero_cl_rejected() {
     assert_eq!(parse_status(&resp), 400);
 }
 
-/// Fix 3 — Content-Length: 0 (no body) must be accepted.
+/// Fix 3 - Content-Length: 0 (no body) must be accepted.
 #[tokio::test]
 async fn cl_zero_accepted() {
     let backend = HttpBackend::start(ResponseSpec::ok("ok")).await;
@@ -1163,7 +1163,7 @@ async fn tls_l7_get_happy_path() {
         .await
         .unwrap();
 
-    // read until proxy closes (it shuts down after each 6b response)
+    // read until the proxy closes the connection after the response
     let mut resp_buf = Vec::new();
     let _ = tls.read_to_end(&mut resp_buf).await;
 
@@ -1171,7 +1171,7 @@ async fn tls_l7_get_happy_path() {
     assert_eq!(response_body(&resp_buf), b"tls-l7-ok");
 }
 
-/// Fix 4 — mid-body backend failure is recorded in passive health tracking.
+/// Fix 4 - mid-body backend failure is recorded in passive health tracking.
 #[tokio::test]
 async fn mid_body_backend_failure_records_passive_health() {
     // backend A: accepts request head then drops the connection (simulates mid-body close)
@@ -1192,7 +1192,7 @@ async fn mid_body_backend_failure_records_passive_health() {
                     }
                 }
             }
-            // drop s — connection closes without any response
+            // drop s - connection closes without any response
         }
     });
 
@@ -1225,7 +1225,7 @@ async fn mid_body_backend_failure_records_passive_health() {
         idle_timeout_secs: Some(10),
         drain_timeout_secs: 1,
         connect_timeout_secs: 2,
-        max_connect_attempts: 1, // no retry — first attempt goes to bad_addr
+        max_connect_attempts: 1, // no retry - first attempt goes to bad_addr
         tls: None,
         header_size_limit_bytes: 16384,
         ..Default::default()

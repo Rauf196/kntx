@@ -60,19 +60,34 @@ pub enum ConfigError {
     #[error("listener {listener} references unknown pool '{pool}'")]
     UnknownPoolReference { listener: SocketAddr, pool: String },
 
-    #[error("listener {listener} has both 'pool' and 'routes' — use one or the other")]
+    #[error("listener {listener} has both 'pool' and 'routes' - use one or the other")]
     ListenerHasBothPoolAndRoutes { listener: SocketAddr },
 
-    #[error("listener {listener} has neither 'pool' nor 'routes' — one is required")]
+    #[error("listener {listener} has neither 'pool' nor 'routes' - one is required")]
     ListenerHasNeitherPoolNorRoutes { listener: SocketAddr },
 
     #[error(
-        "listener {listener} has routes but is plain L4 (no TLS) — routes require L7 or L4+TLS"
+        "listener {listener} has routes but is plain L4 (no TLS) - routes require L7 or L4+TLS"
     )]
     RoutesOnPlainL4Listener { listener: SocketAddr },
 
     #[error("route on listener {listener} uses 'sni' but listener has no TLS")]
     SniMatcherOnNonTlsListener { listener: SocketAddr },
+
+    #[error(
+        "listener {listener} is tls-passthrough but has a [listeners.tls] section - \
+         passthrough never terminates TLS"
+    )]
+    TlsTerminationOnPassthroughListener { listener: SocketAddr },
+
+    #[error(
+        "route on listener {listener} uses '{field}' but the listener is tls-passthrough - \
+         only 'sni' is visible without terminating TLS"
+    )]
+    HttpMatcherOnPassthroughListener {
+        listener: SocketAddr,
+        field: &'static str,
+    },
 
     #[error("route on listener {listener} references unknown pool '{pool}'")]
     UnknownRoutePoolReference { listener: SocketAddr, pool: String },
@@ -139,6 +154,10 @@ pub enum ListenerMode {
     #[default]
     L4,
     L7,
+    /// peek the ClientHello for SNI, route, then forward raw encrypted bytes.
+    /// the client handshakes with the backend - kntx never terminates.
+    #[serde(rename = "tls-passthrough")]
+    TlsPassthrough,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +214,10 @@ pub struct ListenerConfig {
     pub keepalive_idle_timeout_secs: Option<u64>,
     // max sequential requests on one client keep-alive connection; None = default 1000.
     pub keepalive_max_requests: Option<u32>,
+    // tls-passthrough only: max time to receive the full ClientHello.
+    // slowloris bound on the peek phase, like nginx preread_timeout.
+    #[serde(default = "default_clienthello_timeout")]
+    pub clienthello_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,12 +346,17 @@ impl Default for ListenerConfig {
             max_body_size_bytes: None,
             keepalive_idle_timeout_secs: None,
             keepalive_max_requests: None,
+            clienthello_timeout_secs: default_clienthello_timeout(),
         }
     }
 }
 
 fn default_drain_timeout() -> u64 {
     30
+}
+
+fn default_clienthello_timeout() -> u64 {
+    10
 }
 
 fn default_connect_timeout() -> u64 {
@@ -471,7 +499,7 @@ impl Config {
             return Err(ConfigError::EmptyPools);
         }
 
-        // listener address uniqueness — exact dup
+        // listener address uniqueness - exact dup
         let mut seen_addrs: HashSet<SocketAddr> = HashSet::new();
         for listener in &self.listeners {
             if !seen_addrs.insert(listener.address) {
@@ -481,7 +509,7 @@ impl Config {
             }
         }
 
-        // listener address overlap — wildcard (0.0.0.0 / ::) on a port
+        // listener address overlap - wildcard (0.0.0.0 / ::) on a port
         // claims that port on every interface, so it conflicts with any
         // other listener on the same port. kernel would catch this with
         // EADDRINUSE on bind, but a config-time error is clearer.
@@ -555,10 +583,28 @@ impl Config {
                                 pool: route.pool.clone(),
                             });
                         }
-                        if route.sni.is_some() && listener.tls.is_none() {
+                        // sni needs either TLS termination (rustls extracts it) or
+                        // passthrough mode (the ClientHello peek extracts it)
+                        if route.sni.is_some()
+                            && listener.tls.is_none()
+                            && listener.mode != ListenerMode::TlsPassthrough
+                        {
                             return Err(ConfigError::SniMatcherOnNonTlsListener {
                                 listener: listener.address,
                             });
+                        }
+                        if listener.mode == ListenerMode::TlsPassthrough {
+                            let http_fields: [(bool, &'static str); 3] = [
+                                (route.host.is_some(), "host"),
+                                (route.path_prefix.is_some(), "path_prefix"),
+                                (route.method.is_some(), "method"),
+                            ];
+                            if let Some((_, field)) = http_fields.iter().find(|(set, _)| *set) {
+                                return Err(ConfigError::HttpMatcherOnPassthroughListener {
+                                    listener: listener.address,
+                                    field,
+                                });
+                            }
                         }
                         if let Some(host) = &route.host
                             && !is_valid_host_pattern(host)
@@ -638,6 +684,17 @@ impl Config {
                     reason: "must be at least 1".to_owned(),
                 });
             }
+            if listener.clienthello_timeout_secs == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "listener.clienthello_timeout_secs",
+                    reason: "must be at least 1".to_owned(),
+                });
+            }
+            if listener.mode == ListenerMode::TlsPassthrough && listener.tls.is_some() {
+                return Err(ConfigError::TlsTerminationOnPassthroughListener {
+                    listener: listener.address,
+                });
+            }
 
             if let Some(ref tls) = listener.tls {
                 validate_tls_config(tls)?;
@@ -649,7 +706,7 @@ impl Config {
                 });
             }
 
-            // phase-specific timeouts — must be > 0 if explicitly set
+            // phase-specific timeouts - must be > 0 if explicitly set
             let phase_timeouts: [(Option<u64>, &'static str); 5] = [
                 (
                     listener.client_header_timeout_secs,
@@ -1183,7 +1240,7 @@ mod tests {
 
     #[test]
     fn reject_wildcard_overlaps_regardless_of_declaration_order() {
-        // specific listed first, wildcard second — overlap detection must still fire
+        // specific listed first, wildcard second - overlap detection must still fire
         let file = write_temp_config(
             r#"
             [[listeners]]
@@ -2142,6 +2199,145 @@ mod tests {
         let file = write_temp_config(&content);
         Config::from_file(file.path().to_str().unwrap())
             .expect("SNI route on TLS listener must be allowed");
+    }
+
+    #[test]
+    fn parses_tls_passthrough_mode() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            mode = "tls-passthrough"
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.listeners[0].mode, ListenerMode::TlsPassthrough);
+    }
+
+    #[test]
+    fn clienthello_timeout_defaults_to_10() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            mode = "tls-passthrough"
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.listeners[0].clienthello_timeout_secs, 10);
+    }
+
+    #[test]
+    fn validate_rejects_zero_clienthello_timeout() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            mode = "tls-passthrough"
+            pool = "web"
+            clienthello_timeout_secs = 0
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidValue {
+                    field: "listener.clienthello_timeout_secs",
+                    ..
+                }
+            ),
+            "expected InvalidValue for clienthello_timeout_secs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_tls_section_on_passthrough() {
+        let (_dir, cert_path, key_path) = write_pem_files();
+        let content = format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            mode = "tls-passthrough"
+            pool = "web"
+
+            [[listeners.tls.certificates]]
+            cert = "{}"
+            key = "{}"
+            {}
+            "#,
+            cert_path.display(),
+            key_path.display(),
+            base_pool_toml(),
+        );
+        let file = write_temp_config(&content);
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::TlsTerminationOnPassthroughListener { .. }),
+            "expected TlsTerminationOnPassthroughListener, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_sni_routes_on_passthrough() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            mode = "tls-passthrough"
+
+            [[listeners.routes]]
+            sni = "api.test"
+            pool = "api"
+
+            [[listeners.routes]]
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        Config::from_file(file.path().to_str().unwrap())
+            .expect("SNI routes on tls-passthrough listener must be allowed");
+    }
+
+    #[test]
+    fn validate_rejects_http_matchers_on_passthrough() {
+        for (field_toml, field_name) in [
+            (r#"host = "api.test""#, "host"),
+            (r#"path_prefix = "/api""#, "path_prefix"),
+            (r#"method = "GET""#, "method"),
+        ] {
+            let file = write_temp_config(&format!(
+                r#"
+                [[listeners]]
+                address = "0.0.0.0:8443"
+                mode = "tls-passthrough"
+
+                [[listeners.routes]]
+                {field_toml}
+                pool = "api"
+                {}
+                "#,
+                base_pool_toml()
+            ));
+            let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::HttpMatcherOnPassthroughListener { field, .. }
+                    if field == field_name
+                ),
+                "expected HttpMatcherOnPassthroughListener for '{field_name}', got: {err}"
+            );
+        }
     }
 
     #[test]

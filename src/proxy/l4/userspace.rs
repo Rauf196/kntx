@@ -36,7 +36,7 @@ pub async fn forward(
 
 /// forward a TLS client stream to a plain TCP backend using pooled userspace buffers.
 ///
-/// splice is impossible after TLS termination — decrypted bytes live in userspace.
+/// splice is impossible after TLS termination - decrypted bytes live in userspace.
 /// this function always uses userspace copy regardless of configured strategy.
 pub async fn forward_tls(
     client: tokio_rustls::server::TlsStream<TcpStream>,

@@ -1,5 +1,5 @@
 //! Minimal HTTP/1.x client that holds one TCP connection open across multiple
-//! sequential requests — the instrument for exercising the proxy's client
+//! sequential requests - the instrument for exercising the proxy's client
 //! keep-alive loop. Deliberately hand-rolled: a forgiving client (reqwest or
 //! hyper) would paper over the framing bugs these tests are meant to catch.
 
@@ -80,7 +80,7 @@ impl KeepAliveClient {
         self.stream.write_all(raw).await
     }
 
-    /// Half-close the write side (FIN) — signals "client done sending".
+    /// Half-close the write side (FIN) - signals "client done sending".
     pub async fn shutdown_write(&mut self) -> std::io::Result<()> {
         self.stream.shutdown().await
     }
@@ -157,7 +157,7 @@ impl KeepAliveClient {
             };
             decode_chunked(&self.spill[body_start..end])
         } else {
-            // no CL, no chunked: connection-delimited — read to EOF.
+            // no CL, no chunked: connection-delimited - read to EOF.
             let mut tmp = [0u8; 4096];
             loop {
                 match self.stream.read(&mut tmp).await {

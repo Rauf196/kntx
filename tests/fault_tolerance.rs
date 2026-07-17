@@ -105,7 +105,7 @@ async fn backend_failover_redistributes_traffic() {
     )
     .await;
 
-    // both backends healthy — round-robin works
+    // both backends healthy - round-robin works
     for _ in 0..4 {
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
         stream.write_all(b"ping").await.unwrap();
@@ -114,7 +114,7 @@ async fn backend_failover_redistributes_traffic() {
         assert_eq!(&buf[..n], b"ping");
     }
 
-    // drop b1 — its port is now refusing connections
+    // drop b1 - its port is now refusing connections
     drop(b1);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -128,7 +128,7 @@ async fn backend_failover_redistributes_traffic() {
         assert_eq!(&buf[..n], b"after-drop");
     }
 
-    // circuit should be open now — all connections go directly to b2
+    // circuit should be open now - all connections go directly to b2
     assert_eq!(
         pool.get(0).circuit_state(),
         CircuitState::Open,
@@ -153,7 +153,7 @@ async fn retry_on_connect_failure() {
     let live = EchoServer::start().await;
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
 
-    // dead backend first — round-robin starts there and must retry
+    // dead backend first - round-robin starts there and must retry
     let pool = Arc::new(BackendPool::new(
         "test".into(),
         vec![dead_addr, live.addr],
@@ -181,7 +181,7 @@ async fn all_backends_unhealthy_clean_rejection() {
     let pool = Arc::new(BackendPool::new(
         "test".into(),
         vec![dead1, dead2],
-        10, // high threshold — circuit stays closed, all retries exhausted instead
+        10, // high threshold - circuit stays closed, all retries exhausted instead
         Duration::from_secs(60),
         KeepaliveConfig::default(),
     ));
@@ -232,7 +232,7 @@ async fn timeout_enforcement_gives_clean_eof() {
 }
 
 // (4.10 partial) repeated connect failures open the circuit.
-// after circuit is open, next_backend() returns None — immediate EOF.
+// after circuit is open, next_backend() returns None - immediate EOF.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn circuit_opens_after_connect_failures() {
     let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -258,7 +258,7 @@ async fn circuit_opens_after_connect_failures() {
     for _ in 0..2 {
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
         let mut sink = Vec::new();
-        // read until EOF — proxy gives up after retries and closes the connection
+        // read until EOF - proxy gives up after retries and closes the connection
         let _ = stream.read_to_end(&mut sink).await;
         // brief pause for the proxy task to record the failure before next attempt
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -323,7 +323,7 @@ async fn healthy_backend_serves_after_peer_fails() {
     // dead backend's circuit should be open
     assert_eq!(pool.get(0).circuit_state(), CircuitState::Open);
 
-    // all subsequent connections go directly to live backend — no retries
+    // all subsequent connections go directly to live backend - no retries
     for _ in 0..4 {
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
         stream.write_all(b"direct").await.unwrap();

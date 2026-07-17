@@ -240,8 +240,6 @@ mod tests {
         Box::new(MethodMatcher::new(m).unwrap())
     }
 
-    // --- routing logic ---
-
     #[test]
     fn first_match_wins() {
         let router = ConfigRouter::new(vec![
@@ -256,7 +254,7 @@ mod tests {
 
     #[test]
     fn declaration_order_overrides_specificity() {
-        // catch-all listed first — specific host listed second never wins
+        // catch-all listed first - specific host listed second never wins
         let router = ConfigRouter::new(vec![
             make_entry(vec![], "catch_all"),
             make_entry(vec![host_matcher("api.example.com")], "api"),
@@ -285,8 +283,6 @@ mod tests {
         assert!(router.route(&ctx).is_none());
     }
 
-    // --- derive_route_id ---
-
     #[test]
     fn route_id_single_host() {
         let id = derive_route_id(Some("api.example.com"), None, None, None);
@@ -301,7 +297,7 @@ mod tests {
 
     #[test]
     fn route_id_composite_sorted() {
-        // declared as path+host — must sort to host,path
+        // declared as path+host - must sort to host,path
         let id = derive_route_id(Some("api.example.com"), Some("/v1"), None, None);
         assert_eq!(id.as_ref(), "host=api.example.com,path=/v1");
     }

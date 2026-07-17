@@ -264,7 +264,7 @@ pub fn build_request_additions(
 ///
 /// `close_after_response` is the proxy's client-side keep-alive decision; it
 /// sets the hop-by-hop `Connection` header the proxy emits to the client.
-/// `client_version` is the request version — it picks the HTTP/1.0 mixed-case
+/// `client_version` is the request version - it picks the HTTP/1.0 mixed-case
 /// `Keep-Alive` spelling vs HTTP/1.1 `keep-alive`. The backend response's own
 /// `Connection` header is stripped via the hop-by-hop skip set first.
 pub fn build_response_additions(
@@ -291,7 +291,7 @@ pub fn build_response_additions(
     // `close` is always lowercase regardless of HTTP version. `keep-alive` uses
     // the HTTP/1.0 mixed-case `Keep-Alive` convention (some old middleboxes
     // match case-sensitively) and the HTTP/1.1 lowercase `keep-alive` is
-    // always emitted explicitly — belt-and-suspenders for intermediaries that
+    // always emitted explicitly - belt-and-suspenders for intermediaries that
     // predate the default-keep-alive rule.
     let conn_value: &str = if close_after_response {
         "close"

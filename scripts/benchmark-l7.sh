@@ -2,7 +2,7 @@
 # kntx L7 benchmark.
 # compares kntx L7 (backend pool on / off), kntx L4, and nginx L7 across a
 # couple of HTTP workloads. nginx serves as the static backend. oha is the
-# load generator — open-loop with HDR latency correction for accurate p99.
+# load generator - open-loop with HDR latency correction for accurate p99.
 #
 # requires: cargo, nginx, oha
 #
@@ -93,7 +93,7 @@ stop_backend() {
 write_kntx_l7_config() {
     local file="$1"
     local max_idle="$2"
-    # max_total mirrors max_idle when the cache is on — this caps the number
+    # max_total mirrors max_idle when the cache is on - this caps the number
     # of *active* in-flight conns to the backend, the same envelope nginx's
     # `keepalive 32` enforces. When max_idle is 0 (no cache), leave max_total
     # at 0 (unlimited) so that variant truly represents "open every time".
@@ -108,7 +108,7 @@ write_kntx_l7_config() {
 level = "warn"
 
 [forwarding]
-# one body-forwarding buffer per active client conn — size to the largest
+# one body-forwarding buffer per active client conn - size to the largest
 # concurrency scenario this bench runs (S4 with 10k conns) + headroom.
 buffer_pool_capacity = 12000
 
@@ -218,8 +218,8 @@ cleanup() {
     stop_backend
 }
 
-# warmup pass then measurement pass at the same load shape. closed-loop — no
-# rate target — so the load generator runs at whatever pace the system supports
+# warmup pass then measurement pass at the same load shape. closed-loop - no
+# rate target - so the load generator runs at whatever pace the system supports
 # and percentiles reflect actual observed service time. -u ms locks the unit.
 # latency-correction was tried and dropped: with an aspirational -q target the
 # correction inflates percentiles by tens of seconds of virtual queue wait,
