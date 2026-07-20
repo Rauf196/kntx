@@ -80,6 +80,7 @@ async fn start_l7_proxy_with_limit(backend_addr: SocketAddr, header_limit: usize
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -160,6 +161,7 @@ async fn start_l7_proxy_no_backends() -> L7Proxy {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -258,6 +260,7 @@ async fn start_l7_proxy_tls(backend_addr: SocketAddr) -> L7TlsProxy {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -736,6 +739,7 @@ async fn custom_error_page_served() {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -866,6 +870,7 @@ async fn connect_timeout_returns_504() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -954,6 +959,7 @@ async fn access_log_emits_line() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -1044,6 +1050,7 @@ async fn access_log_trace_id_propagates() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -1244,6 +1251,7 @@ async fn mid_body_backend_failure_records_passive_health() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -1339,6 +1347,7 @@ async fn start_l7_proxy_logged(
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -1417,6 +1426,7 @@ async fn start_l7_proxy_no_backends_logged(
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -1580,6 +1590,7 @@ async fn access_log_request_id_round_trips() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),

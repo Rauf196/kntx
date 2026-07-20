@@ -68,6 +68,7 @@ fn make_pool(name: &str, addr: SocketAddr) -> PoolHandle {
 
 fn sni_route(pattern: &str, handle: PoolHandle) -> RouteEntry {
     RouteEntry {
+        rate_limit: None,
         matcher: CompositeMatcher::new(vec![
             Box::new(SniMatcher::new(pattern).unwrap()) as Box<dyn Matcher + Send + Sync>
         ]),
@@ -78,6 +79,7 @@ fn sni_route(pattern: &str, handle: PoolHandle) -> RouteEntry {
 
 fn catch_all(handle: PoolHandle) -> RouteEntry {
     RouteEntry {
+        rate_limit: None,
         matcher: CompositeMatcher::new(vec![]),
         pool: handle,
         route_id: Arc::from("default"),
@@ -116,6 +118,7 @@ async fn start_passthrough_proxy(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy,
         resources: test_resources(),
         max_connections: None,

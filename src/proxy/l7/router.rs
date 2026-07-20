@@ -8,6 +8,7 @@ use crate::proxy::l7::matcher::{
     CompositeMatcher, HostMatcher, Matcher, MatcherBuildError, MethodMatcher, PathPrefixMatcher,
     RouteContext, SniMatcher,
 };
+use crate::rate_limit::{ZoneHandle, ZoneLimiter};
 
 /// resolved pool target returned by a route match.
 #[derive(Clone)]
@@ -22,6 +23,8 @@ pub struct RouteEntry {
     pub pool: PoolHandle,
     /// auto-derived at config load; never re-computed per request.
     pub route_id: Arc<str>,
+    /// per-request zone check after this route matches; l7 listeners only.
+    pub rate_limit: Option<ZoneHandle>,
 }
 
 pub trait Router: Send + Sync {
@@ -48,6 +51,8 @@ impl Router for ConfigRouter {
 pub enum RouterBuildError {
     #[error("route on listener {listener} references unknown pool '{pool}'")]
     UnknownPool { listener: String, pool: String },
+    #[error("route on listener {listener} references unknown rate limit zone '{zone}'")]
+    UnknownZone { listener: String, zone: String },
     #[error("invalid host pattern '{pattern}': {reason}")]
     InvalidHostPattern { pattern: String, reason: String },
     #[error("invalid path prefix '{prefix}': {reason}")]
@@ -114,6 +119,7 @@ pub fn derive_route_id(
 pub fn build_router(
     listener: &ListenerConfig,
     pool_map: &HashMap<String, (Arc<BackendPool>, Arc<RoundRobin>)>,
+    zones: &HashMap<String, Arc<ZoneLimiter>>,
 ) -> Result<ConfigRouter, RouterBuildError> {
     if let Some(pool_name) = &listener.pool {
         let (backends, rr) =
@@ -128,10 +134,12 @@ pub fn build_router(
             rr: rr.clone(),
             name: Arc::from(pool_name.as_str()),
         };
+        // the listener-level zone is enforced at accept, never on the route
         return Ok(ConfigRouter::new(vec![RouteEntry {
             matcher: CompositeMatcher::new(vec![]),
             pool: handle,
             route_id: Arc::from("default"),
+            rate_limit: None,
         }]));
     }
 
@@ -168,10 +176,27 @@ pub fn build_router(
             route_cfg.method.as_deref(),
             route_cfg.sni.as_deref(),
         );
+        let rate_limit = route_cfg
+            .rate_limit
+            .as_ref()
+            .map(|zone| {
+                zones
+                    .get(zone)
+                    .map(|limiter| ZoneHandle {
+                        name: Arc::from(zone.as_str()),
+                        limiter: Arc::clone(limiter),
+                    })
+                    .ok_or_else(|| RouterBuildError::UnknownZone {
+                        listener: listener.address.to_string(),
+                        zone: zone.clone(),
+                    })
+            })
+            .transpose()?;
         entries.push(RouteEntry {
             matcher: CompositeMatcher::new(matchers),
             pool: handle,
             route_id,
+            rate_limit,
         });
     }
     Ok(ConfigRouter::new(entries))
@@ -225,6 +250,7 @@ mod tests {
             matcher: CompositeMatcher::new(matchers),
             pool: make_pool_handle(pool_name),
             route_id: Arc::from(pool_name),
+            rate_limit: None,
         }
     }
 

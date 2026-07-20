@@ -58,6 +58,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
 
 fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
     ServeConfig {
+        rate_limit: None,
         strategy,
         resources: test_resources(),
         max_connections: None,

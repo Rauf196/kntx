@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,9 @@ use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
 use kntx::proxy::l7::router::{Router, build_router};
+use kntx::rate_limit::{
+    KeyedLimiter, Limiter, MonotonicClock, Period, Rate, ZoneHandle, ZoneLimiter,
+};
 
 #[derive(Parser)]
 #[command(name = "kntx", version, about = "High-performance L4/L7 reverse proxy")]
@@ -208,6 +212,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         pool_map.insert(pool_cfg.name.clone(), (pool, balancer));
     }
 
+    // one limiter per rate limit zone; every listener and route referencing
+    // the zone name shares the instance, so shared name = shared budget
+    let mut rate_limit_zones: HashMap<String, Arc<ZoneLimiter>> = HashMap::new();
+    for (name, zone) in &config.rate_limit.zones {
+        let rate = Rate {
+            count: NonZeroU32::new(zone.rate).expect("validation rejects rate = 0"),
+            period: match zone.per {
+                config::RatePeriod::Second => Period::Second,
+                config::RatePeriod::Minute => Period::Minute,
+            },
+        };
+        let limiter = match zone.key {
+            config::ZoneKey::Global => {
+                ZoneLimiter::Global(Limiter::new(rate, zone.burst, MonotonicClock::new()))
+            }
+            config::ZoneKey::ClientIp => {
+                let requested = zone.max_keys.unwrap_or(config::DEFAULT_ZONE_MAX_KEYS);
+                let keyed = KeyedLimiter::new(rate, zone.burst, requested, MonotonicClock::new());
+                if keyed.capacity() != requested as usize {
+                    tracing::info!(
+                        zone = %name,
+                        requested,
+                        effective = keyed.capacity(),
+                        "rate limit zone max_keys rounded up to a power-of-two set count",
+                    );
+                }
+                ZoneLimiter::PerIp(keyed)
+            }
+        };
+        rate_limit_zones.insert(name.clone(), Arc::new(limiter));
+    }
+
     // pre-bind every listener and build TLS acceptors. fail fast on bind / cert errors
     // BEFORE spawning any background task - avoids transient checkers / metrics noise on startup failure.
     let mut prepared: Vec<(
@@ -261,8 +297,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut task_addrs: HashMap<tokio::task::Id, SocketAddr> = HashMap::new();
     for (idx, tcp_listener, tls_acceptor) in prepared {
         let listener_cfg = &config.listeners[idx];
-        let router: Arc<dyn Router> =
-            Arc::new(build_router(listener_cfg, &pool_map).expect("pool refs validated"));
+        let router: Arc<dyn Router> = Arc::new(
+            build_router(listener_cfg, &pool_map, &rate_limit_zones)
+                .expect("pool and zone refs validated"),
+        );
 
         if let Some(ref tls_cfg) = listener_cfg.tls {
             tracing::info!(
@@ -301,6 +339,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             error_pages: Arc::clone(&error_pages),
             access_log: Arc::clone(&access_log),
             buffer_pool: Arc::new(resources.buffer_pool.clone()),
+            rate_limit: listener_cfg.rate_limit.as_ref().map(|name| {
+                let limiter = rate_limit_zones.get(name).expect("zone refs validated");
+                ZoneHandle {
+                    name: name.as_str().into(),
+                    limiter: Arc::clone(limiter),
+                }
+            }),
         };
 
         tracing::info!(

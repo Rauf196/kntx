@@ -84,6 +84,7 @@ async fn start_proxy(backend_addr: SocketAddr, opts: ProxyOpts) -> Proxy {
         request_timeout_secs: None,
         max_body_size_bytes: None,
         clienthello_timeout_secs: 10,
+        rate_limit: None,
     });
 
     let buffer_pool = Arc::new(opts.buffer_pool.unwrap_or_else(BufferPool::with_defaults));
@@ -103,6 +104,7 @@ async fn start_proxy(backend_addr: SocketAddr, opts: ProxyOpts) -> Proxy {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),

@@ -53,6 +53,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
 
 fn test_serve_config() -> ServeConfig {
     ServeConfig {
+        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -136,6 +137,7 @@ async fn start_tls_proxy(
     let rr = Arc::new(RoundRobin::new(pool.clone()));
     let router = make_single_pool_router(pool, rr);
     let config = ServeConfig {
+        rate_limit: None,
         tls_acceptor: Some(acceptor),
         ..test_serve_config()
     };
@@ -240,6 +242,7 @@ async fn tls_handshake_timeout() {
     let pool = test_pool(&[backend.addr]);
     let router = make_single_pool_router(pool.clone(), Arc::new(RoundRobin::new(pool)));
     let config = ServeConfig {
+        rate_limit: None,
         tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(1),
         ..test_serve_config()
@@ -315,6 +318,7 @@ async fn tls_splice_strategy_fallback() {
     let pool = test_pool(&[backend.addr]);
     let router = make_single_pool_router(pool.clone(), Arc::new(RoundRobin::new(pool)));
     let config = ServeConfig {
+        rate_limit: None,
         strategy: ForwardingStrategy::Splice, // splice configured, but TLS forces userspace
         tls_acceptor: Some(acceptor),
         ..test_serve_config()
@@ -367,6 +371,7 @@ async fn tls_sni_multi_cert() {
     let pool = test_pool(&[backend.addr]);
     let router = make_single_pool_router(pool.clone(), Arc::new(RoundRobin::new(pool)));
     let config = ServeConfig {
+        rate_limit: None,
         tls_acceptor: Some(acceptor),
         ..test_serve_config()
     };
@@ -465,6 +470,7 @@ async fn tls_idle_timeout() {
     let pool = test_pool(&[backend.addr]);
     let router = make_single_pool_router(pool.clone(), Arc::new(RoundRobin::new(pool)));
     let config = ServeConfig {
+        rate_limit: None,
         idle_timeout: Some(Duration::from_secs(1)),
         tls_acceptor: Some(acceptor),
         ..test_serve_config()
@@ -503,6 +509,7 @@ async fn tls_graceful_shutdown() {
     let pool = test_pool(&[backend.addr]);
     let router = make_single_pool_router(pool.clone(), Arc::new(RoundRobin::new(pool)));
     let config = ServeConfig {
+        rate_limit: None,
         tls_acceptor: Some(acceptor),
         ..test_serve_config()
     };

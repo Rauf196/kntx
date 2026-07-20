@@ -60,6 +60,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
 
 fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
     ServeConfig {
+        rate_limit: None,
         strategy,
         resources: test_resources(),
         max_connections: None,
@@ -109,6 +110,7 @@ async fn pool_exhaustion_degrades_gracefully() {
     let backend = EchoServer::start().await;
 
     let config = ServeConfig {
+        rate_limit: None,
         resources: Resources {
             buffer_pool: BufferPool::new(4, 64 * 1024),
             #[cfg(target_os = "linux")]

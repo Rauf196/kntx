@@ -64,6 +64,7 @@ fn route(
     route_id: &str,
 ) -> RouteEntry {
     RouteEntry {
+        rate_limit: None,
         matcher: CompositeMatcher::new(matchers),
         pool: handle,
         route_id: Arc::from(route_id),
@@ -106,6 +107,7 @@ async fn start_routing_proxy(router: Arc<dyn Router>) -> RoutingProxy {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -483,6 +485,7 @@ async fn route_id_in_access_log() {
     );
 
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -814,6 +817,7 @@ async fn start_tls_l7_proxy(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -868,6 +872,7 @@ async fn start_tls_l4_proxy(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,

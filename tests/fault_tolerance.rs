@@ -48,6 +48,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
 
 fn test_serve_config() -> ServeConfig {
     ServeConfig {
+        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -98,6 +99,7 @@ async fn backend_failover_redistributes_traffic() {
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
+            rate_limit: None,
             connect_timeout: Duration::from_secs(5),
             max_connect_attempts: 3,
             ..test_serve_config()
@@ -189,6 +191,7 @@ async fn all_backends_unhealthy_clean_rejection() {
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
+            rate_limit: None,
             max_connect_attempts: 2, // 2 attempts total, one per backend
             ..test_serve_config()
         },
@@ -218,6 +221,7 @@ async fn timeout_enforcement_gives_clean_eof() {
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
+            rate_limit: None,
             connect_timeout: Duration::from_secs(5),
             max_connect_attempts: 1,
             ..test_serve_config()
@@ -248,6 +252,7 @@ async fn circuit_opens_after_connect_failures() {
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
+            rate_limit: None,
             max_connect_attempts: 1,
             ..test_serve_config()
         },
@@ -304,6 +309,7 @@ async fn healthy_backend_serves_after_peer_fails() {
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
+            rate_limit: None,
             max_connect_attempts: 3,
             ..test_serve_config()
         },

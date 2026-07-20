@@ -18,6 +18,9 @@ pub struct RouteConfig {
     #[serde(default)]
     pub sni: Option<String>,
     pub pool: String,
+    /// rate limit zone enforced per request after this route matches. l7 only.
+    #[serde(default)]
+    pub rate_limit: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -124,6 +127,27 @@ pub enum ConfigError {
 
     #[error("error page file not found for status {status}: '{path}'")]
     ErrorPageFileNotFound { status: String, path: PathBuf },
+
+    #[error("rate limit zone '{zone}': rate must be >= 1")]
+    RateLimitZeroRate { zone: String },
+
+    #[error("rate limit zone '{zone}': max_keys only applies to client_ip zones, not global")]
+    RateLimitMaxKeysOnGlobalZone { zone: String },
+
+    #[error("rate limit zone '{zone}': max_keys must be >= 4 (one 4-way set)")]
+    RateLimitMaxKeysTooSmall { zone: String },
+
+    #[error("listener {listener} references unknown rate limit zone '{zone}'")]
+    UnknownRateLimitZone { listener: SocketAddr, zone: String },
+
+    #[error("route on listener {listener} references unknown rate limit zone '{zone}'")]
+    UnknownRouteRateLimitZone { listener: SocketAddr, zone: String },
+
+    #[error(
+        "route on listener {listener} sets 'rate_limit' but the listener is not l7 - \
+         route limits are enforced per HTTP request; use the listener-level rate_limit"
+    )]
+    RateLimitOnNonL7Route { listener: SocketAddr },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -178,6 +202,8 @@ pub struct Config {
     pub error_pages: ErrorPagesConfig,
     #[serde(default)]
     pub access_log: AccessLogConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -218,6 +244,8 @@ pub struct ListenerConfig {
     // slowloris bound on the peek phase, like nginx preread_timeout.
     #[serde(default = "default_clienthello_timeout")]
     pub clienthello_timeout_secs: u64,
+    /// rate limit zone enforced per connection at accept, any mode.
+    pub rate_limit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,6 +375,7 @@ impl Default for ListenerConfig {
             keepalive_idle_timeout_secs: None,
             keepalive_max_requests: None,
             clienthello_timeout_secs: default_clienthello_timeout(),
+            rate_limit: None,
         }
     }
 }
@@ -474,6 +503,49 @@ fn default_file_channel_capacity() -> usize {
     4096
 }
 
+/// named rate limit zones, `[rate_limit.zones.<name>]`. a zone is one
+/// limiter instance; every listener and route referencing the name shares
+/// its budget.
+#[derive(Debug, Default, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default)]
+    pub zones: HashMap<String, ZoneConfig>,
+}
+
+pub const DEFAULT_ZONE_MAX_KEYS: u32 = 65536;
+
+#[derive(Debug, Deserialize)]
+pub struct ZoneConfig {
+    pub key: ZoneKey,
+    /// admitted events per `per`, sustained. must be >= 1.
+    pub rate: u32,
+    #[serde(default)]
+    pub per: RatePeriod,
+    /// events admitted back to back beyond the paced one; 0 = strict pacing.
+    #[serde(default)]
+    pub burst: u32,
+    /// client_ip zones only: state capacity, rounded up to a power-of-two
+    /// set count at startup. None = 65536 (~1 MiB).
+    pub max_keys: Option<u32>,
+}
+
+/// what a zone counts: one budget per client IP, or one shared budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoneKey {
+    ClientIp,
+    Global,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum RatePeriod {
+    #[default]
+    #[serde(rename = "s")]
+    Second,
+    #[serde(rename = "m")]
+    Minute,
+}
+
 impl Config {
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
         let content =
@@ -547,8 +619,32 @@ impl Config {
             }
         }
 
+        // rate limit zone definitions
+        for (name, zone) in &self.rate_limit.zones {
+            if zone.rate == 0 {
+                return Err(ConfigError::RateLimitZeroRate { zone: name.clone() });
+            }
+            match (zone.key, zone.max_keys) {
+                (ZoneKey::Global, Some(_)) => {
+                    return Err(ConfigError::RateLimitMaxKeysOnGlobalZone { zone: name.clone() });
+                }
+                (ZoneKey::ClientIp, Some(max_keys)) if max_keys < 4 => {
+                    return Err(ConfigError::RateLimitMaxKeysTooSmall { zone: name.clone() });
+                }
+                _ => {}
+            }
+        }
+
         // listener routing: exactly one of pool or routes, validated per listener
         for listener in &self.listeners {
+            if let Some(zone) = &listener.rate_limit
+                && !self.rate_limit.zones.contains_key(zone)
+            {
+                return Err(ConfigError::UnknownRateLimitZone {
+                    listener: listener.address,
+                    zone: zone.clone(),
+                });
+            }
             match (&listener.pool, listener.routes.is_empty()) {
                 (Some(_), false) => {
                     return Err(ConfigError::ListenerHasBothPoolAndRoutes {
@@ -582,6 +678,21 @@ impl Config {
                                 listener: listener.address,
                                 pool: route.pool.clone(),
                             });
+                        }
+                        if let Some(zone) = &route.rate_limit {
+                            if !self.rate_limit.zones.contains_key(zone) {
+                                return Err(ConfigError::UnknownRouteRateLimitZone {
+                                    listener: listener.address,
+                                    zone: zone.clone(),
+                                });
+                            }
+                            // the route hook lives in the L7 request path;
+                            // anywhere else the field would be silently dead
+                            if listener.mode != ListenerMode::L7 {
+                                return Err(ConfigError::RateLimitOnNonL7Route {
+                                    listener: listener.address,
+                                });
+                            }
                         }
                         // sni needs either TLS termination (rustls extracts it) or
                         // passthrough mode (the ClientHello peek extracts it)
@@ -1016,6 +1127,290 @@ mod tests {
         assert_eq!(config.pools.len(), 1);
         assert_eq!(config.pools[0].name, "web");
         assert_eq!(config.pools[0].backends.len(), 1);
+    }
+
+    #[test]
+    fn parse_rate_limit_zones_with_defaults() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+            rate_limit = "per_ip"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+
+            [rate_limit.zones.per_ip]
+            key = "client_ip"
+            rate = 100
+
+            [rate_limit.zones.api_global]
+            key = "global"
+            rate = 50
+            per = "m"
+            burst = 20
+            "#,
+        );
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.listeners[0].rate_limit.as_deref(), Some("per_ip"));
+
+        let per_ip = &config.rate_limit.zones["per_ip"];
+        assert_eq!(per_ip.key, ZoneKey::ClientIp);
+        assert_eq!(per_ip.rate, 100);
+        assert_eq!(per_ip.per, RatePeriod::Second);
+        assert_eq!(per_ip.burst, 0);
+        assert_eq!(per_ip.max_keys, None);
+
+        let global = &config.rate_limit.zones["api_global"];
+        assert_eq!(global.key, ZoneKey::Global);
+        assert_eq!(global.per, RatePeriod::Minute);
+        assert_eq!(global.burst, 20);
+    }
+
+    #[test]
+    fn parse_route_rate_limit_on_l7_listener() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            path_prefix = "/login"
+            pool = "web"
+            rate_limit = "login"
+
+            [[listeners.routes]]
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+
+            [rate_limit.zones.login]
+            key = "client_ip"
+            rate = 5
+            max_keys = 4096
+            "#,
+        );
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            config.listeners[0].routes[0].rate_limit.as_deref(),
+            Some("login")
+        );
+        assert_eq!(config.listeners[0].routes[1].rate_limit, None);
+        assert_eq!(config.rate_limit.zones["login"].max_keys, Some(4096));
+    }
+
+    #[test]
+    fn rate_limit_zone_zero_rate_rejected() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+
+            [rate_limit.zones.bad]
+            key = "global"
+            rate = 0
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::RateLimitZeroRate { zone } if zone == "bad"));
+    }
+
+    #[test]
+    fn rate_limit_max_keys_on_global_zone_rejected() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+
+            [rate_limit.zones.bad]
+            key = "global"
+            rate = 10
+            max_keys = 1024
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::RateLimitMaxKeysOnGlobalZone { zone } if zone == "bad"));
+    }
+
+    #[test]
+    fn rate_limit_max_keys_boundary() {
+        // 3 is below one 4-way set; 4 is the minimum valid value
+        for (max_keys, ok) in [(3, false), (4, true)] {
+            let file = write_temp_config(&format!(
+                r#"
+                [[listeners]]
+                address = "0.0.0.0:8080"
+                pool = "web"
+
+                [[pools]]
+                name = "web"
+
+                [[pools.backends]]
+                address = "127.0.0.1:3001"
+
+                [rate_limit.zones.z]
+                key = "client_ip"
+                rate = 10
+                max_keys = {max_keys}
+                "#
+            ));
+            let result = Config::from_file(file.path().to_str().unwrap());
+            match (ok, result) {
+                (true, Ok(_)) => {}
+                (false, Err(ConfigError::RateLimitMaxKeysTooSmall { zone })) => {
+                    assert_eq!(zone, "z");
+                }
+                (_, other) => panic!("max_keys = {max_keys}: unexpected result {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn listener_unknown_rate_limit_zone_rejected() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+            rate_limit = "missing"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownRateLimitZone { zone, .. } if zone == "missing"));
+    }
+
+    #[test]
+    fn route_unknown_rate_limit_zone_rejected() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            mode = "l7"
+
+            [[listeners.routes]]
+            pool = "web"
+            rate_limit = "missing"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UnknownRouteRateLimitZone { zone, .. } if zone == "missing")
+        );
+    }
+
+    #[test]
+    fn route_rate_limit_on_non_l7_listener_rejected() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            mode = "tls-passthrough"
+
+            [[listeners.routes]]
+            sni = "a.test"
+            pool = "web"
+            rate_limit = "per_ip"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+
+            [rate_limit.zones.per_ip]
+            key = "client_ip"
+            rate = 10
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::RateLimitOnNonL7Route { .. }));
+    }
+
+    #[test]
+    fn rate_limit_invalid_per_rejected() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+
+            [rate_limit.zones.z]
+            key = "client_ip"
+            rate = 10
+            per = "h"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn rate_limit_duplicate_zone_name_rejected() {
+        // toml itself rejects a table defined twice; guard the assumption
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+
+            [rate_limit.zones.z]
+            key = "client_ip"
+            rate = 10
+
+            [rate_limit.zones.z]
+            key = "global"
+            rate = 20
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }));
     }
 
     #[test]

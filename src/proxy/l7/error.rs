@@ -55,6 +55,7 @@ pub fn reason_phrase(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         413 => "Content Too Large",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -69,11 +70,36 @@ pub fn reason_phrase(status: u16) -> &'static str {
 /// if a custom page exists for this status, use it.
 /// otherwise content-negotiate on `accept`.
 pub fn synthesize_error(status: u16, accept: Option<&str>, pages: &ErrorPages) -> Bytes {
+    build_error(status, accept, pages, "")
+}
+
+/// rate-limit variant: same synthesis plus a `Retry-After` header in
+/// delta-seconds form (RFC 9110).
+pub fn synthesize_error_retry_after(
+    status: u16,
+    accept: Option<&str>,
+    pages: &ErrorPages,
+    retry_after_secs: u64,
+) -> Bytes {
+    build_error(
+        status,
+        accept,
+        pages,
+        &format!("Retry-After: {retry_after_secs}\r\n"),
+    )
+}
+
+fn build_error(
+    status: u16,
+    accept: Option<&str>,
+    pages: &ErrorPages,
+    extra_headers: &str,
+) -> Bytes {
     let reason = reason_phrase(status);
 
     if let Some((body, content_type)) = pages.get(status) {
         let head = format!(
-            "HTTP/1.1 {status} {reason}\r\nServer: kntx\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nServer: kntx\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n",
             body.len()
         );
         let mut out = head.into_bytes();
@@ -100,7 +126,7 @@ pub fn synthesize_error(status: u16, accept: Option<&str>, pages: &ErrorPages) -
     };
 
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nServer: kntx\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nServer: kntx\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
         body.len()
     );
     Bytes::from(response)

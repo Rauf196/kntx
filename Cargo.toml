@@ -49,6 +49,11 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 rcgen = "0.13"
+criterion = "0.7"
+
+[[bench]]
+name = "rate_limit"
+harness = false
 
 [profile.release]
 lto = true

@@ -21,9 +21,10 @@ use crate::proxy::l7::router::Router;
 use crate::proxy::l7::websocket::{
     WsDetect, bidirectional_copy_with_timeout, is_websocket_upgrade,
 };
+use crate::rate_limit::Decision;
 use crate::util::monotonic_millis;
 
-use super::error::{ErrorPages, synthesize_error};
+use super::error::{ErrorPages, synthesize_error, synthesize_error_retry_after};
 use super::framing::{BodyFraming, ChunkedReader, classify_request_body, classify_response_body};
 use super::headers::{
     build_request_additions, build_response_additions, resolve_request_id, serialize_request_head,
@@ -917,6 +918,44 @@ where
         "route_id" => route_id.to_string(),
     )
     .increment(1);
+
+    // route zone check sits post-route, pre-backend: a denied request must
+    // never touch the pool or consume a checkout permit
+    if let Some(ref rl) = entry.rate_limit
+        && let Decision::Deny { retry_after } = rl.limiter.check(client_addr.ip())
+    {
+        metrics::counter!(
+            "kntx_rate_limit_rejected_total",
+            "listener" => listener_label.to_string(),
+            "zone" => rl.name.to_string(),
+            "scope" => "route",
+        )
+        .increment(1);
+        // ceil to whole seconds with a floor of 1: sub-second waits must
+        // not round down to "retry immediately"
+        let retry_secs = (retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0)).max(1);
+        let resp = synthesize_error_retry_after(429, accept_ref, error_pages, retry_secs);
+        let _ = client_wr.write_all(&resp).await;
+        emit_and_count(
+            access_log,
+            listener_label,
+            &client_ip,
+            &method,
+            &req.headers,
+            &path,
+            &pool_name,
+            None,
+            429,
+            0,
+            0,
+            start,
+            None,
+            Some(request_id.clone()),
+            Some(&route_id),
+            keepalive_index,
+        );
+        return CycleOutcome::Done { close: true };
+    }
 
     // build the rewritten request head once - the result is independent of which
     // backend we land on, so we serialize before backend selection and reuse the

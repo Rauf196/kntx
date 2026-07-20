@@ -164,3 +164,36 @@ backends = [
 max_idle          = 32     # idle conns held per backend; 0 disables the cache entirely
 idle_conn_ttl_secs = 60    # idle conn dropped from the cache after this many seconds
 max_total          = 0     # cap on total conns (active + idle) per backend; 0 = unlimited
+
+# -------- rate limiting --------
+# named zones, each one limiter with one budget shape. attach a zone by name
+# to a listener (any mode, checked per connection at accept, denied conns are
+# reset) or to an L7 route (checked per request after routing, denied requests
+# get 429 + Retry-After). every site naming the same zone shares its budget.
+#
+# [rate_limit.zones.per_ip]
+# key = "client_ip"    # one budget per client IP; "global" = one shared budget
+# rate = 100           # admitted events per period, sustained
+# per = "s"            # "s" (default) or "m"
+# burst = 20           # extra events admitted back to back; 0 = strict pacing
+# max_keys = 65536     # client_ip zones only: state capacity (~1 MiB at the
+#                      # default; rounds up to a power-of-two set count).
+#                      # excess keys evict the least recently admitted key in
+#                      # their cache set, memory never grows.
+#
+# [rate_limit.zones.api_global]
+# key = "global"
+# rate = 500
+# per = "s"
+#
+# per-listener attachment (protects the accept path):
+# [[listeners]]
+# address = "0.0.0.0:8080"
+# pool = "web"
+# rate_limit = "per_ip"
+#
+# per-route attachment (l7 listeners only; protects a specific route):
+# [[listeners.routes]]
+# path_prefix = "/login"
+# pool = "api"
+# rate_limit = "per_ip"

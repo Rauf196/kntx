@@ -16,6 +16,7 @@ use crate::proxy::l4::{self, Resources};
 use crate::proxy::l7::matcher::RouteContext;
 use crate::proxy::l7::router::Router;
 use crate::proxy::l7::{self, ClientStream, ErrorPages};
+use crate::rate_limit::{Decision, ZoneHandle};
 use crate::tls::passthrough;
 use crate::util::monotonic_millis;
 
@@ -44,6 +45,7 @@ pub struct ServeConfig {
     pub error_pages: Arc<ErrorPages>,
     pub access_log: Arc<AccessLogSink>,
     pub buffer_pool: Arc<BufferPool>,
+    pub rate_limit: Option<ZoneHandle>,
 }
 
 enum ClientConn {
@@ -103,6 +105,34 @@ pub async fn serve(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((client, peer)) => 'accept: {
+                        // before the max_connections permit (a rejected conn must
+                        // not consume a slot) and before any socket or TLS work
+                        if let Some(ref rl) = config.rate_limit
+                            && let Decision::Deny { .. } = rl.limiter.check(peer.ip())
+                        {
+                            // linger 0 turns the close into an RST: no proxy-side
+                            // TIME_WAIT buildup under flood, and the client hears
+                            // the refusal immediately instead of a silent FIN.
+                            // non-linux keeps the plain close.
+                            #[cfg(target_os = "linux")]
+                            {
+                                use std::os::fd::AsRawFd;
+                                if let Err(e) = crate::util::set_linger_rst(client.as_raw_fd()) {
+                                    tracing::debug!(%peer, error = %e, "failed to set linger on rate limited conn");
+                                }
+                            }
+                            drop(client);
+                            tracing::debug!(%peer, zone = %rl.name, "connection rate limited");
+                            metrics::counter!(
+                                "kntx_rate_limit_rejected_total",
+                                "listener" => listener_label.to_string(),
+                                "zone" => rl.name.to_string(),
+                                "scope" => "listener",
+                            )
+                            .increment(1);
+                            break 'accept;
+                        }
+
                         if let Err(e) = client.set_nodelay(true) {
                             tracing::warn!(%peer, error = %e, "failed to set tcp_nodelay");
                         }

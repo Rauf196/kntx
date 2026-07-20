@@ -101,6 +101,7 @@ async fn start_proxy_pool(
         request_timeout_secs: opts.request_timeout_secs,
         max_body_size_bytes: opts.max_body_size_bytes,
         clienthello_timeout_secs: 10,
+        rate_limit: None,
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());
@@ -120,6 +121,7 @@ async fn start_proxy_pool(
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -2115,6 +2117,7 @@ async fn start_proxy_tls(backend_addr: SocketAddr) -> TlsProxy {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
+        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),

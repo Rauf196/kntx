@@ -61,6 +61,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
 
 fn serve_config(label: &str) -> ServeConfig {
     ServeConfig {
+        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -232,6 +233,7 @@ async fn shutdown_drains_all_listeners_independently() {
         tcp_l1,
         router1,
         ServeConfig {
+            rate_limit: None,
             drain_timeout: Duration::from_secs(5),
             ..serve_config("l1")
         },
@@ -241,6 +243,7 @@ async fn shutdown_drains_all_listeners_independently() {
         tcp_l2,
         router2,
         ServeConfig {
+            rate_limit: None,
             drain_timeout: Duration::from_secs(5),
             ..serve_config("l2")
         },
@@ -300,6 +303,7 @@ async fn pool_shared_l4_l7_listener() {
     let l4_addr = l4_tcp.local_addr().unwrap();
     let (l4_shutdown_tx, l4_shutdown_rx) = tokio::sync::watch::channel(());
     let l4_cfg = ServeConfig {
+        rate_limit: None,
         listener_cfg: Arc::new(ListenerConfig {
             address: l4_addr,
             mode: ListenerMode::L4,
@@ -323,6 +327,7 @@ async fn pool_shared_l4_l7_listener() {
     let l7_addr = l7_tcp.local_addr().unwrap();
     let (l7_shutdown_tx, l7_shutdown_rx) = tokio::sync::watch::channel(());
     let l7_cfg = ServeConfig {
+        rate_limit: None,
         listener_cfg: Arc::new(ListenerConfig {
             address: l7_addr,
             mode: ListenerMode::L7,

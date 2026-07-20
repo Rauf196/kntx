@@ -27,6 +27,7 @@ pub fn make_single_pool_router(pool: Arc<BackendPool>, rr: Arc<RoundRobin>) -> A
         rr,
     };
     let entry = RouteEntry {
+        rate_limit: None,
         matcher: CompositeMatcher::new(vec![]),
         pool: handle,
         route_id: Arc::from("default"),

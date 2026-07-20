@@ -166,6 +166,10 @@ pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         "kntx_websocket_tunnels_total",
         "WebSocket tunnels opened (labels: listener)."
     );
+    describe_counter!(
+        "kntx_rate_limit_rejected_total",
+        "Connections or requests rejected by a rate limit zone (labels: listener, zone, scope=listener|route)."
+    );
 
     Ok(())
 }

@@ -58,6 +58,7 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
 
 fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
     ServeConfig {
+        rate_limit: None,
         strategy,
         resources: test_resources(),
         max_connections: None,
@@ -135,6 +136,7 @@ async fn idle_timeout_closes_connection() {
     let backend = EchoServer::start().await;
 
     let config = ServeConfig {
+        rate_limit: None,
         idle_timeout: Some(Duration::from_secs(1)),
         ..test_serve_config(ForwardingStrategy::Userspace)
     };
@@ -159,6 +161,7 @@ async fn max_connections_rejects_excess() {
     let backend = EchoServer::start().await;
 
     let config = ServeConfig {
+        rate_limit: None,
         max_connections: Some(2),
         ..test_serve_config(ForwardingStrategy::Userspace)
     };

@@ -15,6 +15,30 @@ pub fn monotonic_millis() -> u64 {
 #[repr(align(64))]
 pub struct CacheLinePadded<T>(pub T);
 
+/// set SO_LINGER with a zero timeout: close() sends an RST instead of a
+/// FIN and discards queued data. zero never blocks the closing thread;
+/// the blocking hazard belongs to nonzero linger values.
+#[cfg(target_os = "linux")]
+pub fn set_linger_rst(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// set SO_RCVBUF and SO_SNDBUF on a raw fd.
 /// on linux, the kernel doubles the value set (for internal bookkeeping)
 /// and enforces a minimum. the actual value may differ from what you set.
