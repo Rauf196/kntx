@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -30,6 +31,28 @@ pub enum ListenerError {
     },
 }
 
+/// the half of a listener's configuration a reload can replace without rebinding
+/// the socket. `serve` reads the cell once per accepted connection, so a
+/// connection routes by the vintage it started with for its whole life,
+/// keep-alive requests included. backend membership underneath stays live.
+pub struct ListenerRuntime {
+    pub router: Arc<dyn Router>,
+    pub listener_cfg: Arc<ListenerConfig>,
+    /// rebuilt from disk on every reload, so a rotated cert is served by the next
+    /// handshake. sessions already established keep the acceptor they started with.
+    pub tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    /// listener-level zone, enforced at accept. swapped per reload so a tightened
+    /// limit takes effect for connections accepted after it; an unchanged zone keeps
+    /// its live limiter across the reload (budget not reset).
+    pub rate_limit: Option<ZoneHandle>,
+}
+
+pub type RuntimeCell = Arc<ArcSwap<ListenerRuntime>>;
+
+/// set once at bind. changing any of these needs a restart, including the
+/// timeouts - they shadow the same fields on `ListenerRuntime.listener_cfg`,
+/// which a reload does replace. move one here into the runtime read path when
+/// there is a reason for it to be live.
 pub struct ServeConfig {
     pub strategy: ForwardingStrategy,
     pub resources: Resources,
@@ -38,14 +61,27 @@ pub struct ServeConfig {
     pub drain_timeout: Duration,
     pub connect_timeout: Duration,
     pub max_connect_attempts: u32,
-    pub tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     pub tls_handshake_timeout: Duration,
     pub listener_label: Arc<str>,
-    pub listener_cfg: Arc<ListenerConfig>,
     pub error_pages: Arc<ErrorPages>,
     pub access_log: Arc<AccessLogSink>,
     pub buffer_pool: Arc<BufferPool>,
-    pub rate_limit: Option<ZoneHandle>,
+}
+
+impl ListenerRuntime {
+    pub fn cell(
+        router: Arc<dyn Router>,
+        listener_cfg: Arc<ListenerConfig>,
+        tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+        rate_limit: Option<ZoneHandle>,
+    ) -> RuntimeCell {
+        Arc::new(ArcSwap::from_pointee(Self {
+            router,
+            listener_cfg,
+            tls_acceptor,
+            rate_limit,
+        }))
+    }
 }
 
 enum ClientConn {
@@ -73,7 +109,7 @@ async fn idle_watchdog(last_activity: &AtomicU64, timeout: Duration) {
 
 pub async fn serve(
     listener: TcpListener,
-    router: Arc<dyn Router>,
+    runtime: RuntimeCell,
     config: ServeConfig,
     mut shutdown: watch::Receiver<()>,
 ) {
@@ -90,10 +126,8 @@ pub async fn serve(
     let drain_timeout = config.drain_timeout;
     let connect_timeout = config.connect_timeout;
     let max_connect_attempts = config.max_connect_attempts;
-    let tls_acceptor = config.tls_acceptor;
     let tls_handshake_timeout = config.tls_handshake_timeout;
     let listener_label = config.listener_label.clone();
-    let listener_cfg = config.listener_cfg.clone();
     let error_pages = config.error_pages.clone();
     let access_log = config.access_log.clone();
     let buffer_pool = config.buffer_pool.clone();
@@ -105,9 +139,15 @@ pub async fn serve(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((client, peer)) => 'accept: {
+                        // pin the routing vintage for this connection's whole life,
+                        // keep-alive requests included. a reload swaps the cell for
+                        // connections accepted after it; the rate-limit zone rides on
+                        // the same pinned runtime.
+                        let rt = runtime.load_full();
+
                         // before the max_connections permit (a rejected conn must
                         // not consume a slot) and before any socket or TLS work
-                        if let Some(ref rl) = config.rate_limit
+                        if let Some(ref rl) = rt.rate_limit
                             && let Decision::Deny { .. } = rl.limiter.check(peer.ip())
                         {
                             // linger 0 turns the close into an RST: no proxy-side
@@ -173,11 +213,8 @@ pub async fn serve(
                         )
                         .increment(1.0);
 
-                        let router = Arc::clone(&router);
                         let resources = config.resources.clone();
-                        let tls_acceptor = tls_acceptor.clone();
                         let listener_label = listener_label.clone();
-                        let listener_cfg = listener_cfg.clone();
                         let error_pages = error_pages.clone();
                         let access_log = access_log.clone();
                         let buffer_pool = buffer_pool.clone();
@@ -190,7 +227,7 @@ pub async fn serve(
 
                             // peeked is Some only for tls-passthrough: ClientHello bytes the
                             // client already sent, which must reach the backend first.
-                            let (client_conn, conn_sni, peeked) = if listener_cfg.mode
+                            let (client_conn, conn_sni, peeked) = if rt.listener_cfg.mode
                                 == ListenerMode::TlsPassthrough
                             {
                                 let mut client = client;
@@ -210,7 +247,7 @@ pub async fn serve(
                                     return;
                                 };
                                 let clienthello_timeout =
-                                    Duration::from_secs(listener_cfg.clienthello_timeout_secs);
+                                    Duration::from_secs(rt.listener_cfg.clienthello_timeout_secs);
                                 match tokio::time::timeout(
                                     clienthello_timeout,
                                     passthrough::peek_client_hello(&mut client, &mut peek_buf),
@@ -263,7 +300,7 @@ pub async fn serve(
                                         return;
                                     }
                                 }
-                            } else if let Some(acceptor) = tls_acceptor {
+                            } else if let Some(ref acceptor) = rt.tls_acceptor {
                                 let handshake_start = std::time::Instant::now();
                                 match tokio::time::timeout(
                                     tls_handshake_timeout,
@@ -337,7 +374,7 @@ pub async fn serve(
                             async {
                                 let last_activity = Arc::new(AtomicU64::new(monotonic_millis()));
 
-                                match listener_cfg.mode {
+                                match rt.listener_cfg.mode {
                                     ListenerMode::L7 => {
                                         let l7_stream = match client_conn {
                                             ClientConn::Plain(tcp) => ClientStream::Plain(tcp),
@@ -348,8 +385,8 @@ pub async fn serve(
                                             l7_stream,
                                             peer,
                                             conn_sni.clone(),
-                                            listener_cfg.clone(),
-                                            Arc::clone(&router),
+                                            Arc::clone(&rt.listener_cfg),
+                                            Arc::clone(&rt.router),
                                             Arc::clone(&error_pages),
                                             Arc::clone(&access_log),
                                             Arc::clone(&last_activity),
@@ -385,7 +422,7 @@ pub async fn serve(
                                             sni: conn_sni.as_deref(),
                                             client_ip: peer.ip(),
                                         };
-                                        let l4_entry = match router.route(&l4_ctx) {
+                                        let l4_entry = match rt.router.route(&l4_ctx) {
                                             Some(e) => e,
                                             None => {
                                                 tracing::warn!(%peer, "no route for L4 connection");
@@ -402,7 +439,7 @@ pub async fn serve(
                                                 return;
                                             }
                                         };
-                                        if listener_cfg.mode == ListenerMode::TlsPassthrough {
+                                        if rt.listener_cfg.mode == ListenerMode::TlsPassthrough {
                                             metrics::counter!(
                                                 "kntx_tls_passthrough_connections_total",
                                                 "listener" => listener_label.to_string(),

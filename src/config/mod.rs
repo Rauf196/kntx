@@ -514,7 +514,7 @@ pub struct RateLimitConfig {
 
 pub const DEFAULT_ZONE_MAX_KEYS: u32 = 65536;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ZoneConfig {
     pub key: ZoneKey,
     /// admitted events per `per`, sustained. must be >= 1.
@@ -553,9 +553,14 @@ impl Config {
                 path: path.to_owned(),
                 source,
             })?;
+        Self::from_toml(&content, path)
+    }
 
-        let config: Config = toml::from_str(&content).map_err(|source| ConfigError::Parse {
-            path: path.to_owned(),
+    /// parse + validate config from a TOML string. `label` names the source in
+    /// error messages (a file path, or a marker like "<test>").
+    pub fn from_toml(content: &str, label: &str) -> Result<Self, ConfigError> {
+        let config: Config = toml::from_str(content).map_err(|source| ConfigError::Parse {
+            path: label.to_owned(),
             source,
         })?;
 

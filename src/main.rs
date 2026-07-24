@@ -1,24 +1,20 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::num::NonZeroU32;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use clap::{Parser, ValueEnum};
 use tokio::task::JoinSet;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use kntx::access_log::AccessLogSink;
-use kntx::balancer::RoundRobin;
 use kntx::config;
-use kntx::health::{BackendPool, HealthChecker};
-use kntx::listener::{self, ServeConfig};
+use kntx::listener::{self, ListenerRuntime};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
 use kntx::proxy::l7::router::{Router, build_router};
-use kntx::rate_limit::{
-    KeyedLimiter, Limiter, MonotonicClock, Period, Rate, ZoneHandle, ZoneLimiter,
+use kntx::runtime::{
+    ListenerHandle, ListenerRegistry, ListenerSpawn, PoolTasks, ReloadContext, SharedServe,
 };
 
 #[derive(Parser)]
@@ -178,12 +174,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "resource pools initialized",
     );
 
-    // build shared L7 resources - both are read-only after construction
-    let error_pages = Arc::new(ErrorPages::load(&config.error_pages)?);
-    let access_log = Arc::new(AccessLogSink::from_config(&config.access_log)?);
+    // serve ingredients that never change after startup. one builder assembles a
+    // listener's ServeConfig from these, at boot and on reload alike.
+    let shared_serve = Arc::new(SharedServe {
+        strategy,
+        buffer_pool: Arc::new(resources.buffer_pool.clone()),
+        resources: resources.clone(),
+        error_pages: Arc::new(ErrorPages::load(&config.error_pages)?),
+        access_log: Arc::new(AccessLogSink::from_config(&config.access_log)?),
+    });
 
-    // shutdown coordination: all listener tasks and health checkers share this receiver
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    // shutdown coordination: health checkers and sweepers hold this receiver directly;
+    // listeners are reached through their own drain channels (see the supervision loop).
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
     let shutdown_tx = Arc::new(shutdown_tx);
 
     // signal handler fires the watch channel
@@ -193,55 +196,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _ = signal_tx.send(());
     });
 
-    // build one BackendPool + RoundRobin per pool
-    let mut pool_map: HashMap<String, (Arc<BackendPool>, Arc<RoundRobin>)> = HashMap::new();
-    for pool_cfg in &config.pools {
-        let health = pool_cfg.effective_health(&config.health);
-        let addrs: Vec<_> = pool_cfg.backends.iter().map(|b| b.address).collect();
-        let pool = Arc::new(BackendPool::new(
-            pool_cfg.name.as_str().into(),
-            addrs,
-            health.failure_threshold,
-            Duration::from_secs(health.recovery_timeout_secs),
-            pool_cfg.keepalive.clone(),
-        ));
-        if config.metrics.is_some() {
+    // effective running config: pools (BackendPool + RoundRobin) and rate-limit
+    // zones. held in an ArcSwap so the SIGHUP reload task can reconcile it live.
+    // one builder is shared by startup and reload so the two never diverge.
+    let config_state = Arc::new(arc_swap::ArcSwap::from_pointee(
+        kntx::runtime::build_snapshot(&config),
+    ));
+    // owned snapshot for startup wiring; safe to hold across the bind awaits below.
+    let snapshot = config_state.load_full();
+
+    if config.metrics.is_some() {
+        for (pool, _) in snapshot.pools.values() {
             pool.emit_initial_metrics();
         }
-        let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
-        pool_map.insert(pool_cfg.name.clone(), (pool, balancer));
-    }
-
-    // one limiter per rate limit zone; every listener and route referencing
-    // the zone name shares the instance, so shared name = shared budget
-    let mut rate_limit_zones: HashMap<String, Arc<ZoneLimiter>> = HashMap::new();
-    for (name, zone) in &config.rate_limit.zones {
-        let rate = Rate {
-            count: NonZeroU32::new(zone.rate).expect("validation rejects rate = 0"),
-            period: match zone.per {
-                config::RatePeriod::Second => Period::Second,
-                config::RatePeriod::Minute => Period::Minute,
-            },
-        };
-        let limiter = match zone.key {
-            config::ZoneKey::Global => {
-                ZoneLimiter::Global(Limiter::new(rate, zone.burst, MonotonicClock::new()))
-            }
-            config::ZoneKey::ClientIp => {
-                let requested = zone.max_keys.unwrap_or(config::DEFAULT_ZONE_MAX_KEYS);
-                let keyed = KeyedLimiter::new(rate, zone.burst, requested, MonotonicClock::new());
-                if keyed.capacity() != requested as usize {
-                    tracing::info!(
-                        zone = %name,
-                        requested,
-                        effective = keyed.capacity(),
-                        "rate limit zone max_keys rounded up to a power-of-two set count",
-                    );
-                }
-                ZoneLimiter::PerIp(keyed)
-            }
-        };
-        rate_limit_zones.insert(name.clone(), Arc::new(limiter));
+        // publish the version from boot so the series exists before any reload
+        metrics::gauge!("kntx_config_version").set(0.0);
     }
 
     // pre-bind every listener and build TLS acceptors. fail fast on bind / cert errors
@@ -261,45 +230,48 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         prepared.push((idx, tcp, tls_acceptor));
     }
 
-    // all listeners bound - now spawn health checkers
-    let mut health_handles = Vec::new();
+    // all listeners bound - now start each pool's health checker and keepalive sweeper.
+    // the registry is what lets a reload start tasks for an added pool and stop them
+    // for a removed one.
+    let pool_tasks: PoolTasks = Arc::new(Mutex::new(HashMap::new()));
     for pool_cfg in &config.pools {
+        let (pool, _) = snapshot.pools.get(&pool_cfg.name).unwrap();
         let health = pool_cfg.effective_health(&config.health);
-        if let Some(interval_secs) = health.check_interval_secs {
-            let (pool, _) = pool_map.get(&pool_cfg.name).unwrap();
-            let checker = HealthChecker::new(
-                Arc::clone(pool),
-                Duration::from_secs(interval_secs),
-                // connect_timeout for health probes: 5s default (D7 - per-pool tuning deferred)
-                Duration::from_secs(5),
-            );
-            let handle = checker.spawn(shutdown_rx.clone());
-            health_handles.push(handle);
-            tracing::info!(pool = %pool_cfg.name, interval_secs, "health checker started");
-        }
-    }
-
-    // spawn one keepalive sweeper per pool that has backend keepalive enabled.
-    // Pools with max_idle = 0 get no sweeper - KeepaliveSweeper::new returns None.
-    let mut sweeper_handles = Vec::new();
-    for pool_cfg in &config.pools {
-        let (pool, _) = pool_map.get(&pool_cfg.name).unwrap();
-        if let Some(sweeper) = kntx::proxy::l7::keepalive::KeepaliveSweeper::new(Arc::clone(pool)) {
-            let handle = sweeper.spawn(shutdown_rx.clone());
-            sweeper_handles.push(handle);
-            tracing::info!(pool = %pool_cfg.name, "keepalive sweeper started");
-        }
+        pool_tasks.lock().expect("pool task lock").insert(
+            pool_cfg.name.clone(),
+            kntx::runtime::spawn_pool_tasks(pool, &health, &shutdown_rx),
+        );
     }
 
     // spawn serve tasks for the pre-bound listeners.
     // side table maps task::Id → listener address so panic logs can name the culprit.
     let mut listener_tasks: JoinSet<()> = JoinSet::new();
     let mut task_addrs: HashMap<tokio::task::Id, SocketAddr> = HashMap::new();
+    let listeners: ListenerRegistry = Arc::new(Mutex::new(HashMap::new()));
+    // a reload binds new listeners on its own task but hands them here to spawn, so
+    // the supervision loop stays the single owner of listener task lifecycle.
+    let (spawn_tx, mut spawn_rx) = tokio::sync::mpsc::unbounded_channel::<ListenerSpawn>();
     for (idx, tcp_listener, tls_acceptor) in prepared {
         let listener_cfg = &config.listeners[idx];
         let router: Arc<dyn Router> = Arc::new(
-            build_router(listener_cfg, &pool_map, &rate_limit_zones)
+            build_router(listener_cfg, &snapshot.pools, &snapshot.zones)
                 .expect("pool and zone refs validated"),
+        );
+        let rate_limit = kntx::runtime::build_zone_handle(listener_cfg, &snapshot.zones)
+            .expect("zone refs validated");
+        let runtime = ListenerRuntime::cell(
+            router,
+            Arc::new(listener_cfg.clone()),
+            tls_acceptor,
+            rate_limit,
+        );
+        let (drain_tx, drain_rx) = tokio::sync::watch::channel(());
+        listeners.lock().expect("registry lock").insert(
+            listener_cfg.address,
+            ListenerHandle {
+                runtime: Arc::clone(&runtime),
+                drain: drain_tx,
+            },
         );
 
         if let Some(ref tls_cfg) = listener_cfg.tls {
@@ -318,35 +290,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let tls_handshake_timeout = listener_cfg
-            .tls
-            .as_ref()
-            .map(|t| Duration::from_secs(t.handshake_timeout_secs))
-            .unwrap_or(Duration::from_secs(5));
-
-        let serve_config = ServeConfig {
-            strategy,
-            resources: resources.clone(),
-            max_connections: listener_cfg.max_connections,
-            idle_timeout: listener_cfg.idle_timeout_secs.map(Duration::from_secs),
-            drain_timeout: Duration::from_secs(listener_cfg.drain_timeout_secs),
-            connect_timeout: Duration::from_secs(listener_cfg.connect_timeout_secs),
-            max_connect_attempts: listener_cfg.max_connect_attempts,
-            tls_acceptor,
-            tls_handshake_timeout,
-            listener_label: listener_cfg.address.to_string().into(),
-            listener_cfg: Arc::new(listener_cfg.clone()),
-            error_pages: Arc::clone(&error_pages),
-            access_log: Arc::clone(&access_log),
-            buffer_pool: Arc::new(resources.buffer_pool.clone()),
-            rate_limit: listener_cfg.rate_limit.as_ref().map(|name| {
-                let limiter = rate_limit_zones.get(name).expect("zone refs validated");
-                ZoneHandle {
-                    name: name.as_str().into(),
-                    limiter: Arc::clone(limiter),
-                }
-            }),
-        };
+        let serve_config = kntx::runtime::build_serve_config(&shared_serve, listener_cfg);
 
         tracing::info!(
             address = %listener_cfg.address,
@@ -355,55 +299,109 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "listener starting",
         );
 
-        let rx = shutdown_rx.clone();
-        let abort = listener_tasks.spawn(listener::serve(tcp_listener, router, serve_config, rx));
+        let abort = listener_tasks.spawn(listener::serve(
+            tcp_listener,
+            runtime,
+            serve_config,
+            drain_rx,
+        ));
         task_addrs.insert(abort.id(), listener_cfg.address);
     }
 
-    // monitor listener tasks: any abnormal exit triggers shutdown of all listeners
-    let mut had_error = false;
-    while let Some(result) = listener_tasks.join_next_with_id().await {
-        match result {
-            Ok((id, ())) => {
-                task_addrs.remove(&id);
-            }
-            Err(e) => {
-                let id = e.id();
-                let address = task_addrs
-                    .remove(&id)
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string());
-
-                if e.is_panic() {
-                    let payload = e.into_panic();
-                    let msg = payload
-                        .downcast_ref::<&str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "<non-string panic>".to_string());
-                    tracing::error!(
-                        %address,
-                        payload = %msg,
-                        "listener task panicked, initiating shutdown",
-                    );
-                } else {
-                    tracing::error!(
-                        %address,
-                        error = %e,
-                        "listener task failed, initiating shutdown",
-                    );
+    // SIGHUP: re-read + validate config, reconcile the running snapshot and push new
+    // routing tables to the bound listeners. a bad config is rejected and the current
+    // one keeps serving (nginx -t safety). registered after the listeners exist so a
+    // reload can never race startup.
+    #[cfg(unix)]
+    {
+        let ctx = ReloadContext {
+            state: Arc::clone(&config_state),
+            listeners: Arc::clone(&listeners),
+            pool_tasks: Arc::clone(&pool_tasks),
+            shared: Arc::clone(&shared_serve),
+            spawn_tx,
+            shutdown: shutdown_rx.clone(),
+        };
+        let reload_path = args.config.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sighup = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to register SIGHUP handler; reload disabled");
+                    return;
                 }
-                had_error = true;
-                let _ = shutdown_tx.send(());
+            };
+            while sighup.recv().await.is_some() {
+                kntx::runtime::reload_from_file(&ctx, &reload_path).await;
             }
+        });
+    }
+    #[cfg(not(unix))]
+    drop(spawn_tx);
+
+    // supervise listener tasks: adopt the ones a reload binds, fan process shutdown
+    // out to every listener's drain channel, and treat any abnormal exit as fatal.
+    // a queued spawn keeps the loop alive when the last old listener has already
+    // exited - the reload that replaces a listener sends before it drains the old one.
+    let mut had_error = false;
+    while !listener_tasks.is_empty() || !spawn_rx.is_empty() {
+        tokio::select! {
+            Some((address, task)) = spawn_rx.recv() => {
+                let abort = listener_tasks.spawn(task);
+                task_addrs.insert(abort.id(), address);
+            }
+            Ok(()) = shutdown_rx.changed() => {
+                kntx::runtime::drain_all(&listeners);
+            }
+            Some(result) = listener_tasks.join_next_with_id() => {
+                match result {
+                    Ok((id, ())) => {
+                        task_addrs.remove(&id);
+                    }
+                    Err(e) => {
+                        let id = e.id();
+                        let address = task_addrs
+                            .remove(&id)
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "<unknown>".to_string());
+
+                        if e.is_panic() {
+                            let payload = e.into_panic();
+                            let msg = payload
+                                .downcast_ref::<&str>()
+                                .map(|s| (*s).to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "<non-string panic>".to_string());
+                            tracing::error!(
+                                %address,
+                                payload = %msg,
+                                "listener task panicked, initiating shutdown",
+                            );
+                        } else {
+                            tracing::error!(
+                                %address,
+                                error = %e,
+                                "listener task failed, initiating shutdown",
+                            );
+                        }
+                        had_error = true;
+                        let _ = shutdown_tx.send(());
+                    }
+                }
+            }
+            else => break,
         }
     }
 
     // wait for health checkers and keepalive sweepers to exit after their shutdown receivers fire
-    for handle in health_handles {
-        let _ = handle.await;
-    }
-    for handle in sweeper_handles {
+    let handles: Vec<_> = pool_tasks
+        .lock()
+        .expect("pool task lock")
+        .drain()
+        .flat_map(|(_, handles)| handles)
+        .collect();
+    for handle in handles {
         let _ = handle.await;
     }
 

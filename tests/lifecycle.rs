@@ -13,7 +13,7 @@ use kntx::config::{
     ErrorPagesConfig, ForwardingStrategy, KeepaliveConfig, ListenerConfig, ListenerMode,
 };
 use kntx::health::BackendPool;
-use kntx::listener::{self, ServeConfig};
+use kntx::listener::{self, ListenerRuntime, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
@@ -58,7 +58,6 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
 
 fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
     ServeConfig {
-        rate_limit: None,
         strategy,
         resources: test_resources(),
         max_connections: None,
@@ -66,10 +65,8 @@ fn test_serve_config(strategy: ForwardingStrategy) -> ServeConfig {
         drain_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(5),
         max_connect_attempts: 3,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: "test-listener".into(),
-        listener_cfg: test_listener_cfg(),
         error_pages: Arc::new(ErrorPages::load(&ErrorPagesConfig::default()).unwrap()),
         access_log: Arc::new(AccessLogSink::Off),
         buffer_pool: Arc::new(BufferPool::new(64, 64 * 1024)),
@@ -96,7 +93,12 @@ async fn start_proxy_with_config(backend_addrs: &[SocketAddr], config: ServeConf
         let _tx = shutdown_tx;
         std::future::pending::<()>().await
     });
-    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
+    tokio::spawn(listener::serve(
+        tcp_listener,
+        ListenerRuntime::cell(router, test_listener_cfg(), None, None),
+        config,
+        shutdown_rx,
+    ));
 
     proxy_addr
 }
@@ -136,7 +138,6 @@ async fn idle_timeout_closes_connection() {
     let backend = EchoServer::start().await;
 
     let config = ServeConfig {
-        rate_limit: None,
         idle_timeout: Some(Duration::from_secs(1)),
         ..test_serve_config(ForwardingStrategy::Userspace)
     };
@@ -161,7 +162,6 @@ async fn max_connections_rejects_excess() {
     let backend = EchoServer::start().await;
 
     let config = ServeConfig {
-        rate_limit: None,
         max_connections: Some(2),
         ..test_serve_config(ForwardingStrategy::Userspace)
     };
@@ -207,7 +207,12 @@ async fn graceful_shutdown_drains_connections() {
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    let serve_handle = tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
+    let serve_handle = tokio::spawn(listener::serve(
+        tcp_listener,
+        ListenerRuntime::cell(router, test_listener_cfg(), None, None),
+        config,
+        shutdown_rx,
+    ));
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream.write_all(b"before shutdown").await.unwrap();
@@ -245,7 +250,12 @@ async fn new_connections_refused_during_drain() {
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    let serve_handle = tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
+    let serve_handle = tokio::spawn(listener::serve(
+        tcp_listener,
+        ListenerRuntime::cell(router, test_listener_cfg(), None, None),
+        config,
+        shutdown_rx,
+    ));
 
     // in-flight connection keeps the drain phase alive
     let mut held = TcpStream::connect(proxy_addr).await.unwrap();

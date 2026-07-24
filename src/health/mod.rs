@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 
@@ -118,13 +119,23 @@ impl BackendState {
     }
 }
 
+/// outcome of a pool membership reconcile - which addresses joined and left.
+/// the reload manager uses this to log the change and seed/clear per-backend metrics.
+pub struct BackendReconcile {
+    pub added: Vec<SocketAddr>,
+    pub removed: Vec<SocketAddr>,
+}
+
 pub struct BackendPool {
     pool_name: Arc<str>,
-    // Arc-wrapped so checkout sites can hand the state to KeepaliveCache::checkout without
-    // re-cloning the heavy BackendState (which owns the keepalive ArrayQueue).
-    backends: Vec<Arc<BackendState>>,
-    failure_threshold: u32,
-    recovery_timeout: Duration,
+    // backend set swaps atomically on reload; readers (RR selection, health probe,
+    // sweeper) load one coherent snapshot per call. surviving addresses keep their
+    // Arc<BackendState> so circuit + keepalive cache + counters ride the reload.
+    backends: ArcSwap<Vec<Arc<BackendState>>>,
+    // health tuning is reloadable, so these are atomic: a reload stores new values
+    // that in-flight selections pick up on their next read.
+    failure_threshold: AtomicU32,
+    recovery_timeout_millis: AtomicU64,
     keepalive_cfg: KeepaliveConfig,
 }
 
@@ -136,7 +147,7 @@ impl BackendPool {
         recovery_timeout: Duration,
         keepalive: KeepaliveConfig,
     ) -> Self {
-        let backends = addrs
+        let backends: Vec<Arc<BackendState>> = addrs
             .into_iter()
             .map(|a| {
                 Arc::new(BackendState::new(
@@ -148,11 +159,58 @@ impl BackendPool {
             .collect();
         Self {
             pool_name,
-            backends,
-            failure_threshold,
-            recovery_timeout,
+            backends: ArcSwap::from_pointee(backends),
+            failure_threshold: AtomicU32::new(failure_threshold),
+            recovery_timeout_millis: AtomicU64::new(recovery_timeout.as_millis() as u64),
             keepalive_cfg: keepalive,
         }
+    }
+
+    /// swap the backend set to `new_addrs`, preserving each surviving address's
+    /// BackendState (circuit, keepalive cache, counters) by identity. new addresses
+    /// get a fresh state with the pool's keepalive config; removed addresses drop
+    /// when the last in-flight holder releases, closing their idle keepalive conns.
+    /// also stores the reloaded health thresholds. safe under live traffic: readers
+    /// load one coherent snapshot and the swap is a single atomic store.
+    pub fn reconcile(
+        &self,
+        new_addrs: &[SocketAddr],
+        failure_threshold: u32,
+        recovery_timeout: Duration,
+    ) -> BackendReconcile {
+        let current = self.backends.load();
+        let added = new_addrs
+            .iter()
+            .copied()
+            .filter(|a| !current.iter().any(|b| b.address == *a))
+            .collect();
+        let removed = current
+            .iter()
+            .map(|b| b.address)
+            .filter(|a| !new_addrs.contains(a))
+            .collect();
+        let next: Vec<Arc<BackendState>> = new_addrs
+            .iter()
+            .map(|&addr| {
+                current
+                    .iter()
+                    .find(|b| b.address == addr)
+                    .map(Arc::clone)
+                    .unwrap_or_else(|| {
+                        Arc::new(BackendState::new(
+                            addr,
+                            Arc::clone(&self.pool_name),
+                            self.keepalive_cfg.clone(),
+                        ))
+                    })
+            })
+            .collect();
+        self.failure_threshold
+            .store(failure_threshold, Ordering::Relaxed);
+        self.recovery_timeout_millis
+            .store(recovery_timeout.as_millis() as u64, Ordering::Relaxed);
+        self.backends.store(Arc::new(next));
+        BackendReconcile { added, removed }
     }
 
     /// pool-wide keepalive configuration. used by the sweeper to derive its tick interval
@@ -166,29 +224,34 @@ impl BackendPool {
     }
 
     pub fn len(&self) -> usize {
-        self.backends.len()
+        self.backends.load().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.backends.is_empty()
+        self.backends.load().is_empty()
     }
 
     pub fn recovery_timeout(&self) -> Duration {
-        self.recovery_timeout
+        Duration::from_millis(self.recovery_timeout_millis.load(Ordering::Relaxed))
     }
 
-    pub fn get(&self, idx: usize) -> &BackendState {
-        self.backends[idx].as_ref()
+    /// owned snapshot of the current backend set, safe to hold across await points.
+    /// hot readers (RR selection, health probe, sweeper) load one per call.
+    pub fn snapshot(&self) -> Arc<Vec<Arc<BackendState>>> {
+        self.backends.load_full()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &BackendState> {
-        self.backends.iter().map(|a| a.as_ref())
+    /// clone the Arc'd state at index. callers are tests and diagnostics; the RR hot
+    /// path indexes a `snapshot()` directly instead of paying a clone per backend.
+    pub fn get(&self, idx: usize) -> Arc<BackendState> {
+        Arc::clone(&self.backends.load()[idx])
     }
 
     /// look up an Arc-wrapped BackendState by address. used by L7 checkout to thread
     /// the state into KeepaliveCache::checkout without re-allocating.
     pub fn state_for(&self, addr: SocketAddr) -> Option<Arc<BackendState>> {
         self.backends
+            .load()
             .iter()
             .find(|b| b.address == addr)
             .map(Arc::clone)
@@ -202,7 +265,7 @@ impl BackendPool {
         let state = backend.circuit_state();
 
         match state {
-            CircuitState::Closed if prev + 1 >= self.failure_threshold => {
+            CircuitState::Closed if prev + 1 >= self.failure_threshold.load(Ordering::Relaxed) => {
                 backend
                     .circuit
                     .store(CircuitState::Open as u8, Ordering::Release);
@@ -280,7 +343,7 @@ impl BackendPool {
 
     /// emit initial health metrics for all backends so dashboards show them from startup
     pub fn emit_initial_metrics(&self) {
-        for backend in &self.backends {
+        for backend in self.backends.load().iter() {
             let addr = backend.address.to_string();
             metrics::gauge!(
                 "kntx_backend_health",
@@ -297,11 +360,12 @@ impl BackendPool {
         }
     }
 
-    fn find(&self, addr: SocketAddr) -> Option<&BackendState> {
+    fn find(&self, addr: SocketAddr) -> Option<Arc<BackendState>> {
         self.backends
+            .load()
             .iter()
             .find(|b| b.address == addr)
-            .map(|a| a.as_ref())
+            .map(Arc::clone)
     }
 }
 
@@ -338,7 +402,9 @@ impl HealthChecker {
     }
 
     async fn probe_cycle(&self) {
-        for backend in self.pool.iter() {
+        // owned snapshot: the connect below is an await point, so a Guard must not be held.
+        let backends = self.pool.snapshot();
+        for backend in backends.iter() {
             let addr = backend.address();
             let start = std::time::Instant::now();
 
@@ -529,7 +595,7 @@ mod tests {
         pool.record_failure(addr2);
 
         let recovery = pool.recovery_timeout();
-        let any_available = pool.iter().any(|b| b.is_available(recovery));
+        let any_available = pool.snapshot().iter().any(|b| b.is_available(recovery));
         assert!(!any_available);
     }
 
@@ -684,6 +750,107 @@ mod tests {
                 pool.get(0).keepalive.queue_len(),
                 0,
                 "cache must be empty after circuit opens"
+            );
+        });
+    }
+
+    #[test]
+    fn reconcile_preserves_circuit_state_for_survivor() {
+        // trip A's circuit open, then reconcile with A still present (B removed, C added).
+        // A must stay Open - reloading unrelated changes cannot reset a live circuit breaker.
+        let pool = make_pool(&["127.0.0.1:3001", "127.0.0.1:3002"], 1, 30);
+        let a: SocketAddr = "127.0.0.1:3001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:3002".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:3003".parse().unwrap();
+        pool.record_failure(a);
+        assert_eq!(
+            pool.state_for(a).unwrap().circuit_state(),
+            CircuitState::Open
+        );
+
+        let diff = pool.reconcile(&[a, c], 1, Duration::from_secs(30));
+
+        assert_eq!(diff.added, vec![c]);
+        assert_eq!(diff.removed, vec![b]);
+        assert_eq!(pool.len(), 2);
+        assert_eq!(
+            pool.state_for(a).unwrap().circuit_state(),
+            CircuitState::Open,
+            "surviving backend's circuit must ride the reload"
+        );
+        assert_eq!(
+            pool.state_for(c).unwrap().circuit_state(),
+            CircuitState::Closed,
+            "newly added backend starts closed"
+        );
+        assert!(pool.state_for(b).is_none(), "removed backend is gone");
+    }
+
+    #[test]
+    fn reconcile_noop_keeps_same_state_arc() {
+        // an identical address set preserves the exact BackendState instance.
+        let pool = make_pool(&[ADDR], 3, 10);
+        let addr: SocketAddr = ADDR.parse().unwrap();
+        let before = pool.state_for(addr).unwrap();
+        let diff = pool.reconcile(&[addr], 3, Duration::from_secs(10));
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        let after = pool.state_for(addr).unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "unchanged backend keeps its Arc"
+        );
+    }
+
+    #[test]
+    fn reconcile_updates_health_thresholds() {
+        // start lenient, reconcile the threshold down to 1: a single failure must now open.
+        let pool = make_pool(&[ADDR], 5, 60);
+        let addr: SocketAddr = ADDR.parse().unwrap();
+        pool.reconcile(&[addr], 1, Duration::from_secs(7));
+        assert_eq!(pool.recovery_timeout(), Duration::from_secs(7));
+        pool.record_failure(addr);
+        assert_eq!(
+            pool.state_for(addr).unwrap().circuit_state(),
+            CircuitState::Open,
+            "reloaded failure_threshold=1 must take effect"
+        );
+    }
+
+    #[test]
+    fn reconcile_preserves_keepalive_cache_for_survivor() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let cfg = KeepaliveConfig {
+                max_idle: 4,
+                idle_conn_ttl_secs: 60,
+                max_total: 0,
+            };
+            let pool = Arc::new(BackendPool::new(
+                "test".into(),
+                vec![addr],
+                3,
+                Duration::from_secs(10),
+                cfg,
+            ));
+
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let _s = listener.accept().await.unwrap();
+            pool.get(0)
+                .keepalive
+                .push_test_idle(stream, std::time::Instant::now());
+            assert_eq!(pool.get(0).keepalive.queue_len(), 1);
+
+            // reconcile keeping the same address plus a new one
+            let other: SocketAddr = "127.0.0.1:3999".parse().unwrap();
+            pool.reconcile(&[addr, other], 3, Duration::from_secs(10));
+
+            assert_eq!(
+                pool.state_for(addr).unwrap().keepalive.queue_len(),
+                1,
+                "surviving backend keeps its warm keepalive conns across reload"
             );
         });
     }

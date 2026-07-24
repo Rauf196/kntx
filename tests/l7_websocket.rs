@@ -20,7 +20,7 @@ use kntx::config::{
     ListenerMode,
 };
 use kntx::health::BackendPool;
-use kntx::listener::{self, ServeConfig};
+use kntx::listener::{self, ListenerRuntime, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
@@ -104,7 +104,6 @@ async fn start_proxy(backend_addr: SocketAddr, opts: ProxyOpts) -> Proxy {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -117,16 +116,19 @@ async fn start_proxy(backend_addr: SocketAddr, opts: ProxyOpts) -> Proxy {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
 
     Proxy { addr, shutdown_tx }
 }

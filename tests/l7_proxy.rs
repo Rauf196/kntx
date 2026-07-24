@@ -18,7 +18,7 @@ use kntx::config::{
     ListenerConfig, ListenerMode, TlsConfig,
 };
 use kntx::health::{BackendPool, CircuitState};
-use kntx::listener::{self, ServeConfig};
+use kntx::listener::{self, ListenerRuntime, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
@@ -80,7 +80,6 @@ async fn start_l7_proxy_with_limit(backend_addr: SocketAddr, header_limit: usize
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -93,16 +92,19 @@ async fn start_l7_proxy_with_limit(backend_addr: SocketAddr, header_limit: usize
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
 
     L7Proxy {
         addr,
@@ -161,7 +163,6 @@ async fn start_l7_proxy_no_backends() -> L7Proxy {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -174,16 +175,19 @@ async fn start_l7_proxy_no_backends() -> L7Proxy {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(1),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     L7Proxy {
@@ -260,7 +264,6 @@ async fn start_l7_proxy_tls(backend_addr: SocketAddr) -> L7TlsProxy {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -273,16 +276,19 @@ async fn start_l7_proxy_tls(backend_addr: SocketAddr) -> L7TlsProxy {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, Some(acceptor), None),
+        serve_cfg,
+        shutdown_rx,
+    ));
 
     L7TlsProxy {
         addr,
@@ -739,7 +745,6 @@ async fn custom_error_page_served() {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -752,16 +757,19 @@ async fn custom_error_page_served() {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(1),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let resp = raw_request(addr, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
@@ -870,7 +878,6 @@ async fn connect_timeout_returns_504() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -883,16 +890,19 @@ async fn connect_timeout_returns_504() {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(1),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let resp = raw_request(addr, b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
@@ -959,7 +969,6 @@ async fn access_log_emits_line() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -972,16 +981,19 @@ async fn access_log_emits_line() {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     raw_request(addr, b"GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
@@ -1050,7 +1062,6 @@ async fn access_log_trace_id_propagates() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -1063,16 +1074,19 @@ async fn access_log_trace_id_propagates() {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -1251,7 +1265,6 @@ async fn mid_body_backend_failure_records_passive_health() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -1264,17 +1277,20 @@ async fn mid_body_backend_failure_records_passive_health() {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: proxy_addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
     let pool_ref = Arc::clone(&pool);
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     // round-robin picks bad_addr first (idx 0); backend closes → record_failure
@@ -1290,8 +1306,7 @@ async fn mid_body_backend_failure_records_passive_health() {
 
     // bad_addr circuit must be open after the failure
     let bad_state = pool_ref
-        .iter()
-        .find(|b| b.address() == bad_addr)
+        .state_for(bad_addr)
         .expect("bad_addr must be in pool");
     assert_eq!(
         bad_state.circuit_state(),
@@ -1347,7 +1362,6 @@ async fn start_l7_proxy_logged(
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -1360,16 +1374,19 @@ async fn start_l7_proxy_logged(
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
     let shutdown_tx_ret = shutdown_tx.clone();
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
     (
         L7Proxy {
             addr,
@@ -1426,7 +1443,6 @@ async fn start_l7_proxy_no_backends_logged(
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -1439,16 +1455,19 @@ async fn start_l7_proxy_no_backends_logged(
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(1),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
     let shutdown_tx_ret = shutdown_tx.clone();
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
     tokio::time::sleep(Duration::from_millis(10)).await;
     (
         L7Proxy {
@@ -1590,7 +1609,6 @@ async fn access_log_request_id_round_trips() {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -1603,16 +1621,19 @@ async fn access_log_request_id_round_trips() {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     raw_request(

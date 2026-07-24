@@ -13,7 +13,7 @@ use kntx::config::{
     ErrorPagesConfig, ForwardingStrategy, KeepaliveConfig, ListenerConfig, ListenerMode,
 };
 use kntx::health::{BackendPool, CircuitState};
-use kntx::listener::{self, ServeConfig};
+use kntx::listener::{self, ListenerRuntime, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
@@ -48,7 +48,6 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
 
 fn test_serve_config() -> ServeConfig {
     ServeConfig {
-        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -56,10 +55,8 @@ fn test_serve_config() -> ServeConfig {
         drain_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(5),
         max_connect_attempts: 3,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: "test-listener".into(),
-        listener_cfg: test_listener_cfg(),
         error_pages: Arc::new(ErrorPages::load(&ErrorPagesConfig::default()).unwrap()),
         access_log: Arc::new(AccessLogSink::Off),
         buffer_pool: Arc::new(BufferPool::new(64, 64 * 1024)),
@@ -75,7 +72,12 @@ async fn start_proxy_with_pool(
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
+    tokio::spawn(listener::serve(
+        tcp_listener,
+        ListenerRuntime::cell(router, test_listener_cfg(), None, None),
+        config,
+        shutdown_rx,
+    ));
     (proxy_addr, shutdown_tx)
 }
 
@@ -99,7 +101,6 @@ async fn backend_failover_redistributes_traffic() {
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
-            rate_limit: None,
             connect_timeout: Duration::from_secs(5),
             max_connect_attempts: 3,
             ..test_serve_config()
@@ -191,7 +192,6 @@ async fn all_backends_unhealthy_clean_rejection() {
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
-            rate_limit: None,
             max_connect_attempts: 2, // 2 attempts total, one per backend
             ..test_serve_config()
         },
@@ -221,7 +221,6 @@ async fn timeout_enforcement_gives_clean_eof() {
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
-            rate_limit: None,
             connect_timeout: Duration::from_secs(5),
             max_connect_attempts: 1,
             ..test_serve_config()
@@ -252,7 +251,6 @@ async fn circuit_opens_after_connect_failures() {
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
-            rate_limit: None,
             max_connect_attempts: 1,
             ..test_serve_config()
         },
@@ -309,7 +307,6 @@ async fn healthy_backend_serves_after_peer_fails() {
     let (proxy_addr, _shutdown) = start_proxy_with_pool(
         Arc::clone(&pool),
         ServeConfig {
-            rate_limit: None,
             max_connect_attempts: 3,
             ..test_serve_config()
         },

@@ -14,7 +14,7 @@ use kntx::config::{
     ErrorPagesConfig, ForwardingStrategy, KeepaliveConfig, ListenerConfig, ListenerMode,
 };
 use kntx::health::BackendPool;
-use kntx::listener::{self, ServeConfig};
+use kntx::listener::{self, ListenerRuntime, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
@@ -42,10 +42,10 @@ fn make_pool_named(name: &str, addrs: &[SocketAddr]) -> Arc<BackendPool> {
     ))
 }
 
-fn test_listener_cfg() -> Arc<ListenerConfig> {
+fn test_listener_cfg(mode: ListenerMode) -> Arc<ListenerConfig> {
     Arc::new(ListenerConfig {
         address: "127.0.0.1:0".parse().unwrap(),
-        mode: ListenerMode::L4,
+        mode,
         pool: Some("test".to_owned()),
         routes: vec![],
         max_connections: None,
@@ -61,7 +61,6 @@ fn test_listener_cfg() -> Arc<ListenerConfig> {
 
 fn serve_config(label: &str) -> ServeConfig {
     ServeConfig {
-        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -69,10 +68,8 @@ fn serve_config(label: &str) -> ServeConfig {
         drain_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(5),
         max_connect_attempts: 3,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: label.into(),
-        listener_cfg: test_listener_cfg(),
         error_pages: Arc::new(ErrorPages::load(&ErrorPagesConfig::default()).unwrap()),
         access_log: Arc::new(AccessLogSink::Off),
         buffer_pool: Arc::new(BufferPool::new(64, 64 * 1024)),
@@ -90,7 +87,7 @@ async fn start_listener(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
     tokio::spawn(listener::serve(
         tcp_listener,
-        router,
+        ListenerRuntime::cell(router, test_listener_cfg(ListenerMode::L4), None, None),
         serve_config(label),
         shutdown_rx,
     ));
@@ -231,9 +228,8 @@ async fn shutdown_drains_all_listeners_independently() {
 
     let h1 = tokio::spawn(listener::serve(
         tcp_l1,
-        router1,
+        ListenerRuntime::cell(router1, test_listener_cfg(ListenerMode::L4), None, None),
         ServeConfig {
-            rate_limit: None,
             drain_timeout: Duration::from_secs(5),
             ..serve_config("l1")
         },
@@ -241,9 +237,8 @@ async fn shutdown_drains_all_listeners_independently() {
     ));
     let h2 = tokio::spawn(listener::serve(
         tcp_l2,
-        router2,
+        ListenerRuntime::cell(router2, test_listener_cfg(ListenerMode::L4), None, None),
         ServeConfig {
-            rate_limit: None,
             drain_timeout: Duration::from_secs(5),
             ..serve_config("l2")
         },
@@ -303,48 +298,22 @@ async fn pool_shared_l4_l7_listener() {
     let l4_addr = l4_tcp.local_addr().unwrap();
     let (l4_shutdown_tx, l4_shutdown_rx) = tokio::sync::watch::channel(());
     let l4_cfg = ServeConfig {
-        rate_limit: None,
-        listener_cfg: Arc::new(ListenerConfig {
-            address: l4_addr,
-            mode: ListenerMode::L4,
-            pool: Some("shared".to_owned()),
-            routes: vec![],
-            max_connections: None,
-            idle_timeout_secs: None,
-            drain_timeout_secs: 1,
-            connect_timeout_secs: 2,
-            max_connect_attempts: 1,
-            tls: None,
-            header_size_limit_bytes: 16384,
-            ..Default::default()
-        }),
         ..serve_config("l4")
     };
-    tokio::spawn(listener::serve(l4_tcp, l4_router, l4_cfg, l4_shutdown_rx));
+    let l4_runtime =
+        ListenerRuntime::cell(l4_router, test_listener_cfg(ListenerMode::L4), None, None);
+    tokio::spawn(listener::serve(l4_tcp, l4_runtime, l4_cfg, l4_shutdown_rx));
 
     let l7_router = make_single_pool_router(Arc::clone(&shared_pool), Arc::clone(&shared_rr));
     let l7_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let l7_addr = l7_tcp.local_addr().unwrap();
     let (l7_shutdown_tx, l7_shutdown_rx) = tokio::sync::watch::channel(());
     let l7_cfg = ServeConfig {
-        rate_limit: None,
-        listener_cfg: Arc::new(ListenerConfig {
-            address: l7_addr,
-            mode: ListenerMode::L7,
-            pool: Some("shared".to_owned()),
-            routes: vec![],
-            max_connections: None,
-            idle_timeout_secs: None,
-            drain_timeout_secs: 1,
-            connect_timeout_secs: 2,
-            max_connect_attempts: 1,
-            tls: None,
-            header_size_limit_bytes: 16384,
-            ..Default::default()
-        }),
         ..serve_config("l7")
     };
-    tokio::spawn(listener::serve(l7_tcp, l7_router, l7_cfg, l7_shutdown_rx));
+    let l7_runtime =
+        ListenerRuntime::cell(l7_router, test_listener_cfg(ListenerMode::L7), None, None);
+    tokio::spawn(listener::serve(l7_tcp, l7_runtime, l7_cfg, l7_shutdown_rx));
 
     // warm the keep-alive cache with one L7 request: the backend conn used
     // here is returned to the cache, leaving `total_count == 1` for the

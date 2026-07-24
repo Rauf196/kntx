@@ -16,7 +16,7 @@ use helpers::tls::{
 use kntx::balancer::RoundRobin;
 use kntx::config::{ForwardingStrategy, KeepaliveConfig, ListenerConfig, ListenerMode};
 use kntx::health::BackendPool;
-use kntx::listener::{self, ServeConfig};
+use kntx::listener::{self, ListenerRuntime, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
@@ -68,21 +68,21 @@ fn make_pool(name: &str, addr: SocketAddr) -> PoolHandle {
 
 fn sni_route(pattern: &str, handle: PoolHandle) -> RouteEntry {
     RouteEntry {
-        rate_limit: None,
         matcher: CompositeMatcher::new(vec![
             Box::new(SniMatcher::new(pattern).unwrap()) as Box<dyn Matcher + Send + Sync>
         ]),
         pool: handle,
         route_id: Arc::from(format!("sni={pattern}").as_str()),
+        rate_limit: None,
     }
 }
 
 fn catch_all(handle: PoolHandle) -> RouteEntry {
     RouteEntry {
-        rate_limit: None,
         matcher: CompositeMatcher::new(vec![]),
         pool: handle,
         route_id: Arc::from("default"),
+        rate_limit: None,
     }
 }
 
@@ -118,7 +118,6 @@ async fn start_passthrough_proxy(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy,
         resources: test_resources(),
         max_connections: None,
@@ -126,16 +125,19 @@ async fn start_passthrough_proxy(
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages: Arc::new(ErrorPages::load(&Default::default()).unwrap()),
         access_log: Arc::new(kntx::access_log::AccessLogSink::Off),
         buffer_pool: Arc::new(BufferPool::with_defaults()),
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
 
     PassthroughProxy {
         addr,

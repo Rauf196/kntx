@@ -8,7 +8,8 @@ use crate::proxy::l7::matcher::{
     CompositeMatcher, HostMatcher, Matcher, MatcherBuildError, MethodMatcher, PathPrefixMatcher,
     RouteContext, SniMatcher,
 };
-use crate::rate_limit::{ZoneHandle, ZoneLimiter};
+use crate::rate_limit::ZoneHandle;
+use crate::runtime::ZoneSlot;
 
 /// resolved pool target returned by a route match.
 #[derive(Clone)]
@@ -119,7 +120,7 @@ pub fn derive_route_id(
 pub fn build_router(
     listener: &ListenerConfig,
     pool_map: &HashMap<String, (Arc<BackendPool>, Arc<RoundRobin>)>,
-    zones: &HashMap<String, Arc<ZoneLimiter>>,
+    zones: &HashMap<String, ZoneSlot>,
 ) -> Result<ConfigRouter, RouterBuildError> {
     if let Some(pool_name) = &listener.pool {
         let (backends, rr) =
@@ -182,9 +183,9 @@ pub fn build_router(
             .map(|zone| {
                 zones
                     .get(zone)
-                    .map(|limiter| ZoneHandle {
+                    .map(|slot| ZoneHandle {
                         name: Arc::from(zone.as_str()),
-                        limiter: Arc::clone(limiter),
+                        limiter: Arc::clone(&slot.limiter),
                     })
                     .ok_or_else(|| RouterBuildError::UnknownZone {
                         listener: listener.address.to_string(),

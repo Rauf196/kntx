@@ -170,6 +170,22 @@ pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         "kntx_rate_limit_rejected_total",
         "Connections or requests rejected by a rate limit zone (labels: listener, zone, scope=listener|route)."
     );
+    describe_counter!(
+        "kntx_config_reload_total",
+        "Config reloads attempted (labels: result=success|failure)."
+    );
+    describe_gauge!(
+        "kntx_config_last_reload_success",
+        "1 if the most recent config reload succeeded, 0 if it failed."
+    );
+    describe_gauge!(
+        "kntx_config_last_reload_timestamp_seconds",
+        "Unix timestamp of the most recent config reload attempt."
+    );
+    describe_gauge!(
+        "kntx_config_version",
+        "Monotonic version of the running config, incremented on each committed reload."
+    );
 
     Ok(())
 }

@@ -19,7 +19,7 @@ use kntx::config::{
     ListenerConfig, ListenerMode, TlsConfig,
 };
 use kntx::health::BackendPool;
-use kntx::listener::{self, ServeConfig};
+use kntx::listener::{self, ListenerRuntime, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
@@ -121,7 +121,6 @@ async fn start_proxy_pool(
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -134,16 +133,19 @@ async fn start_proxy_pool(
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
 
     (
         Proxy {
@@ -979,7 +981,7 @@ async fn backend_pool_max_total_failover() {
     );
 
     // saturation is not a backend failure; every backend's circuit stays Closed.
-    for state in pool.iter() {
+    for state in pool.snapshot().iter() {
         assert!(
             matches!(state.circuit_state(), kntx::health::CircuitState::Closed),
             "saturation must not open any circuit; saw {:?}",
@@ -2117,7 +2119,6 @@ async fn start_proxy_tls(backend_addr: SocketAddr) -> TlsProxy {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
 
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: kntx::config::ForwardingStrategy::Userspace,
         resources: Resources {
             buffer_pool: (*buffer_pool).clone(),
@@ -2130,15 +2131,18 @@ async fn start_proxy_tls(backend_addr: SocketAddr) -> TlsProxy {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, Some(acceptor), None),
+        serve_cfg,
+        shutdown_rx,
+    ));
 
     TlsProxy {
         addr,

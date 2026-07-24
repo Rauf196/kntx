@@ -15,7 +15,7 @@ use kntx::config::{
     ErrorPagesConfig, ForwardingStrategy, KeepaliveConfig, ListenerConfig, ListenerMode,
 };
 use kntx::health::BackendPool;
-use kntx::listener::{self, ServeConfig};
+use kntx::listener::{self, ListenerRuntime, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
@@ -71,9 +71,17 @@ fn test_pool(addrs: &[SocketAddr]) -> Arc<BackendPool> {
     ))
 }
 
-fn test_serve_config(mode: ListenerMode, rate_limit: Option<ZoneHandle>) -> ServeConfig {
+fn test_listener_cfg(mode: ListenerMode) -> Arc<ListenerConfig> {
+    Arc::new(ListenerConfig {
+        address: "127.0.0.1:0".parse().unwrap(),
+        mode,
+        pool: Some("test".to_owned()),
+        ..Default::default()
+    })
+}
+
+fn test_serve_config() -> ServeConfig {
     ServeConfig {
-        rate_limit,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -81,15 +89,8 @@ fn test_serve_config(mode: ListenerMode, rate_limit: Option<ZoneHandle>) -> Serv
         drain_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(5),
         max_connect_attempts: 3,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: "test-listener".into(),
-        listener_cfg: Arc::new(ListenerConfig {
-            address: "127.0.0.1:0".parse().unwrap(),
-            mode,
-            pool: Some("test".to_owned()),
-            ..Default::default()
-        }),
         error_pages: Arc::new(ErrorPages::load(&ErrorPagesConfig::default()).unwrap()),
         access_log: Arc::new(AccessLogSink::Off),
         buffer_pool: Arc::new(BufferPool::new(64, 64 * 1024)),
@@ -104,19 +105,28 @@ async fn start_proxy(
     let pool = test_pool(backend_addrs);
     let rr = Arc::new(RoundRobin::new(pool.clone()));
     let router = make_single_pool_router(pool, rr);
-    let config = test_serve_config(
-        ListenerMode::L4,
-        zone.map(|limiter| ZoneHandle {
-            name: zone_name.into(),
-            limiter,
-        }),
-    );
+    // listener-level zone now rides on the runtime cell, not ServeConfig
+    let rate_limit = zone.map(|limiter| ZoneHandle {
+        name: zone_name.into(),
+        limiter,
+    });
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
+    let runtime = ListenerRuntime::cell(
+        router,
+        test_listener_cfg(ListenerMode::L4),
+        None,
+        rate_limit,
+    );
+    tokio::spawn(listener::serve(
+        tcp_listener,
+        runtime,
+        test_serve_config(),
+        shutdown_rx,
+    ));
 
     (proxy_addr, shutdown_tx)
 }
@@ -288,13 +298,18 @@ fn route_entry(
 
 async fn start_l7_proxy(routes: Vec<RouteEntry>) -> (SocketAddr, tokio::sync::watch::Sender<()>) {
     let router: Arc<dyn Router> = Arc::new(ConfigRouter::new(routes));
-    let config = test_serve_config(ListenerMode::L7, None);
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = tcp_listener.local_addr().unwrap();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-    tokio::spawn(listener::serve(tcp_listener, router, config, shutdown_rx));
+    let runtime = ListenerRuntime::cell(router, test_listener_cfg(ListenerMode::L7), None, None);
+    tokio::spawn(listener::serve(
+        tcp_listener,
+        runtime,
+        test_serve_config(),
+        shutdown_rx,
+    ));
 
     (proxy_addr, shutdown_tx)
 }

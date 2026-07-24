@@ -476,7 +476,8 @@ impl KeepaliveSweeper {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        for backend in self.pool.iter() {
+                        let backends = self.pool.snapshot();
+                        for backend in backends.iter() {
                             backend.sweep_stale_keepalive();
                         }
                     }

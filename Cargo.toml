@@ -31,6 +31,9 @@ thiserror = "2"
 # lock-free data structures (buffer/pipe pool)
 crossbeam-queue = "0.3"
 
+# atomic config snapshot swap (RCU) for hot reload
+arc-swap = "1"
+
 # TLS
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }

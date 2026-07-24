@@ -27,7 +27,10 @@ impl RoundRobin {
     }
 
     pub fn next_backend(&self) -> Option<SocketAddr> {
-        let len = self.pool.len();
+        // one snapshot per selection: len and indexing stay consistent even if a
+        // reload swaps the backend set mid-call.
+        let backends = self.pool.snapshot();
+        let len = backends.len();
         if len == 0 {
             return None;
         }
@@ -37,7 +40,7 @@ impl RoundRobin {
 
         for i in 0..len {
             let idx = (start.wrapping_add(i)) % len;
-            let backend = self.pool.get(idx);
+            let backend = &backends[idx];
             if backend.is_available(recovery_timeout) {
                 return Some(backend.address());
             }

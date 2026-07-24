@@ -19,7 +19,7 @@ use kntx::config::{
     ListenerMode, TlsConfig,
 };
 use kntx::health::BackendPool;
-use kntx::listener::{self, ServeConfig};
+use kntx::listener::{self, ListenerRuntime, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
@@ -64,10 +64,10 @@ fn route(
     route_id: &str,
 ) -> RouteEntry {
     RouteEntry {
-        rate_limit: None,
         matcher: CompositeMatcher::new(matchers),
         pool: handle,
         route_id: Arc::from(route_id),
+        rate_limit: None,
     }
 }
 
@@ -107,7 +107,6 @@ async fn start_routing_proxy(router: Arc<dyn Router>) -> RoutingProxy {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -115,16 +114,19 @@ async fn start_routing_proxy(router: Arc<dyn Router>) -> RoutingProxy {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
 
     RoutingProxy {
         addr,
@@ -485,7 +487,6 @@ async fn route_id_in_access_log() {
     );
 
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -493,16 +494,19 @@ async fn route_id_in_access_log() {
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: None,
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, None, None),
+        serve_cfg,
+        shutdown_rx,
+    ));
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     get(addr, "api.example.com", "/test").await;
@@ -817,7 +821,6 @@ async fn start_tls_l7_proxy(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -825,16 +828,19 @@ async fn start_tls_l7_proxy(
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, Some(acceptor), None),
+        serve_cfg,
+        shutdown_rx,
+    ));
 
     RoutingProxy {
         addr,
@@ -872,7 +878,6 @@ async fn start_tls_l4_proxy(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let serve_cfg = ServeConfig {
-        rate_limit: None,
         strategy: ForwardingStrategy::Userspace,
         resources: test_resources(),
         max_connections: None,
@@ -880,16 +885,19 @@ async fn start_tls_l4_proxy(
         drain_timeout: Duration::from_secs(1),
         connect_timeout: Duration::from_secs(2),
         max_connect_attempts: 1,
-        tls_acceptor: Some(acceptor),
         tls_handshake_timeout: Duration::from_secs(5),
         listener_label: addr.to_string().into(),
-        listener_cfg,
         error_pages,
         access_log,
         buffer_pool,
     };
 
-    tokio::spawn(listener::serve(listener, router, serve_cfg, shutdown_rx));
+    tokio::spawn(listener::serve(
+        listener,
+        ListenerRuntime::cell(router, listener_cfg, Some(acceptor), None),
+        serve_cfg,
+        shutdown_rx,
+    ));
 
     RoutingProxy {
         addr,
