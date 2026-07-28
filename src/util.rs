@@ -1,4 +1,5 @@
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::{LazyLock, OnceLock, RwLock};
 use std::time::Instant;
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -7,6 +8,34 @@ static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// uses Instant (not SystemTime) to avoid clock skew issues.
 pub fn monotonic_millis() -> u64 {
     EPOCH.elapsed().as_millis() as u64
+}
+
+/// Intern a metric label into `&'static str` so emissions pass `Cow::Borrowed`
+/// instead of allocating a fresh String per emit. The set is bounded by the
+/// (pool, listener, backend) names a config can name, so the leak is one-time
+/// and tiny.
+///
+/// Interning still takes a read lock, so call it once and hold the result when
+/// the label is fixed for the lifetime of a struct - `BackendState` does this.
+/// Calling it per emit is fine where that is not possible.
+pub fn intern_label(s: &str) -> &'static str {
+    static CACHE: OnceLock<RwLock<HashMap<Box<str>, &'static str>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+    {
+        let map = cache.read().expect("intern_label cache poisoned");
+        if let Some(&v) = map.get(s) {
+            return v;
+        }
+    }
+    let mut map = cache.write().expect("intern_label cache poisoned");
+    if let Some(&v) = map.get(s) {
+        return v;
+    }
+    let owned: Box<str> = s.into();
+    let leaked: &'static str = Box::leak(owned.clone());
+    map.insert(owned, leaked);
+    leaked
 }
 
 // prevent false sharing when multiple cores access adjacent atomic data.

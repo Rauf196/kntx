@@ -1,0 +1,15 @@
+date:     2026-07-28T17:41:10Z
+kernel:   7.1.4-arch1-1
+cpu:      Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz
+cores:    8
+load_gen: oha 1.15.0
+nginx:    nginx version: nginx/1.31.3
+rustc:    rustc 1.97.1 (8bab26f4f 2026-07-14) (Arch Linux rust 1:1.97.1-1)
+kntx:     1e24ca2-dirty
+ulimit:   524288
+duration: 30s, warmup: 10s, conns: 200
+metrics:  enabled (127.0.0.1:9099)
+pool:     2 identical backends (uniform - measures selection overhead only)
+
+commands:
+  ./scripts/benchmark-balancer.sh 30

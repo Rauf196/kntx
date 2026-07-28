@@ -22,7 +22,7 @@ use crate::proxy::l7::websocket::{
     WsDetect, bidirectional_copy_with_timeout, is_websocket_upgrade,
 };
 use crate::rate_limit::Decision;
-use crate::util::monotonic_millis;
+use crate::util::{intern_label, monotonic_millis};
 
 use super::error::{ErrorPages, synthesize_error, synthesize_error_retry_after};
 use super::framing::{BodyFraming, ChunkedReader, classify_request_body, classify_response_body};
@@ -2140,33 +2140,6 @@ fn method_label(method: &str) -> std::borrow::Cow<'static, str> {
         "CONNECT" => Cow::Borrowed("CONNECT"),
         _ => Cow::Owned(method.to_string()),
     }
-}
-
-// Intern pool / listener labels into &'static str so metric emissions can
-// pass them as Cow::Borrowed instead of allocating a fresh String per emit.
-// The set is bounded by the number of (pool, listener) names in the config -
-// typically under a dozen - so the leak is one-time and tiny.
-fn intern_label(s: &str) -> &'static str {
-    use std::collections::HashMap;
-    use std::sync::{OnceLock, RwLock};
-
-    static CACHE: OnceLock<RwLock<HashMap<Box<str>, &'static str>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-
-    {
-        let map = cache.read().expect("intern_label cache poisoned");
-        if let Some(&v) = map.get(s) {
-            return v;
-        }
-    }
-    let mut map = cache.write().expect("intern_label cache poisoned");
-    if let Some(&v) = map.get(s) {
-        return v;
-    }
-    let owned: Box<str> = s.into();
-    let leaked: &'static str = Box::leak(owned.clone());
-    map.insert(owned, leaked);
-    leaked
 }
 
 #[allow(clippy::too_many_arguments)]

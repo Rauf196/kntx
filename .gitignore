@@ -31,3 +31,4 @@ benchmark-results/*
 !benchmark-results/reference-single/
 !benchmark-results/reference-scale/
 !benchmark-results/reference-l7/
+!benchmark-results/reference-balancer/

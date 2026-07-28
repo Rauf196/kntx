@@ -68,6 +68,14 @@ pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         "kntx_health_check_duration_seconds",
         "health check probe duration in seconds (labels: pool, backend)"
     );
+    describe_gauge!(
+        "kntx_backend_active",
+        "in-flight L4 connections and L7 requests per backend, the value least_conn ranks on (labels: pool, backend)"
+    );
+    describe_gauge!(
+        "kntx_backend_weight",
+        "configured weight per backend, 0 means drained (labels: pool, backend)"
+    );
     describe_counter!(
         "kntx_tls_handshakes_total",
         "successful TLS handshakes (labels: listener)"

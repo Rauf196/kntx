@@ -460,7 +460,13 @@ pub async fn serve(
                                                 }
                                             };
                                             match l4::connect_backend(addr, connect_timeout, resources.socket_buffer_size).await {
-                                                Ok(server) => break Some((addr, server)),
+                                                Ok(server) => {
+                                                    // None only if a reload removed this backend
+                                                    // between selection and connect - nothing left
+                                                    // to count load against.
+                                                    let active = pool.state_for(addr).map(|s| s.track_active());
+                                                    break Some((addr, server, active));
+                                                }
                                                 Err(e) => {
                                                     pool.record_failure(addr);
                                                     attempts += 1;
@@ -478,8 +484,11 @@ pub async fn serve(
                                             }
                                         };
 
-                                        let (backend_addr, mut server) = match backend_result {
-                                            Some(pair) => pair,
+                                        // _active must stay bound: dropping it here would
+                                        // zero the least-conn reading for the whole
+                                        // connection it is supposed to represent.
+                                        let (backend_addr, mut server, _active) = match backend_result {
+                                            Some(triple) => triple,
                                             None => {
                                                 metrics::gauge!(
                                                     "kntx_connections_active",

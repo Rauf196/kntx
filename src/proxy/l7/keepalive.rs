@@ -10,7 +10,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::config::KeepaliveConfig;
-use crate::health::{BackendPool, BackendState};
+use crate::health::{ActiveGuard, BackendPool, BackendState};
 use crate::util::CacheLinePadded;
 
 #[derive(Debug)]
@@ -181,6 +181,11 @@ pub struct KeepaliveConn {
     // either transferred into the queue on `return_to_cache` or dropped to
     // release capacity on `discard` / Drop.
     permit: Option<OwnedSemaphorePermit>,
+    // In-flight slot for least-conn, claimed at the top of `checkout` so the
+    // wait for a permit counts too. Scoped to the checkout, not to the socket:
+    // it drops when this conn is returned to the cache, so an idle cached conn
+    // stops counting as load. Every exit path drops it, including Drop.
+    _active: ActiveGuard,
 }
 
 impl KeepaliveConn {
@@ -188,6 +193,7 @@ impl KeepaliveConn {
         stream: TcpStream,
         state: Arc<BackendState>,
         permit: Option<OwnedSemaphorePermit>,
+        active: ActiveGuard,
     ) -> Self {
         Self {
             stream: Some(stream),
@@ -195,6 +201,7 @@ impl KeepaliveConn {
             reused: false,
             body_bytes_sent: AtomicU64::new(0),
             permit,
+            _active: active,
         }
     }
 
@@ -202,6 +209,7 @@ impl KeepaliveConn {
         stream: TcpStream,
         state: Arc<BackendState>,
         permit: Option<OwnedSemaphorePermit>,
+        active: ActiveGuard,
     ) -> Self {
         Self {
             stream: Some(stream),
@@ -209,6 +217,7 @@ impl KeepaliveConn {
             reused: true,
             body_bytes_sent: AtomicU64::new(0),
             permit,
+            _active: active,
         }
     }
 
@@ -277,6 +286,14 @@ impl KeepaliveCache {
         addr: std::net::SocketAddr,
         connect_timeout: Duration,
     ) -> Result<KeepaliveConn, CheckoutError> {
+        // Claimed before the permit gate below, not after: a request waiting on
+        // a saturated backend's semaphore is load on that backend. Counting it
+        // only once the permit lands would peg every saturated backend at
+        // exactly max_total, hiding queue depth - which is the difference
+        // least_conn exists to see, so it would degenerate to round-robin at
+        // precisely the moment it matters.
+        let active = state.track_active();
+
         // Permit gate - acquire ONE active slot before either popping from
         // cache or opening a fresh conn. nginx-style queueing: idle conns
         // sitting in cache do not consume a permit; only active in-flight
@@ -329,6 +346,7 @@ impl KeepaliveCache {
                             idle.stream,
                             Arc::clone(state),
                             permit,
+                            active,
                         ));
                     }
                     ProbeResult::Dead => {
@@ -365,7 +383,12 @@ impl KeepaliveCache {
                     "backend" => addr.to_string(),
                 )
                 .increment(1);
-                Ok(KeepaliveConn::fresh(stream, Arc::clone(state), permit))
+                Ok(KeepaliveConn::fresh(
+                    stream,
+                    Arc::clone(state),
+                    permit,
+                    active,
+                ))
             }
             Ok(Err(e)) => {
                 state.total_count.0.fetch_sub(1, Ordering::Release);
@@ -509,7 +532,7 @@ mod tests {
 
     fn make_state(cfg: KeepaliveConfig) -> Arc<BackendState> {
         let addr: SocketAddr = "127.0.0.1:19999".parse().unwrap();
-        Arc::new(BackendState::new(addr, "test".into(), cfg))
+        Arc::new(BackendState::new(addr, "test".into(), cfg, 1))
     }
 
     #[test]
@@ -698,7 +721,7 @@ mod tests {
             let _s = listener.accept().await.unwrap();
 
             state.total_count.0.store(1, Ordering::SeqCst);
-            let conn = KeepaliveConn::fresh(stream, Arc::clone(&state), None);
+            let conn = KeepaliveConn::fresh(stream, Arc::clone(&state), None, state.track_active());
             KeepaliveCache::return_to_cache(conn);
 
             // counter unchanged - conn is now idle in queue
@@ -735,7 +758,7 @@ mod tests {
             // try to return the active conn - queue full, must drop + decrement
             let s2 = TcpStream::connect(addr).await.unwrap();
             let _ss2 = listener.accept().await.unwrap();
-            let conn = KeepaliveConn::fresh(s2, Arc::clone(&state), None);
+            let conn = KeepaliveConn::fresh(s2, Arc::clone(&state), None, state.track_active());
             KeepaliveCache::return_to_cache(conn);
 
             assert_eq!(state.total_count.0.load(Ordering::SeqCst), 1);
@@ -752,7 +775,7 @@ mod tests {
             let stream = TcpStream::connect(addr).await.unwrap();
             let _s = listener.accept().await.unwrap();
             state.total_count.0.store(1, Ordering::SeqCst);
-            let conn = KeepaliveConn::fresh(stream, Arc::clone(&state), None);
+            let conn = KeepaliveConn::fresh(stream, Arc::clone(&state), None, state.track_active());
             KeepaliveCache::discard(conn);
             assert_eq!(state.total_count.0.load(Ordering::SeqCst), 0);
         });
@@ -769,7 +792,8 @@ mod tests {
             let _s = listener.accept().await.unwrap();
             state.total_count.0.store(1, Ordering::SeqCst);
             {
-                let _conn = KeepaliveConn::fresh(stream, Arc::clone(&state), None);
+                let _conn =
+                    KeepaliveConn::fresh(stream, Arc::clone(&state), None, state.track_active());
                 // conn drops here without explicit return/discard
             }
             assert_eq!(
@@ -790,7 +814,7 @@ mod tests {
             let stream = TcpStream::connect(addr).await.unwrap();
             let _s = listener.accept().await.unwrap();
             state.total_count.0.store(1, Ordering::SeqCst);
-            let conn = KeepaliveConn::fresh(stream, Arc::clone(&state), None);
+            let conn = KeepaliveConn::fresh(stream, Arc::clone(&state), None, state.track_active());
             KeepaliveCache::discard(conn); // sets stream = None
             assert_eq!(state.total_count.0.load(Ordering::SeqCst), 0);
             // Arc strong count: conn dropped inside discard, state has count=1 (the one above)
@@ -808,7 +832,7 @@ mod tests {
             let stream = TcpStream::connect(addr).await.unwrap();
             let _s = listener.accept().await.unwrap();
             state.total_count.0.store(1, Ordering::SeqCst);
-            let conn = KeepaliveConn::fresh(stream, Arc::clone(&state), None);
+            let conn = KeepaliveConn::fresh(stream, Arc::clone(&state), None, state.track_active());
             KeepaliveCache::return_to_cache(conn); // sets stream = None
             assert_eq!(state.total_count.0.load(Ordering::SeqCst), 1); // still 1 (now idle)
         });

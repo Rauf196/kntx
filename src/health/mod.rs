@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use crate::config::KeepaliveConfig;
 use crate::proxy::l7::keepalive::KeepaliveCache;
-use crate::util::{CacheLinePadded, monotonic_millis};
+use crate::util::{CacheLinePadded, intern_label, monotonic_millis};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,11 +38,32 @@ pub struct BackendState {
     pub(crate) open_since: AtomicU64,
     pub keepalive: KeepaliveCache,
     pub total_count: CacheLinePadded<AtomicU64>,
+    /// in-flight work dispatched here: L4 connections and L7 requests alike.
+    /// distinct from `total_count`, which counts open sockets and so includes
+    /// idle cached ones - those are not load. read by `LeastConn`.
+    active: CacheLinePadded<AtomicU64>,
+    /// relative share under the weighted strategy, defaulting to 1 so that a
+    /// pool with no weights configured degenerates to plain round-robin. lives
+    /// here rather than in the balancer so a reload updates it through the
+    /// existing by-address reconcile, which is what makes weight-0 drain live.
+    weight: AtomicU32,
+    /// metric labels interned once here, because `active` is emitted on every
+    /// L4 connection and every L7 request - formatting them per emit would put
+    /// two allocations on each side of the hot path for values that never change.
+    pool_label: &'static str,
+    backend_label: &'static str,
 }
 
 impl BackendState {
-    pub fn new(address: SocketAddr, pool_name: Arc<str>, keepalive_cfg: KeepaliveConfig) -> Self {
+    pub fn new(
+        address: SocketAddr,
+        pool_name: Arc<str>,
+        keepalive_cfg: KeepaliveConfig,
+        weight: u32,
+    ) -> Self {
         Self {
+            pool_label: intern_label(&pool_name),
+            backend_label: intern_label(&address.to_string()),
             address,
             pool_name,
             circuit: AtomicU8::new(CircuitState::Closed as u8),
@@ -50,6 +71,41 @@ impl BackendState {
             open_since: AtomicU64::new(0),
             keepalive: KeepaliveCache::new(keepalive_cfg),
             total_count: CacheLinePadded(AtomicU64::new(0)),
+            active: CacheLinePadded(AtomicU64::new(0)),
+            weight: AtomicU32::new(weight),
+        }
+    }
+
+    pub fn active_count(&self) -> u64 {
+        self.active.0.load(Ordering::Relaxed)
+    }
+
+    pub fn weight(&self) -> u32 {
+        self.weight.load(Ordering::Relaxed)
+    }
+
+    pub fn set_weight(&self, weight: u32) {
+        self.weight.store(weight, Ordering::Relaxed);
+        metrics::gauge!(
+            "kntx_backend_weight",
+            "pool" => self.pool_label,
+            "backend" => self.backend_label,
+        )
+        .set(weight as f64);
+    }
+
+    /// claim an in-flight slot. the returned guard decrements on drop, so error
+    /// paths and cancellations cannot strand the count.
+    pub fn track_active(self: &Arc<Self>) -> ActiveGuard {
+        self.active.0.fetch_add(1, Ordering::Relaxed);
+        metrics::gauge!(
+            "kntx_backend_active",
+            "pool" => self.pool_label,
+            "backend" => self.backend_label,
+        )
+        .increment(1.0);
+        ActiveGuard {
+            state: Arc::clone(self),
         }
     }
 
@@ -119,6 +175,23 @@ impl BackendState {
     }
 }
 
+/// holds an in-flight slot on a backend for as long as it lives.
+pub struct ActiveGuard {
+    state: Arc<BackendState>,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.state.active.0.fetch_sub(1, Ordering::Relaxed);
+        metrics::gauge!(
+            "kntx_backend_active",
+            "pool" => self.state.pool_label,
+            "backend" => self.state.backend_label,
+        )
+        .decrement(1.0);
+    }
+}
+
 /// outcome of a pool membership reconcile - which addresses joined and left.
 /// the reload manager uses this to log the change and seed/clear per-backend metrics.
 pub struct BackendReconcile {
@@ -154,6 +227,7 @@ impl BackendPool {
                     a,
                     Arc::clone(&pool_name),
                     keepalive.clone(),
+                    1,
                 ))
             })
             .collect();
@@ -201,6 +275,7 @@ impl BackendPool {
                             addr,
                             Arc::clone(&self.pool_name),
                             self.keepalive_cfg.clone(),
+                            1,
                         ))
                     })
             })
@@ -211,6 +286,20 @@ impl BackendPool {
             .store(recovery_timeout.as_millis() as u64, Ordering::Relaxed);
         self.backends.store(Arc::new(next));
         BackendReconcile { added, removed }
+    }
+
+    /// apply configured weights to the current backend set, matching by address.
+    /// addresses not in `weights` keep what they have; entries with no matching
+    /// backend are ignored, since membership is reconcile's job. called after
+    /// construction and after every membership reconcile, which is what lets a
+    /// reload retune a weight (including to 0, to drain) without a restart.
+    pub fn set_weights(&self, weights: &[(SocketAddr, u32)]) {
+        let backends = self.backends.load();
+        for (addr, weight) in weights {
+            if let Some(backend) = backends.iter().find(|b| b.address == *addr) {
+                backend.set_weight(*weight);
+            }
+        }
     }
 
     /// pool-wide keepalive configuration. used by the sweeper to derive its tick interval
@@ -354,9 +443,23 @@ impl BackendPool {
             metrics::gauge!(
                 "kntx_circuit_breaker_state",
                 "pool" => self.pool_name.to_string(),
-                "backend" => addr,
+                "backend" => addr.clone(),
             )
             .set(0.0);
+            metrics::gauge!(
+                "kntx_backend_active",
+                "pool" => backend.pool_label,
+                "backend" => backend.backend_label,
+            )
+            .set(0.0);
+            // seeded from state, not config: a reload already stored the new
+            // weight here, and a backend that survives keeps the one it has.
+            metrics::gauge!(
+                "kntx_backend_weight",
+                "pool" => backend.pool_label,
+                "backend" => backend.backend_label,
+            )
+            .set(backend.weight() as f64);
         }
     }
 
@@ -620,7 +723,7 @@ mod tests {
             max_total: 0,
         };
         let addr: SocketAddr = ADDR.parse().unwrap();
-        let state = BackendState::new(addr, "test".into(), cfg);
+        let state = BackendState::new(addr, "test".into(), cfg, 1);
         state.total_count.0.store(999, Ordering::SeqCst);
         assert!(
             !state.is_saturated(),
@@ -636,7 +739,7 @@ mod tests {
             max_total: 5,
         };
         let addr: SocketAddr = ADDR.parse().unwrap();
-        let state = BackendState::new(addr, "test".into(), cfg);
+        let state = BackendState::new(addr, "test".into(), cfg, 1);
         state.total_count.0.store(4, Ordering::SeqCst);
         assert!(!state.is_saturated());
     }
@@ -649,7 +752,7 @@ mod tests {
             max_total: 5,
         };
         let addr: SocketAddr = ADDR.parse().unwrap();
-        let state = BackendState::new(addr, "test".into(), cfg);
+        let state = BackendState::new(addr, "test".into(), cfg, 1);
         state.total_count.0.store(5, Ordering::SeqCst);
         assert!(state.is_saturated());
     }
@@ -664,7 +767,7 @@ mod tests {
             max_total: 1,
         };
         let addr: SocketAddr = ADDR.parse().unwrap();
-        let state = BackendState::new(addr, "test".into(), cfg);
+        let state = BackendState::new(addr, "test".into(), cfg, 1);
         state.total_count.0.store(1, Ordering::SeqCst); // at cap
         assert!(state.is_saturated(), "precondition: backend is saturated");
         assert!(
@@ -684,7 +787,7 @@ mod tests {
                 idle_conn_ttl_secs: 1,
                 max_total: 0,
             };
-            let state = Arc::new(BackendState::new(addr, "test".into(), cfg));
+            let state = Arc::new(BackendState::new(addr, "test".into(), cfg, 1));
 
             // push a stale idle (last_used far in the past)
             let stream = tokio::net::TcpStream::connect(addr).await.unwrap();

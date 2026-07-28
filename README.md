@@ -11,7 +11,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-stable-orange.svg" alt="Rust"></a>
   <img src="https://img.shields.io/badge/platform-linux-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/tests-530-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-551-brightgreen.svg" alt="Tests">
 </p>
 
 ---
@@ -44,11 +44,12 @@ Every listener picks its own mode, its own routes, and its own backend pool, in 
 | **L4 forwarding** | `splice(2)` zero-copy with a pre-allocated pipe pool and `TCP_CORK` batching; vectored `readv/writev` and a pooled-buffer userspace path as alternatives |
 | **L7 HTTP/1.1** | parse, route, header injection, chunked and Content-Length pass-through, 100-continue, keep-alive both sides, WebSocket tunneling |
 | **Routing** | host, path prefix, method, SNI matchers composed per route; first match wins; wildcards (`*.example.com`) |
+| **Load balancing** | round-robin, least-connections, or weighted per pool; weights are live-reloadable, so `weight = 0` drains a backend without a restart |
 | **TLS** | termination via rustls (multi-cert SNI), or SNI-routed passthrough where kntx never holds a cert |
 | **Resilience** | per-backend circuit breakers, active TCP probes, passive failure tracking, connect retries with failover |
 | **Rate limiting** | GCRA on a lock-free set-associative cache; nginx-style named zones attached per listener or per route |
 | **Hot reload** | `SIGHUP` swaps pools, routes, listeners, TLS certs, and rate-limit zones with no restart and no dropped connections |
-| **Observability** | 40 Prometheus metrics, structured JSON access logs, W3C `traceparent` propagation |
+| **Observability** | 42 Prometheus metrics, structured JSON access logs, W3C `traceparent` propagation |
 
 Not implemented: HTTP/2, HTTP/3, backend TLS, request-body buffering, forward-proxy `CONNECT`.
 See [Limits](#limits).
@@ -84,6 +85,28 @@ address = "0.0.0.0:9090"
 
 `config/example.toml` is the full option catalogue: every listener mode, TLS, routes, health
 overrides, keep-alive tuning, and rate-limit zones, each with a comment explaining what it does.
+
+### File descriptor limit
+
+A proxy holds two sockets per connection, and the splice pipe pool claims 1024 descriptors at
+startup. The common default soft limit of 1024 is therefore not enough to start at all, let alone
+serve traffic. kntx checks `RLIMIT_NOFILE` before allocating anything and refuses to start with the
+exact number it needs, rather than dying later with a bare `Too many open files` under load:
+
+```
+file descriptor limit too low: current=1024, required=21280
+(pipe pool: 1024, max connections: 20000, base: 256).
+raise it with: ulimit -n 21280
+```
+
+The budget is `1024` (pipe pool) + `2 × max_connections` per listener + `256` base, so the floor is
+**1280** with no connection caps configured. Raise it for the shell with `ulimit -n <n>`, permanently
+in `/etc/security/limits.conf`, or under systemd with `LimitNOFILE=` in the unit file - which is the
+one that matters in production, because a systemd service does not inherit your shell's limit.
+
+Sizing the limit down is the wrong fix. The defaults are chosen for a production server, and shrinking
+the pipe pool to fit a small limit trades away the zero-copy fast path to work around a misconfigured
+host.
 
 ## Benchmarks
 
@@ -176,6 +199,49 @@ the single-threaded cost. The mutexed map gets worse under spread load than unde
 because more distinct keys means map growth, rehashing, and allocation inside the critical section
 while every thread still funnels through one lock.
 
+### Load balancing (oha, 30s, 200 connections)
+
+```bash
+./scripts/benchmark-balancer.sh 30
+```
+
+Two pools. Uniform is two identical backends. Skewed caps one backend at 2000 r/s with nginx
+`limit_req`, so it queues rather than rejecting. Metrics are enabled, because the emission path is
+part of per-request cost and benchmarking with them off measures a configuration nobody runs.
+
+| pool | strategy | RPS | p50 | p99 |
+|---|---|---:|---:|---:|
+| uniform | round_robin | 37,875 | 5.05ms | 10.76ms |
+| uniform | least_conn | 28,309 | 6.78ms | 13.91ms |
+| uniform | weighted | 28,880 | 6.65ms | 13.61ms |
+| skewed | round_robin | 4,003 | 2.68ms | 100.85ms |
+| skewed | **least_conn** | **29,046** | 4.40ms | **42.93ms** |
+| skewed | weighted 9:1 | 20,059 | 0.43ms | 97.78ms |
+
+**least_conn is 7.3x round-robin under skew**, and the mechanism is worth stating precisely: strict
+alternation forces the healthy backend to match the throttled one's rate, so total throughput is
+pinned at *twice the slowest member* rather than merely reduced by half. Load-aware selection is not
+an optimization here, it is the difference between 4k and 29k RPS.
+
+The skewed rows are highly reproducible: round_robin measured 4,003 RPS in three separate runs and
+weighted landed within 19 RPS of itself, because both are arithmetically determined by the cap
+rather than by proxy speed.
+
+**The uniform rows are not resolvable on this hardware, and the table should not be read as
+"round_robin is 34% faster".** Across three runs of that identical config, round_robin measured
+30,689, 29,081 and 37,875 while least_conn measured 29,452, 30,887 and 28,309 - so the same
+comparison came out anywhere from 4% against round_robin to 34% in its favour. A 4-core laptop over
+loopback cannot separate per-selection costs this small from noise. Treat the uniform pool as
+evidence that no strategy collapses when there is nothing to optimize, and nothing finer. Isolating
+real selection overhead needs a criterion micro-benchmark, not a macro load test.
+
+Read weighted's row carefully. Best p50 of any run at 0.43ms, next to a p99 of 98ms that is
+essentially round-robin's. The distribution is bimodal: 90% of traffic goes sub-millisecond to the
+healthy backend and the remaining 10% still queues behind the cap. A good p50 beside a bad p99 means
+two populations averaged together. It also only helped because the 9:1 ratio was configured in
+advance; least_conn measured the same skew at runtime. Static intent versus observed load is the
+real difference between the two, not the throughput.
+
 ## Design notes
 
 The decisions that took the most thought, and what they cost.
@@ -223,6 +289,18 @@ could reset a flooding client's rate-limit budget by touching an unrelated field
 Pool membership, routes, certs, rate limits, and health thresholds each map to a concrete 3am
 incident. Buffer pool sizes, `metrics.address`, and forwarding strategy do not, so they are
 restart-only and a changed value logs a `WARN` rather than silently half-applying.
+
+**Least-connections has to count queued work, not just in-flight work.** The in-flight counter was
+first claimed where a checked-out backend connection is born, which is one `await` too late:
+checkout acquires the per-backend concurrency permit first, and that blocks when the backend is
+saturated. So requests queued behind a slow backend counted as zero load on it, every saturated
+backend read exactly its cap, and least-connections saw a permanent tie and silently degenerated
+into round-robin at precisely the load where it was supposed to help. The fix was one line moved
+above the permit gate. What caught it was the benchmark, not the tests: least-connections measured
+*worse* than round-robin under a skewed pool, which a correct implementation cannot do. Every unit
+test passed throughout, because they set the counter directly and never exercised the saturation
+path. The general rule is that a load signal must answer "what have I already committed here",
+not "what is running here" - queued work is committed, idle pooled sockets are not.
 
 **Metric labels are bounded by rule, not by habit.** `method`, `status`, `pool`, `listener`,
 `route_id`, `backend` are allowed. `host` and `sni` only when enumerable from config. `path`,
@@ -303,8 +381,20 @@ Honest list of what kntx does not do.
   out of scope.
 - **HTTP pipelining.** Deprecated by browsers and replaced by HTTP/2 multiplexing. kntx reads the
   next request only after the previous response completes, which is current industry behavior.
-- **Linux-only for the fast path.** `splice(2)` is gated on Linux. Other platforms fall back to the
-  vectored or userspace paths.
+- **No PROXY protocol, so the client IP is wrong behind an L4 load balancer.** kntx reads the client
+  address from the socket. Put an AWS NLB (or any L4 balancer) in front and that address is the
+  balancer's, which means `X-Forwarded-For`, `X-Real-IP`, access logs, and **per-IP rate limiting**
+  all key on the balancer rather than the client. kntx deliberately refuses `X-Forwarded-For` as a
+  rate-limit key because it is spoofable at the edge, so today there is no correct way to per-IP rate
+  limit in that topology. Behind an L7 balancer that sets `X-Forwarded-For` the logging story is
+  fine; the rate-limiting one still is not. PROXY protocol support is the fix and is planned.
+- **No session affinity.** No consistent hashing or sticky sessions, so stateful backends, shard
+  routing, and cache-locality workloads are not served. Round-robin, least-connections and weighted
+  all assume any backend can take any request.
+- **Linux is the target, not a supported-platform matrix.** kntx is built for Linux servers.
+  `splice(2)` and the startup fd-limit preflight are both Linux-gated; other platforms compile and
+  fall back to the vectored or userspace forwarding paths, but they are not tested or benchmarked
+  and CI does not build them.
 - **Reload commit is a sequence of atomic operations, not one global atomic.** There is a
   sub-microsecond window where new routes can pair with an about-to-update pool. Both backend sets
   are valid targets so there is no correctness bug, and pools reconcile before routers publish to
@@ -314,7 +404,7 @@ Honest list of what kntx does not do.
 ## Development
 
 ```bash
-cargo test                                  # 530 tests
+cargo test                                  # 551 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 kntx --config config.toml --validate        # check a config without binding anything
@@ -328,8 +418,10 @@ including splice.
 
 ## Roadmap
 
-Advanced load balancing (least-connections, weighted), admin endpoints (`/healthz`, `/ready`,
-`/config_dump`), and OpenTelemetry span emission with Prometheus exemplars.
+Near term: PROXY protocol, which closes the client-IP gap above and is what makes running behind an
+L4 load balancer correct rather than merely functional. Admin endpoints (`/healthz`, `/ready`,
+`/config_dump`) so an orchestrator or a cloud target group can drain an instance properly. Then
+consistent hashing for session affinity, and OpenTelemetry span emission with Prometheus exemplars.
 
 Longer term, kntx is aiming at programmable proxy logic, the space Cloudflare Workers, Envoy
 filters, and nginx+Lua occupy, but with the priority order inverted: performance first,

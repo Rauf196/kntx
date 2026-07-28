@@ -116,6 +116,9 @@ pub enum ConfigError {
     #[error("pool '{pool}' has no backends")]
     EmptyPoolBackends { pool: String },
 
+    #[error("pool '{pool}' uses strategy 'weighted' but every backend has weight 0")]
+    AllWeightsZero { pool: String },
+
     #[error("invalid value for '{field}': {reason}")]
     InvalidValue { field: &'static str, reason: String },
 
@@ -248,6 +251,19 @@ pub struct ListenerConfig {
     pub rate_limit: Option<String>,
 }
 
+/// backend selection algorithm for a pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BalancerStrategy {
+    #[default]
+    RoundRobin,
+    /// fewest in-flight connections wins. suits long-lived L4 connections and
+    /// backends with uneven per-request cost, where rotation alone drifts.
+    LeastConn,
+    /// smooth weighted round-robin over per-backend `weight`.
+    Weighted,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PoolConfig {
     pub name: String,
@@ -255,6 +271,10 @@ pub struct PoolConfig {
     pub health: Option<PoolHealthOverride>,
     #[serde(default)]
     pub keepalive: KeepaliveConfig,
+    /// restart-only: a reload logs a WARN and keeps the running strategy.
+    /// per-backend `weight` stays live so a drain can happen without a restart.
+    #[serde(default)]
+    pub strategy: BalancerStrategy,
 }
 
 impl PoolConfig {
@@ -429,6 +449,14 @@ fn default_recovery_timeout() -> u64 {
 #[derive(Debug, Deserialize)]
 pub struct BackendConfig {
     pub address: SocketAddr,
+    /// relative share under `strategy = "weighted"`; ignored by the other
+    /// strategies. 0 drains the backend without removing it from the pool.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+fn default_weight() -> u32 {
+    1
 }
 
 #[derive(Debug, Deserialize)]
@@ -620,6 +648,20 @@ impl Config {
             if !seen_pools.insert(pool.name.as_str()) {
                 return Err(ConfigError::DuplicatePoolName {
                     name: pool.name.clone(),
+                });
+            }
+        }
+
+        // a weighted pool with every weight at 0 can never select a backend, so
+        // every request to it would 503. zeroing one backend to drain it is the
+        // point of weights; zeroing all of them is a typo.
+        for pool in &self.pools {
+            if pool.strategy == BalancerStrategy::Weighted
+                && !pool.backends.is_empty()
+                && pool.backends.iter().all(|b| b.weight == 0)
+            {
+                return Err(ConfigError::AllWeightsZero {
+                    pool: pool.name.clone(),
                 });
             }
         }
@@ -2443,6 +2485,150 @@ mod tests {
             matches!(err, ConfigError::ListenerHasNeitherPoolNorRoutes { .. }),
             "expected ListenerHasNeitherPoolNorRoutes, got: {err}"
         );
+    }
+
+    #[test]
+    fn pool_strategy_and_weight_default_when_absent() {
+        let file = write_temp_config(&format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+            {}
+            "#,
+            base_pool_toml()
+        ));
+        let cfg = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(cfg.pools[0].strategy, BalancerStrategy::RoundRobin);
+        assert_eq!(cfg.pools[0].backends[0].weight, 1);
+    }
+
+    #[test]
+    fn pool_strategy_parses_every_variant() {
+        for (text, expected) in [
+            ("round_robin", BalancerStrategy::RoundRobin),
+            ("least_conn", BalancerStrategy::LeastConn),
+            ("weighted", BalancerStrategy::Weighted),
+        ] {
+            let file = write_temp_config(&format!(
+                r#"
+                [[listeners]]
+                address = "0.0.0.0:8080"
+                pool = "web"
+
+                [[pools]]
+                name = "web"
+                strategy = "{text}"
+
+                [[pools.backends]]
+                address = "127.0.0.1:3001"
+                weight = 7
+                "#
+            ));
+            let cfg = Config::from_file(file.path().to_str().unwrap()).unwrap();
+            assert_eq!(cfg.pools[0].strategy, expected, "strategy '{text}'");
+            assert_eq!(cfg.pools[0].backends[0].weight, 7);
+        }
+    }
+
+    #[test]
+    fn pool_strategy_rejects_unknown_value() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+            strategy = "least-conn"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Parse { .. }),
+            "snake_case is the wire form, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_weighted_pool_with_all_weights_zero() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+            strategy = "weighted"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            weight = 0
+
+            [[pools.backends]]
+            address = "127.0.0.1:3002"
+            weight = 0
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::AllWeightsZero { pool } if pool == "web"),
+            "expected AllWeightsZero for 'web', got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_weighted_pool_with_one_backend_drained() {
+        // draining a single backend to 0 is the point of weights, so only the
+        // all-zero case is an error.
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+            strategy = "weighted"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            weight = 0
+
+            [[pools.backends]]
+            address = "127.0.0.1:3002"
+            weight = 3
+            "#,
+        );
+        let cfg = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(cfg.pools[0].backends[0].weight, 0);
+        assert_eq!(cfg.pools[0].backends[1].weight, 3);
+    }
+
+    #[test]
+    fn all_weights_zero_allowed_on_non_weighted_strategy() {
+        // weight is meaningless under round_robin, so it must not gate config load
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+            strategy = "least_conn"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            weight = 0
+            "#,
+        );
+        assert!(Config::from_file(file.path().to_str().unwrap()).is_ok());
     }
 
     #[test]

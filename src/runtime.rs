@@ -211,8 +211,20 @@ fn build_pool(
         Duration::from_secs(health.recovery_timeout_secs),
         pool_cfg.keepalive.clone(),
     ));
-    let balancer = Arc::new(RoundRobin::new(Arc::clone(&pool)));
+    pool.set_weights(&weights_of(pool_cfg));
+    let balancer = Arc::new(RoundRobin::with_strategy(
+        Arc::clone(&pool),
+        pool_cfg.strategy,
+    ));
     (pool, balancer)
+}
+
+fn weights_of(pool_cfg: &config::PoolConfig) -> Vec<(std::net::SocketAddr, u32)> {
+    pool_cfg
+        .backends
+        .iter()
+        .map(|b| (b.address, b.weight))
+        .collect()
 }
 
 /// assemble a listener's `ServeConfig` - the process-lifetime half of its serve
@@ -404,7 +416,7 @@ pub async fn apply_reload(ctx: &ReloadContext, new: &Config) -> Result<u64, Relo
     // commit. every step below is infallible; pools go first so a router published
     // in this reload never points at a pool whose membership or tasks lag behind it.
     for pool_cfg in &new.pools {
-        let (pool, _) = &pools[&pool_cfg.name];
+        let (pool, balancer) = &pools[&pool_cfg.name];
         let health = pool_cfg.effective_health(&new.health);
         let addrs: Vec<_> = pool_cfg.backends.iter().map(|b| b.address).collect();
         let diff = pool.reconcile(
@@ -412,12 +424,27 @@ pub async fn apply_reload(ctx: &ReloadContext, new: &Config) -> Result<u64, Relo
             health.failure_threshold,
             Duration::from_secs(health.recovery_timeout_secs),
         );
+        // after reconcile, so weights land on the surviving states and on any
+        // backend this reload just added. weight 0 drains a backend without
+        // removing it, which is the whole reason weights are live.
+        pool.set_weights(&weights_of(pool_cfg));
         if !diff.added.is_empty() || !diff.removed.is_empty() {
             tracing::info!(
                 pool = %pool_cfg.name,
                 added = ?diff.added,
                 removed = ?diff.removed,
                 "pool membership reconciled",
+            );
+        }
+        // a surviving pool keeps its balancer Arc, so the strategy it was built
+        // with is the strategy it keeps. same treatment as the other
+        // restart-only knobs: say so rather than half-applying.
+        if balancer.strategy() != pool_cfg.strategy {
+            tracing::warn!(
+                pool = %pool_cfg.name,
+                running = ?balancer.strategy(),
+                configured = ?pool_cfg.strategy,
+                "pool strategy is restart-only, keeping the running strategy",
             );
         }
     }
@@ -716,6 +743,93 @@ backends = [{ address = "127.0.0.1:4001" }]
             !addrs.contains(&addr("127.0.0.1:3002")),
             "removed backend must be gone from the running pool"
         );
+    }
+
+    fn weighted_pool_cfg(strategy: &str, w1: u32, w2: u32) -> Config {
+        cfg(&format!(
+            r#"
+            [[listeners]]
+            address = "127.0.0.1:18080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+            strategy = "{strategy}"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            weight = {w1}
+
+            [[pools.backends]]
+            address = "127.0.0.1:3002"
+            weight = {w2}
+            "#
+        ))
+    }
+
+    #[test]
+    fn build_snapshot_wires_strategy_and_weights_from_config() {
+        let snapshot = build_snapshot(&weighted_pool_cfg("weighted", 3, 1));
+        let (pool, balancer) = snapshot.pools.get("web").unwrap();
+
+        assert_eq!(balancer.strategy(), config::BalancerStrategy::Weighted);
+        assert_eq!(pool.state_for(addr("127.0.0.1:3001")).unwrap().weight(), 3);
+        assert_eq!(pool.state_for(addr("127.0.0.1:3002")).unwrap().weight(), 1);
+
+        // and the wiring actually steers selection, not just the stored fields
+        let mut first = 0;
+        for _ in 0..400 {
+            if balancer.next_backend().unwrap() == addr("127.0.0.1:3001") {
+                first += 1;
+            }
+        }
+        assert_eq!(first, 300);
+    }
+
+    #[tokio::test]
+    async fn reload_retunes_weights_but_keeps_strategy() {
+        let h = harness(&weighted_pool_cfg("weighted", 3, 1));
+        let balancer_before = h.ctx.state.load().pools.get("web").unwrap().1.clone();
+
+        // weight moves to drain 3001; strategy change in the same reload is
+        // restart-only and must be ignored rather than half-applied.
+        apply_reload(&h.ctx, &weighted_pool_cfg("least_conn", 0, 5))
+            .await
+            .expect("reload succeeds");
+
+        let (pool, balancer_after) = h.ctx.state.load().pools.get("web").unwrap().clone();
+        assert!(
+            Arc::ptr_eq(&balancer_before, &balancer_after),
+            "surviving pool keeps its balancer",
+        );
+        assert_eq!(
+            balancer_after.strategy(),
+            config::BalancerStrategy::Weighted,
+            "strategy is restart-only",
+        );
+        assert_eq!(pool.state_for(addr("127.0.0.1:3001")).unwrap().weight(), 0);
+        assert_eq!(pool.state_for(addr("127.0.0.1:3002")).unwrap().weight(), 5);
+
+        // the drained backend must stop receiving traffic immediately
+        for _ in 0..100 {
+            assert_eq!(
+                balancer_after.next_backend().unwrap(),
+                addr("127.0.0.1:3002")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_applies_weight_to_a_backend_it_adds() {
+        let h = harness(&weighted_pool_cfg("weighted", 1, 1));
+        apply_reload(&h.ctx, &weighted_pool_cfg("weighted", 1, 4))
+            .await
+            .expect("reload succeeds");
+
+        // set_weights runs after reconcile, so a weight lands even on a backend
+        // that only exists as of this reload
+        let pool = h.ctx.state.load().pools.get("web").unwrap().0.clone();
+        assert_eq!(pool.state_for(addr("127.0.0.1:3002")).unwrap().weight(), 4);
     }
 
     #[tokio::test]
