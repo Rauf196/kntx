@@ -350,6 +350,14 @@ passthrough routing, and config reload status. Histogram buckets are set for pro
 library defaults: request duration spans 50 µs to 30 s with the density in the 100 µs to 100 ms
 band where proxy-induced cost actually lives.
 
+**Health endpoints** on the same socket. `/healthz` is liveness: 200 while the process is up. A
+crashed listener task takes the process down with it, so there is no state where it lies. `/ready`
+is readiness: 200 when every pool can still reach a backend, 503 naming the first pool that cannot.
+Point a Kubernetes readiness probe or an ALB target group at `/ready` and the instance is pulled
+from rotation when its backends die, rather than kept in it because the port still answers. They
+share the metrics socket because they share its exposure class - read-only, no secrets, and
+reachable from the network by whoever scrapes or probes.
+
 **Access logs**, one JSON line per completed request, to stdout, stderr, or a file. Carries
 timestamp, listener, client IP, method, host, path, query, status, bytes each way, total and
 backend-wait duration, backend, pool, route ID, request ID, trace ID, and keep-alive index. Pre-route

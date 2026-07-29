@@ -146,10 +146,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if let Some(ref metrics_config) = config.metrics {
-        kntx::metrics::install(metrics_config.address)?;
-        tracing::info!(address = %metrics_config.address, "metrics endpoint started");
-    }
+    // recorder and socket come up here so a port conflict fails startup before any
+    // pool or listener work. the endpoint itself starts once listeners are serving,
+    // so /ready can never answer before there is something to be ready for.
+    let metrics_endpoint = match config.metrics {
+        Some(ref m) => Some((
+            kntx::metrics::install()?,
+            kntx::metrics::endpoint::bind(m.address).await?,
+        )),
+        None => None,
+    };
 
     let strategy = config.forwarding.strategy;
 
@@ -306,6 +312,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             drain_rx,
         ));
         task_addrs.insert(abort.id(), listener_cfg.address);
+    }
+
+    if let Some((handle, listener)) = metrics_endpoint {
+        let address = listener.local_addr()?;
+        kntx::metrics::endpoint::spawn(listener, handle, Arc::clone(&config_state));
+        tracing::info!(%address, "metrics endpoint started (/metrics, /healthz, /ready)");
     }
 
     // SIGHUP: re-read + validate config, reconcile the running snapshot and push new

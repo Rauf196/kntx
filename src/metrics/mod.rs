@@ -1,12 +1,14 @@
-use std::net::SocketAddr;
+pub mod endpoint;
 
 use metrics::{describe_counter, describe_gauge, describe_histogram};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
-pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+/// installs the global recorder. the returned handle renders the scrape payload
+/// for `endpoint`, which serves it alongside the health routes.
+pub fn install() -> Result<PrometheusHandle, Box<dyn std::error::Error>> {
     // recorder must be installed before describe_* - otherwise descriptions go to the
     // noop recorder and never reach /metrics as # HELP / # TYPE lines.
-    PrometheusBuilder::new()
+    let handle = PrometheusBuilder::new()
         // proxy-scale latency buckets: 50µs-30s, denser in the 100µs-100ms range
         .set_buckets_for_metric(
             Matcher::Full("kntx_http_request_duration_seconds".into()),
@@ -29,8 +31,7 @@ pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             Matcher::Full("kntx_http_keepalive_requests".into()),
             &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0],
         )?
-        .with_http_listener(address)
-        .install()?;
+        .install_recorder()?;
 
     describe_counter!(
         "kntx_connections_total",
@@ -195,5 +196,5 @@ pub fn install(address: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         "Monotonic version of the running config, incremented on each committed reload."
     );
 
-    Ok(())
+    Ok(handle)
 }

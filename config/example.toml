@@ -9,6 +9,8 @@ strategy = "userspace"
 [logging]
 level = "info"
 
+# serves /metrics (prometheus), /healthz (liveness) and /ready (readiness).
+# omitting this section binds nothing; collection still runs.
 [metrics]
 address = "0.0.0.0:9090"
 
