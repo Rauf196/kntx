@@ -6,6 +6,7 @@ pub mod listener;
 pub mod metrics;
 pub mod pool;
 pub mod proxy;
+pub mod proxy_protocol;
 pub mod rate_limit;
 pub mod runtime;
 pub mod tls;

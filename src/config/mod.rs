@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::proxy_protocol::TrustedCidr;
+
 /// route entry inside a `[[listeners.routes]]` array.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RouteConfig {
@@ -151,6 +153,12 @@ pub enum ConfigError {
          route limits are enforced per HTTP request; use the listener-level rate_limit"
     )]
     RateLimitOnNonL7Route { listener: SocketAddr },
+
+    #[error(
+        "listener {listener} sets 'proxy_protocol_from' but not 'proxy_protocol' - \
+         the trust list is only consulted on listeners that require the header"
+    )]
+    TrustedPeersWithoutProxyProtocol { listener: SocketAddr },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -249,6 +257,15 @@ pub struct ListenerConfig {
     pub clienthello_timeout_secs: u64,
     /// rate limit zone enforced per connection at accept, any mode.
     pub rate_limit: Option<String>,
+    /// require a PROXY protocol header on every connection, any mode. once on it
+    /// is mandatory: taking either a header or a bare connection on one port
+    /// would let a client pick its own source address.
+    #[serde(default)]
+    pub proxy_protocol: bool,
+    /// peers allowed to send the header, as `<address>` or `<address>/<prefix>`.
+    /// empty trusts any peer that can reach the listener.
+    #[serde(default)]
+    pub proxy_protocol_from: Vec<TrustedCidr>,
 }
 
 /// backend selection algorithm for a pool.
@@ -396,6 +413,8 @@ impl Default for ListenerConfig {
             keepalive_max_requests: None,
             clienthello_timeout_secs: default_clienthello_timeout(),
             rate_limit: None,
+            proxy_protocol: false,
+            proxy_protocol_from: Vec::new(),
         }
     }
 }
@@ -690,6 +709,11 @@ impl Config {
                 return Err(ConfigError::UnknownRateLimitZone {
                     listener: listener.address,
                     zone: zone.clone(),
+                });
+            }
+            if !listener.proxy_protocol_from.is_empty() && !listener.proxy_protocol {
+                return Err(ConfigError::TrustedPeersWithoutProxyProtocol {
+                    listener: listener.address,
                 });
             }
             match (&listener.pool, listener.routes.is_empty()) {
@@ -1406,6 +1430,69 @@ mod tests {
         );
         let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
         assert!(matches!(err, ConfigError::RateLimitOnNonL7Route { .. }));
+    }
+
+    fn proxy_protocol_config(listener_fields: &str) -> String {
+        format!(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+            {listener_fields}
+
+            [[pools]]
+            name = "web"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#
+        )
+    }
+
+    #[test]
+    fn proxy_protocol_trust_list_parses() {
+        let file = write_temp_config(&proxy_protocol_config(
+            r#"proxy_protocol = true
+            proxy_protocol_from = ["10.0.0.0/8", "2001:db8::/32", "192.0.2.7"]"#,
+        ));
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        let trusted = &config.listeners[0].proxy_protocol_from;
+        assert_eq!(trusted.len(), 3);
+        assert!(trusted[0].contains("10.1.2.3".parse().unwrap()));
+        assert!(!trusted[0].contains("11.1.2.3".parse().unwrap()));
+    }
+
+    #[test]
+    fn proxy_protocol_defaults_off_with_no_trust_list() {
+        let file = write_temp_config(&proxy_protocol_config(""));
+        let config = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert!(!config.listeners[0].proxy_protocol);
+        assert!(config.listeners[0].proxy_protocol_from.is_empty());
+    }
+
+    #[test]
+    fn trust_list_without_proxy_protocol_rejected() {
+        let file = write_temp_config(&proxy_protocol_config(
+            r#"proxy_protocol_from = ["10.0.0.0/8"]"#,
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::TrustedPeersWithoutProxyProtocol { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_trusted_cidr_rejected() {
+        let file = write_temp_config(&proxy_protocol_config(
+            r#"proxy_protocol = true
+            proxy_protocol_from = ["10.0.0.0/33"]"#,
+        ));
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to parse"),
+            "a bad CIDR must fail at parse with the file named: {err}"
+        );
     }
 
     #[test]

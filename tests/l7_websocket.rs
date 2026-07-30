@@ -85,6 +85,7 @@ async fn start_proxy(backend_addr: SocketAddr, opts: ProxyOpts) -> Proxy {
         max_body_size_bytes: None,
         clienthello_timeout_secs: 10,
         rate_limit: None,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(opts.buffer_pool.unwrap_or_else(BufferPool::with_defaults));

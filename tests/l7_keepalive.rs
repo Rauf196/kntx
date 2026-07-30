@@ -102,6 +102,7 @@ async fn start_proxy_pool(
         max_body_size_bytes: opts.max_body_size_bytes,
         clienthello_timeout_secs: 10,
         rate_limit: None,
+        ..Default::default()
     });
 
     let buffer_pool = Arc::new(BufferPool::with_defaults());

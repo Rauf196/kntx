@@ -140,6 +140,15 @@ pub fn install() -> Result<PrometheusHandle, Box<dyn std::error::Error>> {
     );
 
     describe_counter!(
+        "kntx_proxy_protocol_headers_total",
+        "PROXY protocol headers accepted (labels: listener, version=v1|v2)."
+    );
+    describe_counter!(
+        "kntx_proxy_protocol_rejects_total",
+        "Connections refused before routing for a missing or bad PROXY protocol header (labels: listener, reason=not_proxy_protocol|malformed|too_large|eof|io|timeout|untrusted)."
+    );
+
+    describe_counter!(
         "kntx_backend_pool_checkouts_total",
         "Backend keepalive cache checkouts (labels: pool, backend, outcome=hit|miss|stale)."
     );

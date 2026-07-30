@@ -11,7 +11,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-stable-orange.svg" alt="Rust"></a>
   <img src="https://img.shields.io/badge/platform-linux-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/tests-551-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-553-brightgreen.svg" alt="Tests">
 </p>
 
 ---
@@ -49,6 +49,7 @@ Every listener picks its own mode, its own routes, and its own backend pool, in 
 | **Resilience** | per-backend circuit breakers, active TCP probes, passive failure tracking, connect retries with failover |
 | **Rate limiting** | GCRA on a lock-free set-associative cache; nginx-style named zones attached per listener or per route |
 | **Hot reload** | `SIGHUP` swaps pools, routes, listeners, TLS certs, and rate-limit zones with no restart and no dropped connections |
+| **PROXY protocol** | v1 and v2 ingress, any listener mode, so the real client address survives an L4 balancer in front - including on the `splice(2)` path |
 | **Observability** | 42 Prometheus metrics, structured JSON access logs, W3C `traceparent` propagation |
 
 Not implemented: HTTP/2, HTTP/3, backend TLS, request-body buffering, forward-proxy `CONNECT`.
@@ -372,6 +373,111 @@ when absent. OTLP span emission is planned.
 `kntx_config_last_reload_success` is the alert to wire up: 0 means a replica rejected a reload and
 is serving stale config. `kntx_config_version` confirms a fleet has converged.
 
+## Deployment
+
+### Behind an L4 load balancer
+
+An NLB and kntx are not substitutes, they compose. The balancer spreads load across the fleet and
+survives losing an availability zone; kntx decides what happens to each request, which an L4
+balancer cannot do at all.
+
+| layer | owns |
+|---|---|
+| L4 balancer (NLB, ELB in TCP mode, another HAProxy) | spreading load across instances, AZ failover, registration and drain |
+| kntx | routing, rate limiting, TLS termination or passthrough, circuit breaking, retries, keep-alive |
+| backends | the application |
+
+Because the balancer terminates the TCP connection, the peer address kntx sees is the balancer's.
+Without PROXY protocol, `X-Forwarded-For`, `X-Real-IP`, access logs, and **per-IP rate limiting** all
+key on the balancer rather than the client.
+
+Enable it on the sender - AWS: the `proxy_protocol_v2.enabled` target group attribute; HAProxy:
+`send-proxy-v2` on the server line; nginx: `proxy_protocol on` inside a `stream` block, since the
+`http` upstream cannot send it at all - and on the listener:
+
+```toml
+[[listeners]]
+address             = "0.0.0.0:8443"
+mode                = "l7"
+pool                = "web"
+proxy_protocol      = true
+proxy_protocol_from = ["10.0.0.0/16"]   # the balancer subnets, nothing else
+```
+
+> **Once `proxy_protocol` is on, the header is mandatory on that listener.** A port that accepts
+> either a header or a bare connection lets any client claim any source address. There is no mixed
+> mode by design; give plain clients their own listener.
+
+`proxy_protocol_from` restricts which peers may send the header. Leaving it empty trusts anything
+that can reach the port - HAProxy `accept-proxy`'s model, and only safe when the port is reachable
+from the balancer alone. Set it whenever that is not provably true.
+
+v1 and v2 are both accepted. A `LOCAL` header, which is what a balancer sends for its own health
+check, keeps the socket peer rather than inventing a client address. This works in **every listener
+mode**, including `l4` and `tls-passthrough` where there is no HTTP request to inject a header into,
+and it does not cost the zero-copy path: the header is consumed before `splice(2)` takes over.
+
+One interaction to know about. On a `proxy_protocol` listener the listener-level `rate_limit` check
+runs after the header is read rather than at accept, because the address to key on does not exist
+any earlier. A rejected connection has therefore already taken a `max_connections` slot, so on that
+listener `max_connections` rather than the zone is what bounds a flood.
+
+### Health checks
+
+Point the target group at `/ready` over HTTP on the `[metrics]` port, not a TCP check on the traffic
+port. A TCP check only proves the socket is bound, so an instance whose every backend pool is dead
+stays in rotation; `/ready` returns 503 naming the first pool that cannot reach a backend. See
+[Observability](#observability) for what each endpoint means.
+
+### Draining
+
+Three settings have to be ordered around `drain_timeout_secs` or the graceful shutdown that already
+works gets defeated:
+
+```
+deregistration delay  >=  drain_timeout_secs  <  TimeoutStopSec
+```
+
+- **Deregistration delay at least `drain_timeout_secs`.** `SIGTERM` makes kntx stop accepting and
+  close its listening sockets at once, then drain in-flight work. A balancer still sending new
+  connections gets refused ones. AWS defaults this to 300s, so the trap is shortening it for faster
+  deploys without shortening the drain to match.
+- **`TimeoutStopSec` above `drain_timeout_secs`.** systemd `SIGKILL`s at `TimeoutStopSec`; set it at
+  or below the drain timeout and it kills mid-drain, which is precisely what the drain exists to
+  avoid.
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/kntx --config /etc/kntx/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=45      # must exceed drain_timeout_secs (default 30)
+LimitNOFILE=21280      # see File descriptor limit; a unit does not inherit your shell's
+Restart=on-failure
+User=kntx
+```
+
+`systemctl reload kntx` then maps to `SIGHUP`, which swaps pools, routes, listeners, certs, and
+rate-limit zones in place. A reload that fails validation aborts before mutating anything and the
+running config keeps serving, so check it before shipping:
+
+```bash
+kntx --config /etc/kntx/config.toml --validate
+```
+
+### Common mistakes
+
+| symptom | cause |
+|---|---|
+| every client shares one rate-limit budget | `proxy_protocol` off behind an L4 balancer |
+| access logs record the balancer's IP | same |
+| all connections refused right after enabling `proxy_protocol` | the sender is not configured to send the header, which is mandatory once the listener requires it |
+| connections refused during a rolling deploy | deregistration delay shorter than `drain_timeout_secs` |
+| requests cut mid-flight on restart | `TimeoutStopSec` at or below `drain_timeout_secs` |
+| instance stays in rotation with every backend dead | target group doing a TCP check instead of `/ready` |
+| reload appears to do nothing | the field is restart-only; the log says so, and `kntx_config_version` still advances |
+| `Too many open files` under load | see [File descriptor limit](#file-descriptor-limit) |
+
 ## Limits
 
 Honest list of what kntx does not do.
@@ -389,13 +495,11 @@ Honest list of what kntx does not do.
   out of scope.
 - **HTTP pipelining.** Deprecated by browsers and replaced by HTTP/2 multiplexing. kntx reads the
   next request only after the previous response completes, which is current industry behavior.
-- **No PROXY protocol, so the client IP is wrong behind an L4 load balancer.** kntx reads the client
-  address from the socket. Put an AWS NLB (or any L4 balancer) in front and that address is the
-  balancer's, which means `X-Forwarded-For`, `X-Real-IP`, access logs, and **per-IP rate limiting**
-  all key on the balancer rather than the client. kntx deliberately refuses `X-Forwarded-For` as a
-  rate-limit key because it is spoofable at the edge, so today there is no correct way to per-IP rate
-  limit in that topology. Behind an L7 balancer that sets `X-Forwarded-For` the logging story is
-  fine; the rate-limiting one still is not. PROXY protocol support is the fix and is planned.
+- **PROXY protocol is ingress only.** kntx reads the header to recover the client address (see
+  [Deployment](#behind-an-l4-load-balancer)) but does not send one upstream. On an `l7` listener that
+  does not matter, because backends get `X-Forwarded-For` and `X-Real-IP`. On `l4` and
+  `tls-passthrough` there is no header to inject and no way to tell the backend who the client is, so
+  a backend that needs the client address has to sit behind an L7 listener.
 - **No session affinity.** No consistent hashing or sticky sessions, so stateful backends, shard
   routing, and cache-locality workloads are not served. Round-robin, least-connections and weighted
   all assume any backend can take any request.
@@ -412,7 +516,7 @@ Honest list of what kntx does not do.
 ## Development
 
 ```bash
-cargo test                                  # 551 tests
+cargo test                                  # 585 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 kntx --config config.toml --validate        # check a config without binding anything
@@ -426,10 +530,9 @@ including splice.
 
 ## Roadmap
 
-Near term: PROXY protocol, which closes the client-IP gap above and is what makes running behind an
-L4 load balancer correct rather than merely functional. Admin endpoints (`/healthz`, `/ready`,
-`/config_dump`) so an orchestrator or a cloud target group can drain an instance properly. Then
-consistent hashing for session affinity, and OpenTelemetry span emission with Prometheus exemplars.
+Near term: the rest of the admin surface (`/config_dump`, `/clusters`, and a forced-unhealthy toggle
+so an instance can be drained for maintenance without stopping the process). Then consistent hashing
+for session affinity, and OpenTelemetry span emission with Prometheus exemplars.
 
 Longer term, kntx is aiming at programmable proxy logic, the space Cloudflare Workers, Envoy
 filters, and nginx+Lua occupy, but with the priority order inverted: performance first,

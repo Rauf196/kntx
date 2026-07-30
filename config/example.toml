@@ -53,6 +53,30 @@ pool = "web"
 # connect_timeout_secs = 5
 # max_connect_attempts = 3
 
+# PROXY protocol (any mode). Behind an L4 balancer - an AWS NLB, an ELB in TCP
+# mode, another HAProxy - the TCP peer is the balancer, so X-Forwarded-For, the
+# access log and per-IP rate limiting would all key on it. Turn this on and the
+# real client address is read from the header the balancer prepends.
+#
+# Once on, the header is REQUIRED. Taking either a header or a bare connection on
+# one port would let any client claim any source address, so there is no mixed
+# mode; give the balancer its own listener if plain clients also need one.
+#
+# proxy_protocol = true
+#
+# Peers allowed to send it, as an address or address/prefix. Empty (the default)
+# trusts anything that can reach the listener, which assumes the port is only
+# reachable from the balancer - the same assumption HAProxy's accept-proxy makes.
+# Set it when the port is reachable more widely than that.
+#
+# proxy_protocol_from = ["10.0.0.0/8", "172.31.0.0/16"]
+#
+# One caveat with `rate_limit` below: on a proxy_protocol listener the zone check
+# happens after the header is read rather than at accept, because the address to
+# key on does not exist before then. A denied connection has therefore already
+# taken a max_connections slot, so max_connections rather than the zone is what
+# bounds a flood on this listener.
+
 # TLS listener - dotted keys + inline cert array keeps everything in one block.
 # uncomment a `tls.certificates = [...]` line below to enable.
 [[listeners]]

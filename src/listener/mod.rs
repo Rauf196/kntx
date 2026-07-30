@@ -17,9 +17,14 @@ use crate::proxy::l4::{self, Resources};
 use crate::proxy::l7::matcher::RouteContext;
 use crate::proxy::l7::router::Router;
 use crate::proxy::l7::{self, ClientStream, ErrorPages};
+use crate::proxy_protocol;
 use crate::rate_limit::{Decision, ZoneHandle};
 use crate::tls::passthrough;
 use crate::util::monotonic_millis;
+
+/// bound on the header-read phase. the balancer sends it in its first segment,
+/// so this is a slowloris cap rather than a knob anyone needs to tune.
+const PROXY_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum ListenerError {
@@ -95,6 +100,44 @@ pub async fn bind(address: SocketAddr) -> Result<TcpListener, ListenerError> {
         .map_err(|source| ListenerError::Bind { address, source })
 }
 
+/// close a rate limited connection with an RST instead of a FIN: no proxy-side
+/// TIME_WAIT buildup under flood, and the client hears the refusal immediately.
+/// non-linux keeps the plain close.
+fn reject_rate_limited(client: TcpStream, peer: SocketAddr, zone: &str, listener_label: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if let Err(e) = crate::util::set_linger_rst(client.as_raw_fd()) {
+            tracing::debug!(%peer, error = %e, "failed to set linger on rate limited conn");
+        }
+    }
+    drop(client);
+    tracing::debug!(%peer, zone, "connection rate limited");
+    metrics::counter!(
+        "kntx_rate_limit_rejected_total",
+        "listener" => listener_label.to_string(),
+        "zone" => zone.to_string(),
+        "scope" => "listener",
+    )
+    .increment(1);
+}
+
+/// count a refused PROXY protocol connection and close out its share of the
+/// active gauge, which the accept loop already incremented.
+fn reject_proxy_protocol(listener_label: &str, reason: &'static str) {
+    metrics::counter!(
+        "kntx_proxy_protocol_rejects_total",
+        "listener" => listener_label.to_string(),
+        "reason" => reason,
+    )
+    .increment(1);
+    metrics::gauge!(
+        "kntx_connections_active",
+        "listener" => listener_label.to_string(),
+    )
+    .decrement(1.0);
+}
+
 async fn idle_watchdog(last_activity: &AtomicU64, timeout: Duration) {
     let timeout_millis = timeout.as_millis() as u64;
     let check_interval = Duration::from_secs(1).min(timeout / 4);
@@ -146,30 +189,15 @@ pub async fn serve(
                         let rt = runtime.load_full();
 
                         // before the max_connections permit (a rejected conn must
-                        // not consume a slot) and before any socket or TLS work
-                        if let Some(ref rl) = rt.rate_limit
+                        // not consume a slot) and before any socket or TLS work.
+                        // a proxy_protocol listener cannot check here - the peer is
+                        // the balancer and the address to key on has not been read
+                        // yet - so it checks inside the task instead.
+                        if !rt.listener_cfg.proxy_protocol
+                            && let Some(ref rl) = rt.rate_limit
                             && let Decision::Deny { .. } = rl.limiter.check(peer.ip())
                         {
-                            // linger 0 turns the close into an RST: no proxy-side
-                            // TIME_WAIT buildup under flood, and the client hears
-                            // the refusal immediately instead of a silent FIN.
-                            // non-linux keeps the plain close.
-                            #[cfg(target_os = "linux")]
-                            {
-                                use std::os::fd::AsRawFd;
-                                if let Err(e) = crate::util::set_linger_rst(client.as_raw_fd()) {
-                                    tracing::debug!(%peer, error = %e, "failed to set linger on rate limited conn");
-                                }
-                            }
-                            drop(client);
-                            tracing::debug!(%peer, zone = %rl.name, "connection rate limited");
-                            metrics::counter!(
-                                "kntx_rate_limit_rejected_total",
-                                "listener" => listener_label.to_string(),
-                                "zone" => rl.name.to_string(),
-                                "scope" => "listener",
-                            )
-                            .increment(1);
+                            reject_rate_limited(client, peer, &rl.name, &listener_label);
                             break 'accept;
                         }
 
@@ -225,14 +253,83 @@ pub async fn serve(
                         tasks.spawn(async move {
                             let _permit = permit;
 
+                            // behind an L4 balancer the socket peer is the balancer.
+                            // client_addr is the single answer to "who is the client"
+                            // from here down: routing, rate limiting, XFF, access log.
+                            let mut client = client;
+                            let mut client_addr = peer;
+
+                            if rt.listener_cfg.proxy_protocol {
+                                if !proxy_protocol::peer_trusted(
+                                    &rt.listener_cfg.proxy_protocol_from,
+                                    peer.ip(),
+                                ) {
+                                    tracing::warn!(%peer, "peer is not trusted to send a PROXY protocol header");
+                                    reject_proxy_protocol(&listener_label, "untrusted");
+                                    return;
+                                }
+
+                                match tokio::time::timeout(
+                                    PROXY_PROTOCOL_TIMEOUT,
+                                    proxy_protocol::read_header(&mut client),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(recovered)) => {
+                                        metrics::counter!(
+                                            "kntx_proxy_protocol_headers_total",
+                                            "listener" => listener_label.to_string(),
+                                            "version" => recovered.version.label(),
+                                        )
+                                        .increment(1);
+                                        match recovered.source {
+                                            Some(source) => {
+                                                tracing::debug!(%peer, client = %source, "client address recovered");
+                                                client_addr = source;
+                                            }
+                                            // LOCAL or UNKNOWN: the sender is speaking
+                                            // for itself, typically a health check, so
+                                            // it is the client.
+                                            None => tracing::debug!(%peer, "PROXY protocol header carried no client address"),
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        tracing::debug!(%peer, error = %e, "PROXY protocol header rejected");
+                                        reject_proxy_protocol(&listener_label, e.metric_reason());
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        tracing::debug!(%peer, "PROXY protocol header timed out");
+                                        reject_proxy_protocol(&listener_label, "timeout");
+                                        return;
+                                    }
+                                }
+
+                                // deferred from the accept loop. the cost of keying on
+                                // the real client is that a denial here has already
+                                // taken a max_connections permit, so that limit rather
+                                // than the zone is what bounds a flood on this listener.
+                                if let Some(ref rl) = rt.rate_limit
+                                    && let Decision::Deny { .. } =
+                                        rl.limiter.check(client_addr.ip())
+                                {
+                                    reject_rate_limited(client, client_addr, &rl.name, &listener_label);
+                                    metrics::gauge!(
+                                        "kntx_connections_active",
+                                        "listener" => listener_label.to_string(),
+                                    )
+                                    .decrement(1.0);
+                                    return;
+                                }
+                            }
+
                             // peeked is Some only for tls-passthrough: ClientHello bytes the
                             // client already sent, which must reach the backend first.
                             let (client_conn, conn_sni, peeked) = if rt.listener_cfg.mode
                                 == ListenerMode::TlsPassthrough
                             {
-                                let mut client = client;
                                 let Some(mut peek_buf) = buffer_pool.get() else {
-                                    tracing::warn!(%peer, "buffer pool exhausted during ClientHello peek");
+                                    tracing::warn!(%client_addr, "buffer pool exhausted during ClientHello peek");
                                     metrics::counter!(
                                         "kntx_tls_passthrough_rejects_total",
                                         "listener" => listener_label.to_string(),
@@ -258,9 +355,9 @@ pub async fn serve(
                                         let sni: Option<Arc<str>> =
                                             hello.sni.as_deref().map(Arc::from);
                                         if let Some(ref s) = sni {
-                                            tracing::debug!(%peer, sni = %s, len = hello.len, "ClientHello peeked");
+                                            tracing::debug!(%client_addr, sni = %s, len = hello.len, "ClientHello peeked");
                                         } else {
-                                            tracing::debug!(%peer, len = hello.len, "ClientHello peeked (no SNI)");
+                                            tracing::debug!(%client_addr, len = hello.len, "ClientHello peeked (no SNI)");
                                             metrics::counter!(
                                                 "kntx_tls_passthrough_no_sni_total",
                                                 "listener" => listener_label.to_string(),
@@ -270,7 +367,7 @@ pub async fn serve(
                                         (ClientConn::Plain(client), sni, Some((peek_buf, hello.len)))
                                     }
                                     Ok(Err(e)) => {
-                                        tracing::debug!(%peer, error = %e, "ClientHello peek failed");
+                                        tracing::debug!(%client_addr, error = %e, "ClientHello peek failed");
                                         metrics::counter!(
                                             "kntx_tls_passthrough_rejects_total",
                                             "listener" => listener_label.to_string(),
@@ -285,7 +382,7 @@ pub async fn serve(
                                         return;
                                     }
                                     Err(_) => {
-                                        tracing::debug!(%peer, "ClientHello peek timed out");
+                                        tracing::debug!(%client_addr, "ClientHello peek timed out");
                                         metrics::counter!(
                                             "kntx_tls_passthrough_rejects_total",
                                             "listener" => listener_label.to_string(),
@@ -327,15 +424,15 @@ pub async fn serve(
                                             .server_name()
                                             .map(Arc::from);
                                         if let Some(ref s) = sni {
-                                            tracing::debug!(%peer, sni = %s, "TLS handshake completed");
+                                            tracing::debug!(%client_addr, sni = %s, "TLS handshake completed");
                                         } else {
-                                            tracing::debug!(%peer, "TLS handshake completed (no SNI)");
+                                            tracing::debug!(%client_addr, "TLS handshake completed (no SNI)");
                                         }
 
                                         (ClientConn::Tls(Box::new(tls)), sni, None)
                                     }
                                     Ok(Err(e)) => {
-                                        tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                                        tracing::debug!(%client_addr, error = %e, "TLS handshake failed");
                                         metrics::counter!(
                                             "kntx_tls_handshake_failures_total",
                                             "listener" => listener_label.to_string(),
@@ -350,7 +447,7 @@ pub async fn serve(
                                         return;
                                     }
                                     Err(_) => {
-                                        tracing::debug!(%peer, "TLS handshake timed out");
+                                        tracing::debug!(%client_addr, "TLS handshake timed out");
                                         metrics::counter!(
                                             "kntx_tls_handshake_failures_total",
                                             "listener" => listener_label.to_string(),
@@ -369,7 +466,7 @@ pub async fn serve(
                                 (ClientConn::Plain(client), None, None)
                             };
 
-                            let span = tracing::info_span!("conn", %peer);
+                            let span = tracing::info_span!("conn", client = %client_addr);
 
                             async {
                                 let last_activity = Arc::new(AtomicU64::new(monotonic_millis()));
@@ -383,7 +480,7 @@ pub async fn serve(
 
                                         let forward_fut = l7::forward_l7(
                                             l7_stream,
-                                            peer,
+                                            client_addr,
                                             conn_sni.clone(),
                                             Arc::clone(&rt.listener_cfg),
                                             Arc::clone(&rt.router),
@@ -420,12 +517,12 @@ pub async fn serve(
                                             path: None,
                                             headers: &[],
                                             sni: conn_sni.as_deref(),
-                                            client_ip: peer.ip(),
+                                            client_ip: client_addr.ip(),
                                         };
                                         let l4_entry = match rt.router.route(&l4_ctx) {
                                             Some(e) => e,
                                             None => {
-                                                tracing::warn!(%peer, "no route for L4 connection");
+                                                tracing::warn!("no route for L4 connection");
                                                 metrics::counter!(
                                                     "kntx_route_no_match_total",
                                                     "listener" => listener_label.to_string(),
@@ -455,7 +552,7 @@ pub async fn serve(
                                             let addr = match rr.next_backend() {
                                                 Some(a) => a,
                                                 None => {
-                                                    tracing::warn!(%peer, "no healthy backends available");
+                                                    tracing::warn!("no healthy backends available");
                                                     break None;
                                                 }
                                             };
@@ -476,10 +573,10 @@ pub async fn serve(
                                                         "listener" => listener_label.to_string(),
                                                     ).increment(1);
                                                     if attempts >= max_connect_attempts {
-                                                        tracing::warn!(%peer, attempts, "all retry attempts exhausted");
+                                                        tracing::warn!(attempts, "all retry attempts exhausted");
                                                         break None;
                                                     }
-                                                    tracing::debug!(%peer, %addr, attempt = attempts, error = %e, "retrying");
+                                                    tracing::debug!(%addr, attempt = attempts, error = %e, "retrying");
                                                 }
                                             }
                                         };
@@ -501,7 +598,7 @@ pub async fn serve(
                                         if let Some((peek_buf, peek_len)) = peeked {
                                             use tokio::io::AsyncWriteExt;
                                             if let Err(e) = server.write_all(&peek_buf[..peek_len]).await {
-                                                tracing::warn!(%peer, error = %e, "failed to flush ClientHello to backend");
+                                                tracing::warn!(error = %e, "failed to flush ClientHello to backend");
                                                 pool.record_failure(backend_addr);
                                                 metrics::gauge!(
                                                     "kntx_connections_active",
