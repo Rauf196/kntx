@@ -41,6 +41,10 @@ const DEFAULT_KEEPALIVE_MAX_REQUESTS: u32 = 1000;
 /// default for every phase-specific timeout when neither the specific knob nor
 /// the listener's legacy `idle_timeout_secs` fallback is set.
 const DEFAULT_PHASE_TIMEOUT_SECS: u64 = 60;
+/// largest first body chunk appended to the response head so the two leave in
+/// one write. bounds how far the per-connection head buffer can grow, since it
+/// is reused for the life of the connection.
+const RESPONSE_COALESCE_MAX: usize = 4096;
 
 /// Resolved phase-specific timeouts. Each is per-call (the gap between two
 /// successive successful I/O ops) except `request`, which is the single
@@ -174,6 +178,42 @@ async fn emit_timeout<W>(
         Some(route_id),
         keepalive_index,
     );
+}
+
+/// Head buffers owned by the keep-alive loop and reused for every request on
+/// the connection. Sized once from the listener's header limit.
+///
+/// Each is cleared at the top of the cycle rather than at the end: `read_head`
+/// appends and scans the whole buffer for the terminator, so it needs an empty
+/// one, and clearing on entry keeps that guarantee on every path in.
+struct HeadBufs {
+    /// request head read from the client
+    client_head: Vec<u8>,
+    /// request head rewritten for the backend
+    client_head_out: BytesMut,
+    /// response head read from the backend
+    backend_head: Vec<u8>,
+    /// response head rewritten for the client
+    backend_head_out: BytesMut,
+}
+
+impl HeadBufs {
+    fn new(header_limit: usize) -> Self {
+        let head = header_limit.min(8192);
+        Self {
+            client_head: Vec::with_capacity(head),
+            client_head_out: BytesMut::with_capacity(head),
+            backend_head: Vec::with_capacity(8192),
+            backend_head_out: BytesMut::with_capacity(4096),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.client_head.clear();
+        self.client_head_out.clear();
+        self.backend_head.clear();
+        self.backend_head_out.clear();
+    }
 }
 
 /// Outcome of one request/response cycle, consumed by the keep-alive loop.
@@ -321,6 +361,8 @@ where
     // phase timeouts are per-connection config, constant across the loop.
     let tmo = PhaseTimeouts::resolve(&listener_cfg);
 
+    let mut heads = HeadBufs::new(listener_cfg.header_size_limit_bytes);
+
     let mut keepalive_index: u32 = 0;
 
     loop {
@@ -369,6 +411,7 @@ where
             &access_log,
             &last_activity,
             &mut buf_guard,
+            &mut heads,
             &listener_label,
             keepalive_index,
             keepalive_max,
@@ -449,6 +492,7 @@ async fn forward_one_request<R, W>(
     access_log: &AccessLogSink,
     last_activity: &Arc<AtomicU64>,
     scratch: &mut [u8],
+    heads: &mut HeadBufs,
     listener_label: &str,
     keepalive_index: u32,
     keepalive_max: u32,
@@ -480,12 +524,13 @@ where
 
     let bump = |la: &Arc<AtomicU64>| la.store(monotonic_millis(), Ordering::Relaxed);
 
-    let mut head_buf: Vec<u8> = Vec::with_capacity(header_limit.min(8192));
+    heads.clear();
+    let head_buf = &mut heads.client_head;
     // `client_header_timeout`: per-call gap budget on the request-head
     // read, clamped to the total deadline.
     let read_result = match tokio::time::timeout(
         call_budget(tmo.header, deadline),
-        read_head(client_rd, &mut head_buf, header_limit, last_activity),
+        read_head(client_rd, head_buf, header_limit, last_activity),
     )
     .await
     {
@@ -557,7 +602,7 @@ where
 
     // http/2 connection preface: httparse returns Malformed for it, so we detect
     // it explicitly and return 505 instead of 400.
-    if looks_like_http2_preface(&head_buf) {
+    if looks_like_http2_preface(head_buf) {
         let request_id = uuid::Uuid::new_v4().to_string();
         let resp = synthesize_error(505, None, error_pages);
         let _ = client_wr.write_all(&resp).await;
@@ -583,7 +628,7 @@ where
     }
 
     // parse the head
-    let req = match parse_request(&head_buf, 128) {
+    let req = match parse_request(head_buf, 128) {
         Err(ParseError::HeaderTooLarge) => {
             let request_id = uuid::Uuid::new_v4().to_string();
             let resp = synthesize_error(431, None, error_pages);
@@ -968,9 +1013,9 @@ where
         &request_id,
         is_ws_upgrade,
     );
-    let mut req_head_buf = BytesMut::with_capacity(header_limit.min(8192));
+    let req_head_buf = &mut heads.client_head_out;
     serialize_request_head(
-        &mut req_head_buf,
+        req_head_buf,
         &method,
         &path,
         version,
@@ -1093,7 +1138,7 @@ where
         // `proxy_send_timeout` on the head write to the backend.
         let write_res = tokio::time::timeout(
             call_budget(tmo.proxy_send, deadline),
-            conn.stream_mut().write_all(&req_head_buf),
+            conn.stream_mut().write_all(req_head_buf),
         )
         .await;
 
@@ -1457,7 +1502,7 @@ where
 
     // read backend response head (loop for 1xx interim responses).
     // bytes_out / final_status hoisted above.
-    let mut resp_head_buf: Vec<u8> = Vec::with_capacity(8192);
+    let resp_head_buf = &mut heads.backend_head;
     #[allow(unused_assignments)]
     let mut backend_wait_ms: Option<f64> = None;
     #[allow(unused_assignments)]
@@ -1471,12 +1516,7 @@ where
         // `proxy_read_timeout`: per-call gap on the backend response-head read.
         let head_result = match tokio::time::timeout(
             call_budget(tmo.proxy_read, deadline),
-            read_head(
-                &mut server_rd,
-                &mut resp_head_buf,
-                header_limit,
-                last_activity,
-            ),
+            read_head(&mut server_rd, resp_head_buf, header_limit, last_activity),
         )
         .await
         {
@@ -1539,7 +1579,7 @@ where
             HeadReadResult::Complete => {}
         }
 
-        let resp = match parse_response(&resp_head_buf, 128) {
+        let resp = match parse_response(resp_head_buf, 128) {
             Ok(ParseOutcome::Complete(r)) => r,
             _ => {
                 pool.record_failure(backend_addr);
@@ -1736,9 +1776,9 @@ where
         // `Keep-Alive` for HTTP/1.0).
         let (resp_skip, resp_additions) =
             build_response_additions(&resp.headers, resp_version, close_after_response, version);
-        let mut resp_head_out = BytesMut::with_capacity(4096);
+        let resp_head_out = &mut heads.backend_head_out;
         serialize_response_head(
-            &mut resp_head_out,
+            resp_head_out,
             resp_version,
             resp.status,
             &resp.reason,
@@ -1747,19 +1787,30 @@ where
             &resp_additions,
         );
         bump(last_activity);
-        if client_wr.write_all(&resp_head_out).await.is_err() {
-            pool.record_failure(backend_addr);
-            // client gone mid-response; end the conn (no error response possible)
-            return CycleOutcome::Done { close: true };
+        let resp_framing = classify_response_body(&resp, &method);
+
+        // A Content-Length body holds the head back so the first chunk can ride
+        // in the same write; every other framing sends it now. Ordering on the
+        // wire is identical either way - the head is still the first thing the
+        // client sees. Holding it also widens where a 504 is still possible: a
+        // backend that stalls on the first body read has not put anything on
+        // the wire yet, so the error is emittable rather than an abrupt close.
+        let hold_head = matches!(resp_framing, BodyFraming::ContentLength(n) if n > 0);
+
+        if !hold_head {
+            if client_wr.write_all(resp_head_out).await.is_err() {
+                pool.record_failure(backend_addr);
+                // client gone mid-response; end the conn (no error response possible)
+                return CycleOutcome::Done { close: true };
+            }
+            bump(last_activity);
+            // response head is on the wire - past this point a timeout can no
+            // longer synthesize a status response; the proxy must close
+            // abruptly to avoid corrupting framing the client has parsed.
+            response_head_sent = true;
         }
-        bump(last_activity);
-        // response head is on the wire - past this point a timeout can no
-        // longer synthesize a status response; the proxy must close
-        // abruptly to avoid corrupting framing the client has parsed.
-        response_head_sent = true;
 
         // stream response body
-        let resp_framing = classify_response_body(&resp, &method);
         let mut body_backend_error = false;
         match resp_framing {
             BodyFraming::None => {}
@@ -1808,7 +1859,21 @@ where
                         Ok(0) => break,
                         Ok(n) => {
                             bump(last_activity);
-                            if client_wr.write_all(&scratch[..n]).await.is_err() {
+                            let wrote = if response_head_sent {
+                                client_wr.write_all(&scratch[..n]).await
+                            } else if n <= RESPONSE_COALESCE_MAX {
+                                resp_head_out.extend_from_slice(&scratch[..n]);
+                                client_wr.write_all(resp_head_out).await
+                            } else {
+                                // too big to join without growing the reused head
+                                // buffer past its bound; send them back to back.
+                                match client_wr.write_all(resp_head_out).await {
+                                    Ok(()) => client_wr.write_all(&scratch[..n]).await,
+                                    e => e,
+                                }
+                            };
+                            response_head_sent = true;
+                            if wrote.is_err() {
                                 break; // client-side error, don't record
                             }
                             bump(last_activity);
@@ -1821,6 +1886,19 @@ where
                             break;
                         }
                     }
+                }
+                // backend closed or errored before any body byte arrived, so the
+                // held-back head never went out. the client is owed the response
+                // it was promised, even though the body will be short.
+                // nothing downstream reads the flag on this arm, but leaving it
+                // stale would hand the next edit a wrong answer.
+                #[allow(unused_assignments)]
+                if !response_head_sent {
+                    if client_wr.write_all(resp_head_out).await.is_err() {
+                        return CycleOutcome::Done { close: true };
+                    }
+                    bump(last_activity);
+                    response_head_sent = true;
                 }
             }
             BodyFraming::Chunked => {

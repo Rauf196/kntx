@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use bytes::BytesMut;
 
 use super::parse::{HttpVersion, ParsedHeader};
@@ -98,8 +100,12 @@ impl SkipSet {
 }
 
 /// header lines to append after the filtered original headers.
+///
+/// Names are always literals, so they borrow rather than allocate. Values are
+/// `Cow` because roughly half are literals too (`http`/`https`, `keep-alive`)
+/// and only the rest are built per request.
 pub struct Additions {
-    pub lines: Vec<(String, String)>,
+    pub lines: Vec<(&'static str, Cow<'static, str>)>,
 }
 
 impl Default for Additions {
@@ -110,11 +116,14 @@ impl Default for Additions {
 
 impl Additions {
     pub fn new() -> Self {
-        Self { lines: Vec::new() }
+        // five on the request path, two on the response path
+        Self {
+            lines: Vec::with_capacity(5),
+        }
     }
 
-    pub fn push(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.lines.push((name.into(), value.into()));
+    pub fn push(&mut self, name: &'static str, value: impl Into<Cow<'static, str>>) {
+        self.lines.push((name, value.into()));
     }
 }
 
@@ -247,7 +256,7 @@ pub fn build_request_additions(
 
     let mut additions = Additions::new();
     additions.push("X-Forwarded-For", xff);
-    additions.push("X-Real-IP", client_ip);
+    additions.push("X-Real-IP", client_ip.to_owned());
     additions.push("X-Forwarded-Proto", proto);
     additions.push("X-Request-ID", request_id.to_owned());
     additions.push("Via", via);
@@ -397,7 +406,7 @@ mod tests {
         let xff = additions
             .lines
             .iter()
-            .find(|(n, _)| n == "X-Forwarded-For")
+            .find(|(n, _)| *n == "X-Forwarded-For")
             .unwrap();
         assert_eq!(xff.1, "1.2.3.4, 5.6.7.8");
     }
@@ -411,7 +420,7 @@ mod tests {
         let xff = additions
             .lines
             .iter()
-            .find(|(n, _)| n == "X-Forwarded-For")
+            .find(|(n, _)| *n == "X-Forwarded-For")
             .unwrap();
         assert_eq!(xff.1, "1.2.3.4");
     }
@@ -428,7 +437,7 @@ mod tests {
         let entry = additions
             .lines
             .iter()
-            .find(|(n, _)| n == "X-Request-ID")
+            .find(|(n, _)| *n == "X-Request-ID")
             .unwrap();
         assert_eq!(entry.1, "my-req-id-123");
     }
@@ -442,7 +451,7 @@ mod tests {
         let entry = additions
             .lines
             .iter()
-            .find(|(n, _)| n == "X-Request-ID")
+            .find(|(n, _)| *n == "X-Request-ID")
             .unwrap();
         assert!(!entry.1.is_empty());
         assert_eq!(entry.1.len(), 36);
@@ -460,7 +469,7 @@ mod tests {
         let entry = additions
             .lines
             .iter()
-            .find(|(n, _)| n == "X-Request-ID")
+            .find(|(n, _)| *n == "X-Request-ID")
             .unwrap();
         assert_eq!(entry.1.len(), 36);
     }
@@ -471,7 +480,7 @@ mod tests {
         let rid = resolve_request_id(&headers);
         let (_, additions) =
             build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid, false);
-        let via = additions.lines.iter().find(|(n, _)| n == "Via").unwrap();
+        let via = additions.lines.iter().find(|(n, _)| *n == "Via").unwrap();
         assert_eq!(via.1, "1.0 upstream, 1.1 kntx");
     }
 
@@ -481,7 +490,7 @@ mod tests {
         let rid = resolve_request_id(&headers);
         let (_, additions) =
             build_request_additions(&headers, "1.1.1.1", false, HttpVersion::Http11, &rid, false);
-        let via = additions.lines.iter().find(|(n, _)| n == "Via").unwrap();
+        let via = additions.lines.iter().find(|(n, _)| *n == "Via").unwrap();
         assert_eq!(via.1, "1.1 kntx");
     }
 

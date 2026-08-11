@@ -11,7 +11,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-stable-orange.svg" alt="Rust"></a>
   <img src="https://img.shields.io/badge/platform-linux-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/tests-553-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-587-brightgreen.svg" alt="Tests">
 </p>
 
 ---
@@ -149,6 +149,11 @@ flat from 10 to 100 streams while nginx plateaus around 32 Gbps.
 
 Linux 7.0.3, nginx 1.29.8, `oha` 1.14. Backend is nginx in all cases. `kntx-l7` runs with the
 backend keep-alive cache at `max_idle = 32`.
+
+This table predates the hot-path work described under Design notes, which cut L7 work per request
+by 13%. It has not been re-measured, and the throughput effect of that change was deliberately not
+estimated from it - the run-to-run spread on this machine is wider than the change. Both get
+re-run together for the final benchmark.
 
 | Concurrency | | RPS | p50 | p99 | success |
 |---|---|---:|---:|---:|---:|
@@ -315,6 +320,22 @@ epsilon. That precision caught two real protocol races: a blind TAT store after 
 could roll back concurrent admits, and a two-pass scan/select duplicated hot new keys across empty
 ways about 1% of runs. Both are fixed; every admit is now exactly one successful CAS. An epsilon
 bound would have hidden both.
+
+**Optimizations are measured in instructions per request, not RPS.** On this hardware the same
+binary drifts from 35k to 17k RPS across rounds of an identical workload, which is far wider than
+any change worth making, so throughput cannot tell you whether an optimization worked. Instructions
+per request can: frequency scaling changes how long a request takes, not how much work it is, and
+side-by-side it repeats to within 0.1%. `scripts/ab-compare.sh` alternates two builds round by
+round, flipping order every other round so residual drift lands on both sides.
+
+That instrument measured three L7 changes at -2.0%, -8.1% and -3.7% individually and **-13.3% end
+to end**, with the isolated figures compounding to -13.35% against the direct measurement. It also
+overturned what profiling was expected to find. Metric `Key` construction was the predicted
+bottleneck and came sixth of seven at 8 allocations per request. Moving four per-request buffers
+onto the connection removed 58% of the bytes a request allocates and bought 2%; removing one
+`sendto` of three bought 8%. Bytes allocated is a weak proxy for cost - allocation *count* barely
+moved - and on a machine with Meltdown and Spectre mitigations active, a kernel crossing is simply
+worth more than a large allocation that is never fully faulted in.
 
 ## Configuration
 
@@ -516,7 +537,7 @@ Honest list of what kntx does not do.
 ## Development
 
 ```bash
-cargo test                                  # 585 tests
+cargo test                                  # 587 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 kntx --config config.toml --validate        # check a config without binding anything

@@ -318,7 +318,13 @@ async fn raw_request(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
 }
 
 fn parse_status(resp: &[u8]) -> u16 {
-    let s = std::str::from_utf8(resp).unwrap_or("");
+    // status line only: decoding the whole response would make any binary body
+    // fail utf8 and report 0 instead of the real status.
+    let end = resp
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(resp.len());
+    let s = std::str::from_utf8(&resp[..end]).unwrap_or("");
     let parts: Vec<&str> = s.splitn(3, ' ').collect();
     if parts.len() >= 2 {
         parts[1].parse().unwrap_or(0)
@@ -441,6 +447,79 @@ async fn expect_100_continue_relayed() {
     let s = String::from_utf8_lossy(&resp);
     // response should contain either 100 intermediate or just the final 200
     assert!(s.contains("200"));
+}
+
+/// Content-Length bodies leave with the response head in one write when they
+/// fit and in two when they do not. Either way the bytes on the wire must be
+/// identical, so this walks both sides of the join threshold.
+#[tokio::test]
+async fn content_length_body_byte_exact_across_coalesce_threshold() {
+    // 4096 is the largest first chunk joined to the head; 4095/4096 take the
+    // joined path, 4097 and up take the back-to-back path.
+    for size in [1usize, 4095, 4096, 4097, 20000] {
+        let body: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let expected = body.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = s.read(&mut buf).await;
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                s.write_all(head.as_bytes()).await.unwrap();
+                s.write_all(&body).await.unwrap();
+            }
+        });
+
+        let proxy = start_l7_proxy(backend_addr).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let resp = raw_request(proxy.addr, b"GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+        assert_eq!(parse_status(&resp), 200, "size {size}");
+        assert_eq!(
+            response_body(&resp),
+            expected.as_slice(),
+            "body corrupted at size {size}"
+        );
+    }
+}
+
+/// Backend announces a body then closes without sending any of it. The head is
+/// held back to be joined with the first chunk, and that chunk never arrives -
+/// the client must still get the response head rather than silence.
+#[tokio::test]
+async fn response_head_flushed_when_backend_sends_no_body() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            // promises 100 bytes, delivers none, then hangs up
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                .await
+                .unwrap();
+            drop(s);
+        }
+    });
+
+    let proxy = start_l7_proxy(backend_addr).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        raw_request(proxy.addr, b"GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+    )
+    .await
+    .expect("proxy hung instead of flushing the held-back head");
+
+    assert_eq!(parse_status(&resp), 200);
+    assert_eq!(
+        response_header(&resp, "content-length").as_deref(),
+        Some("100")
+    );
+    assert!(response_body(&resp).is_empty());
 }
 
 /// malformed request returns 400 and connection is closed.

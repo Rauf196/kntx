@@ -17,6 +17,12 @@ use kntx::runtime::{
     ListenerHandle, ListenerRegistry, ListenerSpawn, PoolTasks, ReloadContext, SharedServe,
 };
 
+// dhat::Profiler alone reports nothing. the allocator has to be installed too,
+// and a run missing it completes clean and reports zero allocations.
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 #[derive(Parser)]
 #[command(name = "kntx", version, about = "High-performance L4/L7 reverse proxy")]
 struct Args {
@@ -134,6 +140,12 @@ fn main() {
 
 #[tokio::main]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // full backtraces: the 10-frame default does not reach kntx frames through
+    // tokio's async stacks. the profile is written when this drops, so the
+    // process::exit paths produce no file.
+    #[cfg(feature = "dhat")]
+    let _dhat = dhat::Profiler::builder().trim_backtraces(None).build();
+
     let args = Args::parse();
 
     let config = config::Config::from_file(&args.config)?;
