@@ -17,3 +17,5 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # advisories, license policy, duplicate/wildcard deps, source allowlist - config in deny.toml
+      - uses: EmbarkStudios/cargo-deny-action@v2

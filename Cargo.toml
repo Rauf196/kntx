@@ -8,7 +8,7 @@ description = "High-performance L4/L7 reverse proxy"
 
 [dependencies]
 # async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
 
 # cli
 clap = { version = "4", features = ["derive"] }
@@ -23,7 +23,10 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"]
 
 # metrics
 metrics = "0.24"
-metrics-exporter-prometheus = "0.18"
+# default features (http-listener, push-gateway) pull in hyper + a second TLS stack
+# (aws-lc-rs) that kntx never uses - install_recorder() + PrometheusHandle is all this
+# needs, kntx's own metrics/endpoint.rs serves the scrape payload.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # error handling
 thiserror = "2"

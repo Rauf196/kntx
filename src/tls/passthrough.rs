@@ -541,4 +541,22 @@ mod tests {
         assert!(matches!(err, PeekError::Eof));
         assert_eq!(err.metric_reason(), "eof");
     }
+
+    #[test]
+    #[ignore = "regenerates fuzz corpus seeds; run manually with `cargo test -- --ignored`"]
+    fn regenerate_fuzz_corpus() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/seeds/parse_client_hello");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("genuine_tls13"),
+            genuine_hello(dns_name("api.example.com"), false),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("genuine_tls12"),
+            genuine_hello(dns_name("legacy.example.com"), true),
+        )
+        .unwrap();
+    }
 }

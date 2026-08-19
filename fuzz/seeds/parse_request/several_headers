@@ -1,0 +1,9 @@
+GET /api/v1/resource HTTP/1.1
+Host: example.com
+User-Agent: fuzz-seed/1.0
+Accept: */*
+X-Request-Id: 123e4567-e89b-12d3-a456-426614174000
+Authorization: Bearer abc.def.ghi
+X-Forwarded-For: 203.0.113.5
+Connection: keep-alive
+

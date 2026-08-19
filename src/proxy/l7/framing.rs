@@ -276,23 +276,34 @@ impl ChunkedReader {
     }
 }
 
-/// read until \n (inclusive) using the BufReader's buffering.
+/// bounds a single chunk-size or trailer line against an attacker who never sends \n.
+/// same magnitude as header_size_limit_bytes's default; kept as a fixed constant since
+/// read_line has no config in scope.
+const MAX_LINE_LEN: usize = 16384;
+
+/// read until \n (inclusive), capped at MAX_LINE_LEN so a line with no terminator
+/// can't grow the buffer without bound.
 async fn read_line<R>(src: &mut R, line: &mut Vec<u8>) -> io::Result<()>
 where
     R: AsyncBufRead + Unpin,
 {
     line.clear();
-    let n = src.read_until(b'\n', line).await?;
-    if n == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof mid-line"));
+    loop {
+        let available = src.fill_buf().await?;
+        if available.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof mid-line"));
+        }
+        let newline_at = available.iter().position(|&b| b == b'\n');
+        let take = newline_at.map_or(available.len(), |i| i + 1);
+        line.extend_from_slice(&available[..take]);
+        src.consume(take);
+        if newline_at.is_some() {
+            return Ok(());
+        }
+        if line.len() > MAX_LINE_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+        }
     }
-    if !line.ends_with(b"\n") {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "no newline before eof",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -627,5 +638,19 @@ mod tests {
             classify_response_body(&r, "GET"),
             BodyFraming::CloseDelimited
         );
+    }
+
+    #[tokio::test]
+    async fn chunk_size_line_over_cap_errs_without_hanging() {
+        let huge = vec![b'f'; 100_000]; // no \n, well past MAX_LINE_LEN
+        let mut reader = tokio::io::BufReader::new(std::io::Cursor::new(&huge[..]));
+        let mut output = Vec::new();
+        let mut cr = ChunkedReader::new();
+        let mut scratch = vec![0u8; 4096];
+        let err = cr
+            .pump_once(&mut reader, &mut output, &mut scratch)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

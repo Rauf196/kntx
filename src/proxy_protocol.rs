@@ -707,4 +707,18 @@ mod tests {
         assert!(!peer_trusted(&[only_private], peer));
         assert!(peer_trusted(&[only_private], "10.9.9.9".parse().unwrap()));
     }
+
+    #[test]
+    #[ignore = "regenerates fuzz corpus seeds; run manually with `cargo test -- --ignored`"]
+    fn regenerate_fuzz_corpus() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fuzz/seeds/proxy_protocol_parse");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = v2_header(
+            V2_CMD_PROXY,
+            V2_AF_INET,
+            &inet_block([192, 0, 2, 7], [198, 51, 100, 1], 51234, 443),
+        );
+        std::fs::write(dir.join("v2_inet"), raw).unwrap();
+    }
 }

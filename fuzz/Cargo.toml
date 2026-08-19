@@ -1,0 +1,50 @@
+[package]
+name = "kntx-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tokio = { version = "1", default-features = false, features = ["rt", "io-util"] }
+kntx = { path = ".." }
+
+[[bin]]
+name = "shakedown_magic_bytes"
+path = "fuzz_targets/shakedown_magic_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_client_hello"
+path = "fuzz_targets/parse_client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_request"
+path = "fuzz_targets/parse_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked_reader"
+path = "fuzz_targets/chunked_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_protocol_parse"
+path = "fuzz_targets/proxy_protocol_parse.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
