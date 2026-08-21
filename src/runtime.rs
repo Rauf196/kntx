@@ -16,6 +16,7 @@ use crate::balancer::RoundRobin;
 use crate::config::{
     self, Config, ForwardingStrategy, ListenerConfig, RateLimitConfig, ResolvedHealth, ZoneConfig,
 };
+use crate::control::AdminHandle;
 use crate::health::{BackendPool, HealthChecker};
 use crate::listener::{self, ListenerRuntime, RuntimeCell, ServeConfig};
 use crate::pool::buffer::BufferPool;
@@ -94,6 +95,8 @@ pub struct ReloadContext {
     pub spawn_tx: mpsc::UnboundedSender<ListenerSpawn>,
     /// handed to background tasks a reload starts, so they stop with the process.
     pub shutdown: watch::Receiver<()>,
+    /// the running admin socket, if one was configured at boot.
+    pub admin: Option<AdminHandle>,
 }
 
 /// the effective running configuration: the reconcilable, swappable runtime
@@ -415,6 +418,31 @@ pub async fn apply_reload(ctx: &ReloadContext, new: &Config) -> Result<u64, Relo
 
     // commit. every step below is infallible; pools go first so a router published
     // in this reload never points at a pool whose membership or tasks lag behind it.
+
+    // the admin socket is bound at startup and never rebound, but the token is a
+    // credential: a leaked one has to be revocable without dropping traffic.
+    match (&ctx.admin, &new.admin) {
+        (Some(running), Some(cfg)) => {
+            if cfg.address != running.address {
+                tracing::warn!(
+                    address = %running.address,
+                    "[admin] address is restart-only, keeping the bound socket",
+                );
+            }
+            running.set_token(cfg.token.as_deref());
+        }
+        // the socket outlives the section, so dropping the gate with it would
+        // leave it serving unauthenticated
+        (Some(running), None) => tracing::warn!(
+            address = %running.address,
+            "[admin] removed but its socket stays bound until restart, keeping the running token",
+        ),
+        (None, Some(_)) => {
+            tracing::warn!("[admin] added, but binding its socket needs a restart")
+        }
+        (None, None) => {}
+    }
+
     for pool_cfg in &new.pools {
         let (pool, balancer) = &pools[&pool_cfg.name];
         let health = pool_cfg.effective_health(&new.health);
@@ -625,6 +653,7 @@ mod tests {
                 shared: Arc::new(test_shared_serve()),
                 spawn_tx,
                 shutdown,
+                admin: None,
             },
             spawn_rx,
             drains,
@@ -1067,6 +1096,50 @@ backends = [{ address = "127.0.0.1:4001" }]
         assert!(
             h.ctx.state.load().pools.contains_key("api"),
             "an aborted reload must not drop a pool"
+        );
+    }
+
+    /// the token swaps at commit, not on the way in: an operator whose reload was
+    /// rejected must still hold the credential the running process accepts.
+    #[tokio::test]
+    async fn aborted_reload_does_not_rotate_the_admin_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\ntruncated\n").unwrap();
+        std::fs::write(&key, b"not a key").unwrap();
+
+        let mut h = harness(&routed_cfg("api"));
+        let admin = AdminHandle::new("127.0.0.1:9901".parse().unwrap(), Some("old"));
+        h.ctx.admin = Some(admin.clone());
+
+        let with_tls = cfg(&format!(
+            "[[listeners]]\naddress = \"127.0.0.1:8080\"\nmode = \"l7\"\n\n\
+             [[listeners.tls.certificates]]\ncert = \"{}\"\nkey = \"{}\"\n\n\
+             [[listeners.routes]]\npath_prefix = \"/api\"\npool = \"web\"\n\n\
+             [[listeners.routes]]\npool = \"web\"\n\n\
+             [[pools]]\nname = \"web\"\nbackends = [{{ address = \"127.0.0.1:3001\" }}]\n\n\
+             [admin]\naddress = \"127.0.0.1:9901\"\ntoken = \"new\"\n",
+            cert.display(),
+            key.display(),
+        ));
+
+        apply_reload(&h.ctx, &with_tls).await.unwrap_err();
+        assert!(admin.token_is(Some("old")), "aborted reload rotated it");
+
+        // the same edit on a config that commits does rotate
+        let good = cfg(
+            "[[listeners]]\naddress = \"127.0.0.1:8080\"\nmode = \"l7\"\n\n\
+             [[listeners.routes]]\npath_prefix = \"/api\"\npool = \"api\"\n\n\
+             [[listeners.routes]]\npool = \"web\"\n\n\
+             [[pools]]\nname = \"web\"\nbackends = [{ address = \"127.0.0.1:3001\" }]\n\n\
+             [[pools]]\nname = \"api\"\nbackends = [{ address = \"127.0.0.1:4001\" }]\n\n\
+             [admin]\naddress = \"127.0.0.1:9901\"\ntoken = \"new\"\n",
+        );
+        apply_reload(&h.ctx, &good).await.unwrap();
+        assert!(
+            admin.token_is(Some("new")),
+            "committed reload kept the old one"
         );
     }
 

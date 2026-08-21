@@ -146,6 +146,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dhat")]
     let _dhat = dhat::Profiler::builder().trim_backtraces(None).build();
 
+    let started = std::time::Instant::now();
     let args = Args::parse();
 
     let config = config::Config::from_file(&args.config)?;
@@ -164,8 +165,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metrics_endpoint = match config.metrics {
         Some(ref m) => Some((
             kntx::metrics::install()?,
-            kntx::metrics::endpoint::bind(m.address).await?,
+            kntx::control::bind(m.address).await?,
         )),
+        None => None,
+    };
+    let admin_endpoint = match config.admin {
+        Some(ref a) => {
+            // from the bound socket, not the config: port 0 resolves here
+            let listener = kntx::control::bind(a.address).await?;
+            let handle =
+                kntx::control::AdminHandle::new(listener.local_addr()?, a.token.as_deref());
+            Some((listener, handle))
+        }
         None => None,
     };
 
@@ -328,9 +339,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some((handle, listener)) = metrics_endpoint {
         let address = listener.local_addr()?;
-        kntx::metrics::endpoint::spawn(listener, handle, Arc::clone(&config_state));
+        kntx::control::spawn(
+            listener,
+            kntx::control::Surface::Metrics {
+                handle,
+                state: Arc::clone(&config_state),
+            },
+        );
         tracing::info!(%address, "metrics endpoint started (/metrics, /healthz, /ready)");
     }
+
+    let admin_handle = admin_endpoint.map(|(listener, handle)| {
+        let address = handle.address;
+        let authenticated = config.admin.as_ref().is_some_and(|a| a.token.is_some());
+        kntx::control::spawn(
+            listener,
+            kntx::control::Surface::Admin {
+                handle: handle.clone(),
+                state: Arc::clone(&config_state),
+                started,
+            },
+        );
+        tracing::info!(%address, authenticated, "admin endpoint started (/server_info)");
+        handle
+    });
 
     // SIGHUP: re-read + validate config, reconcile the running snapshot and push new
     // routing tables to the bound listeners. a bad config is rejected and the current
@@ -345,6 +377,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             shared: Arc::clone(&shared_serve),
             spawn_tx,
             shutdown: shutdown_rx.clone(),
+            admin: admin_handle,
         };
         let reload_path = args.config.clone();
         tokio::spawn(async move {

@@ -14,6 +14,13 @@ level = "info"
 [metrics]
 address = "0.0.0.0:9090"
 
+# serves /server_info. separate socket from [metrics]: these routes dump config
+# and mutate the instance, so an address outside 127.0.0.0/8 or ::1 is rejected
+# unless a token is set, and the token then gates every route here.
+[admin]
+address = "127.0.0.1:9901"
+# token = "change-me"        # required to bind off-loopback; sent as x-kntx-token
+
 # global health check defaults - each [[pools]] entry can override these
 [health]
 # check_interval_secs = 10   # active TCP probes (omit to disable globally)

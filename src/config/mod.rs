@@ -159,6 +159,15 @@ pub enum ConfigError {
          the trust list is only consulted on listeners that require the header"
     )]
     TrustedPeersWithoutProxyProtocol { listener: SocketAddr },
+
+    #[error(
+        "[admin] address {address} is not loopback and no token is set - \
+         the admin surface dumps config and can drain this instance"
+    )]
+    AdminNotLoopback { address: SocketAddr },
+
+    #[error("[admin] token is empty - remove it or set a value")]
+    AdminEmptyToken,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -205,6 +214,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
     #[serde(default)]
     pub forwarding: ForwardingConfig,
     #[serde(default)]
@@ -501,6 +512,14 @@ pub struct MetricsConfig {
     pub address: SocketAddr,
 }
 
+/// the admin socket. separate from `[metrics]`: these routes dump config and
+/// mutate the instance, so binding off-loopback requires a token.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AdminConfig {
+    pub address: SocketAddr,
+    pub token: Option<String>,
+}
+
 fn default_header_size_limit() -> usize {
     16384
 }
@@ -621,6 +640,20 @@ impl Config {
         }
         if self.pools.is_empty() {
             return Err(ConfigError::EmptyPools);
+        }
+
+        // the token is the only opt-in for a wider bind, so admin cannot be
+        // exposed by a typo in the address.
+        if let Some(ref admin) = self.admin {
+            match admin.token.as_deref() {
+                Some("") => return Err(ConfigError::AdminEmptyToken),
+                None if !admin.address.ip().is_loopback() => {
+                    return Err(ConfigError::AdminNotLoopback {
+                        address: admin.address,
+                    });
+                }
+                _ => {}
+            }
         }
 
         // listener address uniqueness - exact dup
@@ -1663,6 +1696,60 @@ mod tests {
             config.metrics.unwrap().address,
             "0.0.0.0:9090".parse().unwrap()
         );
+    }
+
+    fn config_with_admin(section: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(
+            &format!(
+                r#"
+                [[listeners]]
+                address = "0.0.0.0:8080"
+                pool = "web"
+
+                [[pools]]
+                name = "web"
+                backends = [{{ address = "127.0.0.1:3001" }}]
+
+                {section}
+                "#
+            ),
+            "<test>",
+        )
+    }
+
+    #[test]
+    fn admin_off_loopback_requires_a_token() {
+        for address in ["0.0.0.0:9901", "192.168.1.10:9901", "[::]:9901"] {
+            let err = config_with_admin(&format!("[admin]\naddress = \"{address}\""))
+                .expect_err(&format!("{address} accepted without a token"));
+            assert!(
+                matches!(err, ConfigError::AdminNotLoopback { address: a } if a.to_string() == address),
+                "{address}: {err:?}"
+            );
+
+            config_with_admin(&format!(
+                "[admin]\naddress = \"{address}\"\ntoken = \"s3cret\""
+            ))
+            .unwrap_or_else(|e| panic!("{address} rejected with a token: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn admin_on_loopback_needs_no_token() {
+        for address in ["127.0.0.1:9901", "127.0.0.2:9901", "[::1]:9901"] {
+            let config = config_with_admin(&format!("[admin]\naddress = \"{address}\""))
+                .unwrap_or_else(|e| panic!("{address}: {e:?}"));
+            let admin = config.admin.expect("[admin] parsed");
+            assert_eq!(admin.address, address.parse().unwrap());
+            assert!(admin.token.is_none());
+        }
+    }
+
+    #[test]
+    fn admin_rejects_an_empty_token() {
+        let err = config_with_admin("[admin]\naddress = \"127.0.0.1:9901\"\ntoken = \"\"")
+            .expect_err("empty token accepted");
+        assert!(matches!(err, ConfigError::AdminEmptyToken), "{err:?}");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 pub mod access_log;
 pub mod balancer;
 pub mod config;
+pub mod control;
 pub mod health;
 pub mod listener;
 pub mod metrics;

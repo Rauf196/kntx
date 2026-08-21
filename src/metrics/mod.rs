@@ -1,10 +1,8 @@
-pub mod endpoint;
-
 use metrics::{describe_counter, describe_gauge, describe_histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
 /// installs the global recorder. the returned handle renders the scrape payload
-/// for `endpoint`, which serves it alongside the health routes.
+/// for `crate::control`, which serves it alongside the health routes.
 pub fn install() -> Result<PrometheusHandle, Box<dyn std::error::Error>> {
     // recorder must be installed before describe_* - otherwise descriptions go to the
     // noop recorder and never reach /metrics as # HELP / # TYPE lines.

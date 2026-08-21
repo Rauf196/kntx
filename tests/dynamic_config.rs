@@ -99,6 +99,7 @@ impl TestProxy {
                 shared,
                 spawn_tx,
                 shutdown: shutdown_rx,
+                admin: None,
             },
             _shutdown: shutdown_tx,
         }
