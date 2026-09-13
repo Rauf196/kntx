@@ -154,7 +154,7 @@ impl KeepaliveCache {
         let _ = self.push(idle);
     }
 
-    #[cfg(test)]
+    /// idle conns cached for this backend right now. 0 when keepalive is disabled.
     pub fn queue_len(&self) -> usize {
         self.queue.as_ref().map(|q| q.len()).unwrap_or(0)
     }

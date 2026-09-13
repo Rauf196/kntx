@@ -11,18 +11,16 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-stable-orange.svg" alt="Rust"></a>
   <img src="https://img.shields.io/badge/platform-linux-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/tests-587-brightgreen.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-625-brightgreen.svg" alt="Tests">
 </p>
 
 ---
 
 > **Pre-release.** Config schema, metrics, and APIs may change without notice.
 
-Most proxies parse HTTP first and treat raw TCP as a special case. kntx does it the other way
-around: the fast path moves bytes with `splice(2)` and never looks at them, and HTTP parsing is a
-mode you turn on per listener. That ordering is what makes the L4 path 66% faster than nginx
-`stream`, while the L7 path matches nginx `proxy_pass` on single-connection overhead and pulls
-ahead by 1.5x to 2.3x once concurrency arrives.
+The fast path moves bytes with `splice(2)` and never parses them. HTTP is a mode you turn on per
+listener. L4 measures 66% faster than nginx `stream`; L7 ties nginx `proxy_pass` at one connection
+and leads 1.5x to 2.3x under concurrency.
 
 ```
                           ┌── mode = "l4" ───────────► splice(2), bytes never enter userspace
@@ -35,22 +33,23 @@ client ──► TCP accept ────┼── mode = "tls-passthrough" ► p
            [listeners.tls]│  optional rustls termination, sits before the mode decision
 ```
 
-Every listener picks its own mode, its own routes, and its own backend pool, in one process.
+Every listener picks its own mode, routes, and backend pool, in one process.
 
-## What works today
+## Features
 
 | | |
 |---|---|
-| **L4 forwarding** | `splice(2)` zero-copy with a pre-allocated pipe pool and `TCP_CORK` batching; vectored `readv/writev` and a pooled-buffer userspace path as alternatives |
+| **L4 forwarding** | `splice(2)` zero-copy with a pooled pipe allocator and `TCP_CORK` batching; vectored and userspace paths as alternatives |
 | **L7 HTTP/1.1** | parse, route, header injection, chunked and Content-Length pass-through, 100-continue, keep-alive both sides, WebSocket tunneling |
 | **Routing** | host, path prefix, method, SNI matchers composed per route; first match wins; wildcards (`*.example.com`) |
-| **Load balancing** | round-robin, least-connections, or weighted per pool; weights are live-reloadable, so `weight = 0` drains a backend without a restart |
-| **TLS** | termination via rustls (multi-cert SNI), or SNI-routed passthrough where kntx never holds a cert |
+| **Load balancing** | round-robin, least-connections, weighted; weights live-reloadable, so `weight = 0` drains a backend without a restart |
+| **TLS** | rustls termination with multi-cert SNI, or SNI-routed passthrough where kntx holds no cert |
 | **Resilience** | per-backend circuit breakers, active TCP probes, passive failure tracking, connect retries with failover |
-| **Rate limiting** | GCRA on a lock-free set-associative cache; nginx-style named zones attached per listener or per route |
-| **Hot reload** | `SIGHUP` swaps pools, routes, listeners, TLS certs, and rate-limit zones with no restart and no dropped connections |
-| **PROXY protocol** | v1 and v2 ingress, any listener mode, so the real client address survives an L4 balancer in front - including on the `splice(2)` path |
-| **Observability** | 42 Prometheus metrics, structured JSON access logs, W3C `traceparent` propagation |
+| **Rate limiting** | GCRA on a lock-free set-associative cache; named zones attached per listener or per route |
+| **Hot reload** | `SIGHUP` swaps pools, routes, listeners, certs, and rate-limit zones with no restart and no dropped connections |
+| **PROXY protocol** | v1 and v2 ingress, any listener mode, including the `splice(2)` path |
+| **Admin** | token-gated socket: pool state, config dump, live log level, two-phase drain, and a JS-free HTML panel |
+| **Observability** | 43 Prometheus metrics, JSON access logs, W3C `traceparent` propagation |
 
 Not implemented: HTTP/2, HTTP/3, backend TLS, request-body buffering, forward-proxy `CONNECT`.
 See [Limits](#limits).
@@ -59,9 +58,8 @@ See [Limits](#limits).
 
 ```bash
 cargo build --release
+./target/release/kntx --config config.toml
 ```
-
-Minimal `config.toml`:
 
 ```toml
 [[listeners]]
@@ -80,19 +78,11 @@ backends = [
 address = "0.0.0.0:9090"
 ```
 
-```bash
-./target/release/kntx --config config.toml
-```
-
-`config/example.toml` is the full option catalogue: every listener mode, TLS, routes, health
-overrides, keep-alive tuning, and rate-limit zones, each with a comment explaining what it does.
+`config/example.toml` is the full option catalogue. `--validate` checks a config without starting.
 
 ### File descriptor limit
 
-A proxy holds two sockets per connection, and the splice pipe pool claims 1024 descriptors at
-startup. The common default soft limit of 1024 is therefore not enough to start at all, let alone
-serve traffic. kntx checks `RLIMIT_NOFILE` before allocating anything and refuses to start with the
-exact number it needs, rather than dying later with a bare `Too many open files` under load:
+kntx checks `RLIMIT_NOFILE` at startup and refuses to start with the exact number it needs:
 
 ```
 file descriptor limit too low: current=1024, required=21280
@@ -100,29 +90,193 @@ file descriptor limit too low: current=1024, required=21280
 raise it with: ulimit -n 21280
 ```
 
-The budget is `1024` (pipe pool) + `2 × max_connections` per listener + `256` base, so the floor is
-**1280** with no connection caps configured. Raise it for the shell with `ulimit -n <n>`, permanently
-in `/etc/security/limits.conf`, or under systemd with `LimitNOFILE=` in the unit file - which is the
-one that matters in production, because a systemd service does not inherit your shell's limit.
+Budget is `1024` (pipe pool) + `2 × max_connections` per listener + `256`. The common 1024 default
+is not enough to start. Use `LimitNOFILE=` in the systemd unit; a service does not inherit your
+shell's limit.
 
-Sizing the limit down is the wrong fix. The defaults are chosen for a production server, and shrinking
-the pipe pool to fit a small limit trades away the zero-copy fast path to work around a misconfigured
-host.
+## Configuration
+
+Precedence: defaults → config file → env vars → CLI flags.
+
+The four per-call timeouts bound the gap between two successful I/O operations, not total phase
+duration, which is what makes them a progress invariant against slowloris.
+
+| Setting | Scope | On expiry | Default |
+|---|---|---|---:|
+| `client_header_timeout_secs` | gap reading request head | 408 + close | 60 |
+| `client_body_timeout_secs` | gap reading request body | close | 60 |
+| `proxy_send_timeout_secs` | gap writing to backend | 504 if pre-response | 60 |
+| `proxy_read_timeout_secs` | gap reading backend response | 504 if pre-response | 60 |
+| `request_timeout_secs` | whole request | 504 if pre-response | 60 |
+| `keepalive_idle_timeout_secs` | between keep-alive requests | close | 60 |
+| `clienthello_timeout_secs` | passthrough ClientHello peek | close | 10 |
+| `connect_timeout_secs` | TCP connect to backend | next backend, then 504 | 5 |
+| `drain_timeout_secs` | shutdown drain | force close | 30 |
+| pool `idle_conn_ttl_secs` | idle backend conn in cache | drop conn | 60 |
+
+Backend keep-alive is on by default (`max_idle = 32`); set `max_idle = 0` to opt out.
+
+Restart-only fields log a `WARN` and keep the running value on reload: pool `strategy`,
+`[admin] address`, `metrics.address`, buffer pool sizes, and the per-listener connection settings.
+
+## Admin
+
+A second socket, separate from `[metrics]` by exposure class. Binding off-loopback without a token
+is a validation error. The token gates reads as well as writes, and rotates on `SIGHUP`.
+
+```toml
+[admin]
+address = "127.0.0.1:9901"
+# token = "..."   # required to bind anywhere but loopback
+```
+
+| route | method | |
+|---|---|---|
+| `/` | GET | HTML panel, or a plain-text route table for curl |
+| `/server_info` | GET | version, uptime, config version, pool count, serving or draining |
+| `/pools` | GET | per backend: circuit, weight, in-flight, failures, keep-alive cache, sockets |
+| `/config_dump` | GET | running config as JSON, `[admin] token` redacted |
+| `/logging` | GET, POST | read the log filter, or POST an `EnvFilter` directive |
+| `/healthcheck/fail`, `/ok` | POST | force `/ready` to 503 without stopping the process |
+| `/drain_listeners` | POST | stop accepting, stay alive, `SIGHUP` re-binds |
+
+```bash
+curl -s :9901/pools | jq '.pools[].backends[] | {address, circuit, active}'
+curl -X POST --data 'kntx::proxy::l7=debug,info' :9901/logging
+```
+
+`/config_dump` reports what is **running**: restart-only fields are pinned to their live values, so
+an edited-but-ignored setting shows the value actually in effect.
+
+`/logging` takes a filter directive, not a level, so one module can be turned up alone. Bad
+directives are rejected before the swap. A runtime filter outranks `[logging] level` and survives
+`SIGHUP`.
+
+The panel is one self-contained page: no JavaScript, no external assets, no auto-refresh. Its
+buttons are plain forms, safe because mutating routes reject any `Sec-Fetch-Site` that is not
+`same-origin` (`same-site` included: another port on loopback is not the same origin). Requests
+with no such header, like curl, are allowed. With a token set the panel is unreachable from a
+browser by design; it is a curl surface.
+
+## Observability
+
+`/metrics`, `/healthz` and `/ready` share the `[metrics]` socket. Histogram buckets are set for
+proxy timescales: 50 µs to 30 s, dense in the 100 µs to 100 ms band.
+
+| endpoint | means |
+|---|---|
+| `/healthz` | the process is alive. A crashed listener takes the process down, so it cannot lie. |
+| `/ready` | this instance should receive traffic. 200 unless draining or the health override is set. |
+
+**`/ready` ignores backend health.** One kntx fronts many services, so a dead pool must not
+deregister the listener serving the healthy ones, and every replica would report identically
+anyway. Requests to a dead pool get a clean 503; alert on the metric instead:
+
+```promql
+sum by (pool) (kntx_backend_health) == 0                    # pool down everywhere - page
+count by (pool) (kntx_backend_health == 0) > 0
+  unless sum by (pool) (kntx_backend_health) == 0           # one replica cannot reach it - warn
+kntx_config_last_reload_success == 0                        # replica serving stale config
+```
+
+Access logs are one JSON line per request: timestamp, listener, client IP, method, host, path,
+query, status, bytes each way, durations, backend, pool, route ID, request ID, trace ID,
+keep-alive index. File sinks flush every second or 64 lines.
+
+Inbound `traceparent`, `tracestate` and B3 headers pass through unchanged. kntx does not emit its
+own spans yet.
+
+## Deployment
+
+### Behind an L4 load balancer
+
+The balancer spreads load and survives an AZ loss; kntx decides what happens to each request.
+Because the balancer terminates TCP, the peer kntx sees is the balancer, so `X-Forwarded-For`,
+access logs and **per-IP rate limiting** all key on it unless PROXY protocol is enabled.
+
+Enable it on the sender (AWS `proxy_protocol_v2.enabled`; HAProxy `send-proxy-v2`; nginx
+`proxy_protocol on` inside a `stream` block, as the `http` upstream cannot send it) and on the
+listener:
+
+```toml
+[[listeners]]
+address             = "0.0.0.0:8443"
+mode                = "l7"
+pool                = "web"
+proxy_protocol      = true
+proxy_protocol_from = ["10.0.0.0/16"]   # balancer subnets only
+```
+
+> **Once `proxy_protocol` is on, the header is mandatory on that listener.** A port accepting either
+> a header or a bare connection lets any client claim any source address. Give plain clients their
+> own listener.
+
+Empty `proxy_protocol_from` trusts anything that can reach the port. A `LOCAL` header keeps the
+socket peer. Works in every listener mode and does not cost the zero-copy path.
+
+On a `proxy_protocol` listener the listener-level `rate_limit` runs after the header is read, so a
+rejected connection has already taken a `max_connections` slot; that limit bounds a flood there.
+
+### Health checks and draining
+
+Point the target group at `/ready` over HTTP on the `[metrics]` port, not a TCP check on the traffic
+port. A TCP check cannot see a drain: sockets close at the same instant new connections start being
+refused, too late to deregister gracefully.
+
+Order these three or graceful shutdown is defeated:
+
+```
+deregistration delay  >=  drain_timeout_secs  <  TimeoutStopSec
+```
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/kntx --config /etc/kntx/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=45      # must exceed drain_timeout_secs (default 30)
+LimitNOFILE=21280
+Restart=on-failure
+User=kntx
+```
+
+To take one instance out of rotation and put it back without a restart:
+
+```bash
+curl -X POST :9901/healthcheck/fail    # 1. /ready -> 503. balancer stops sending NEW work.
+                                       #    :8080 keeps serving what is already routed to it.
+# 2. wait out the deregistration delay. kntx_connections_active reaching 0 means drained.
+curl -X POST :9901/drain_listeners     # 3. stop accepting. sockets close, new connects refused.
+#    deploy / edit config
+kill -HUP $(pidof kntx)                # 4. re-bind.
+curl -X POST :9901/healthcheck/ok      # 5. rejoin rotation.
+```
+
+Step 5 is required: `SIGHUP` clears the drain but deliberately not the health override, so skipping
+it leaves an instance serving while the balancer sends it nothing. Going straight to step 3 cuts
+connections the balancer was still routing to you.
+
+### Common mistakes
+
+| symptom | cause |
+|---|---|
+| `X-Forwarded-For` shows one IP for everyone | `proxy_protocol` off behind an L4 balancer |
+| all connections refused right after enabling `proxy_protocol` | sender not configured to send the header, which is mandatory once on |
+| connections refused during a rolling deploy | deregistration delay shorter than `drain_timeout_secs` |
+| requests cut mid-flight on restart | `TimeoutStopSec` at or below `drain_timeout_secs` |
+| instance stays in rotation with backends dead | expected; alert on `kntx_backend_health` |
+| serves fine but gets no traffic after a deploy | missed `POST /healthcheck/ok` |
+| reload appears to do nothing | the field is restart-only; the log says so |
+| `Too many open files` | see [File descriptor limit](#file-descriptor-limit) |
 
 ## Benchmarks
 
-Every number below is reproducible from this repo. Raw tool output is committed under
-`benchmark-results/`; the scripts that produced it are in `scripts/`. All runs are on the same
-machine, an Intel i7-8550U (4C/8T) over loopback. Each table notes its own kernel and nginx build,
-because they were captured at different points in the project.
+Reproducible from this repo. Raw output in `benchmark-results/`, scripts in `scripts/`. Intel
+i7-8550U (4C/8T) over loopback. Tables note their own kernel and nginx build.
 
-### L4 throughput (iperf3, single stream, 10s)
+### L4 throughput
 
-```bash
-./scripts/benchmark-single.sh 10
-```
-
-Linux 7.1.4, nginx 1.31.3.
+`./scripts/benchmark-single.sh 10` - iperf3, single stream, Linux 7.1.4, nginx 1.31.3.
 
 | Path | Throughput | vs direct | vs nginx |
 |---|---:|---:|---:|
@@ -132,28 +286,16 @@ Linux 7.1.4, nginx 1.31.3.
 | kntx userspace (64 KB pooled) | 19.40 Gbps | 49% | -1% |
 | nginx `stream` | 19.55 Gbps | 50% | baseline |
 
-nginx `stream` has no splice option (only its HTTP module does `sendfile`), so it copies through
-userspace. `proxy_buffer_size 64k` was set to match kntx's buffer size. The gap between kntx's own
-userspace path (19.40) and its splice path (32.43) is the cost of data touching userspace: +67%.
-That gap is the entire argument for the L4-first design, and it is why kntx's plainest path merely
-ties nginx while its fast path does not.
+nginx `stream` has no splice option, so it copies through userspace. kntx's own userspace path
+(19.40) versus its splice path (32.43) is the cost of data touching userspace: +67%.
 
-Under parallel streams (`benchmark-scale.sh`, Linux 6.19.9, nginx 1.29.7), splice holds ~51 Gbps
-flat from 10 to 100 streams while nginx plateaus around 32 Gbps.
+Under parallel streams (Linux 6.19.9, nginx 1.29.7), splice holds ~51 Gbps flat from 10 to 100
+streams while nginx plateaus around 32 Gbps.
 
-### L7 HTTP (oha, 200-byte static response, 30s after 10s warmup)
+### L7 HTTP
 
-```bash
-./scripts/benchmark-l7.sh
-```
-
-Linux 7.0.3, nginx 1.29.8, `oha` 1.14. Backend is nginx in all cases. `kntx-l7` runs with the
-backend keep-alive cache at `max_idle = 32`.
-
-This table predates the hot-path work described under Design notes, which cut L7 work per request
-by 13%. It has not been re-measured, and the throughput effect of that change was deliberately not
-estimated from it - the run-to-run spread on this machine is wider than the change. Both get
-re-run together for the final benchmark.
+`./scripts/benchmark-l7.sh` - oha, 200-byte static response, 30s after warmup. Linux 7.0.3, nginx
+1.29.8. Backend is nginx throughout. Predates the hot-path work below and has not been re-measured.
 
 | Concurrency | | RPS | p50 | p99 | success |
 |---|---|---:|---:|---:|---:|
@@ -166,54 +308,29 @@ re-run together for the final benchmark.
 | 10,000 conns | **kntx-l7** | **30,012** | **327.9 ms** | **392.6 ms** | **100%** |
 | | nginx-l7 | 13,011 | 470.3 ms | 650.2 ms | 99.86% |
 
-At one connection the two are dead even, which is the honest per-request-overhead result. kntx
-pulls ahead as concurrency rises because of the backend keep-alive cache, worth 1.5x RPS at one
-connection and 3.8x at ten thousand.
+Read the success column with the percentiles. At 10k conns nginx dropped 10,282 requests, and
+dropped requests never enter its histogram, so its p99 of 650 ms covers only what it served; its
+worst case was 29,766 ms. kntx queues on a FIFO semaphore instead of shedding: 100% served, every
+response between 258 ms and 514 ms. Higher median, bounded tail.
 
-**On nginx's 99.86%.** At 10k connections nginx dropped 10,282 requests: 9,751 deadline aborts,
-325 connection errors, 206 timeouts. Dropped requests never enter the percentile histogram, so
-nginx's p99 of 650 ms is computed only over requests it managed to serve. Its actual worst case
-was 29,766 ms. kntx queues on a FIFO semaphore instead of shedding, so every request is held and
-served: 100% success, and every single response landed between 258 ms and 514 ms. That is a
-deliberate trade, higher median in exchange for a bounded tail, and it is only visible if you read
-the success rate next to the percentiles.
+### Rate limiter
 
-Getting there took work. The first cut of the L7 path had no cap on backend connections, which at
-10k clients produced a SYN storm against the backend, a 23% 503 rate, and a **3,514 ms** p99. Adding
-the permit semaphore, interning metric labels to kill four heap allocations per request, streaming
-access-log JSON with `to_writer` instead of an intermediate `String`, and making the buffer pool
-sizable brought that to 424 ms and zero errors.
+`cargo bench --bench rate_limit` - criterion, release. Comparator is a `Mutex<HashMap>` token
+bucket. Threaded rows are wall time per check across 8 threads.
 
-### Rate limiter (criterion, release profile)
-
-```bash
-cargo bench --bench rate_limit
-```
-
-Comparator is a `Mutex<HashMap<u64, (f64, Instant)>>` token bucket, the design the keyed limiter
-exists to refuse. Threaded rows are wall time per check with 8 threads in parallel.
-
-| Scenario | kntx `KeyedLimiter` | `Mutex<HashMap>` bucket | ratio |
+| Scenario | kntx `KeyedLimiter` | `Mutex<HashMap>` | ratio |
 |---|---:|---:|---:|
 | Uncontended, 1 thread | 45.0 ns | 64.4 ns | 1.4x |
-| Same key, 8 threads (attacker on one key) | 106.9 ns | 352.2 ns | 3.3x |
-| Distinct keys, 8 threads (production spread) | **15.9 ns** | 457.9 ns | **29x** |
+| Same key, 8 threads | 106.9 ns | 352.2 ns | 3.3x |
+| Distinct keys, 8 threads | **15.9 ns** | 457.9 ns | **29x** |
 
-Distinct keys is the production case and where the designs diverge hardest. Independent keys land
-on independent cache lines, so checks scale across cores and the per-check wall time drops *below*
-the single-threaded cost. The mutexed map gets worse under spread load than under same-key load,
-because more distinct keys means map growth, rehashing, and allocation inside the critical section
-while every thread still funnels through one lock.
+Distinct keys is the production case: independent keys land on independent cache lines, so per-check
+cost drops below the single-threaded figure.
 
-### Load balancing (oha, 30s, 200 connections)
+### Load balancing
 
-```bash
-./scripts/benchmark-balancer.sh 30
-```
-
-Two pools. Uniform is two identical backends. Skewed caps one backend at 2000 r/s with nginx
-`limit_req`, so it queues rather than rejecting. Metrics are enabled, because the emission path is
-part of per-request cost and benchmarking with them off measures a configuration nobody runs.
+`./scripts/benchmark-balancer.sh 30` - oha, 200 connections. Skewed caps one backend at 2000 r/s so
+it queues rather than rejecting. Metrics enabled.
 
 | pool | strategy | RPS | p50 | p99 |
 |---|---|---:|---:|---:|
@@ -224,347 +341,52 @@ part of per-request cost and benchmarking with them off measures a configuration
 | skewed | **least_conn** | **29,046** | 4.40ms | **42.93ms** |
 | skewed | weighted 9:1 | 20,059 | 0.43ms | 97.78ms |
 
-**least_conn is 7.3x round-robin under skew**, and the mechanism is worth stating precisely: strict
-alternation forces the healthy backend to match the throttled one's rate, so total throughput is
-pinned at *twice the slowest member* rather than merely reduced by half. Load-aware selection is not
-an optimization here, it is the difference between 4k and 29k RPS.
+**least_conn is 7.3x round-robin under skew**: strict alternation pins total throughput at twice the
+slowest member, not half. The skewed rows reproduce exactly because the cap determines them.
 
-The skewed rows are highly reproducible: round_robin measured 4,003 RPS in three separate runs and
-weighted landed within 19 RPS of itself, because both are arithmetically determined by the cap
-rather than by proxy speed.
+**The uniform rows are noise on this hardware and should not be read as a ranking.** Across three
+runs of that identical config round_robin measured 30,689 / 29,081 / 37,875. Treat them as evidence
+that no strategy collapses when there is nothing to optimize, nothing finer.
 
-**The uniform rows are not resolvable on this hardware, and the table should not be read as
-"round_robin is 34% faster".** Across three runs of that identical config, round_robin measured
-30,689, 29,081 and 37,875 while least_conn measured 29,452, 30,887 and 28,309 - so the same
-comparison came out anywhere from 4% against round_robin to 34% in its favour. A 4-core laptop over
-loopback cannot separate per-selection costs this small from noise. Treat the uniform pool as
-evidence that no strategy collapses when there is nothing to optimize, and nothing finer. Isolating
-real selection overhead needs a criterion micro-benchmark, not a macro load test.
-
-Read weighted's row carefully. Best p50 of any run at 0.43ms, next to a p99 of 98ms that is
-essentially round-robin's. The distribution is bimodal: 90% of traffic goes sub-millisecond to the
-healthy backend and the remaining 10% still queues behind the cap. A good p50 beside a bad p99 means
-two populations averaged together. It also only helped because the 9:1 ratio was configured in
-advance; least_conn measured the same skew at runtime. Static intent versus observed load is the
-real difference between the two, not the throughput.
-
-## Design notes
-
-The decisions that took the most thought, and what they cost.
-
-**splice is the ceiling, and io_uring is not the answer.** io_uring was evaluated properly and
-rejected. `tokio-uring` has been unmaintained since November 2022 and benchmarked 11-15% *slower*
-than plain Tokio. Its completion model needs owned buffers and `!Send` futures, which is
-fundamentally incompatible with `#[tokio::main]` and the `AsyncRead`/`AsyncWrite` ecosystem.
-Dropping a future with operations in flight is a documented unsolved cancellation-safety problem
-across every Rust io_uring runtime. And no production proxy uses it: not Pingora, nginx, HAProxy,
-or Envoy. Expected gain over splice for streaming is 0-15%. Writing that analysis down was worth
-more than a broken integration.
-
-**Retry has two axes, not one.** kntx streams request bodies rather than buffering them, so once a
-body byte reaches the backend it is gone. A retry therefore needs *both* an idempotent method
-(RFC 7231 §4.2.2) *and* zero body bytes flushed. nginx can be more aggressive because it buffers
-first. The trade: kntx cannot replay a PUT mid-body even though the spec calls PUT idempotent.
-Buying that back would mean a per-request memory budget, which is a real cost for a case that has
-not come up.
-
-**Paths are forwarded byte-for-byte.** No `%2F` decoding, no `..` resolution, no `//` collapsing.
-Normalization is a policy decision, not a transport responsibility, and applying it silently can
-flip an auth or ACL outcome on the backend. The proxy carries what the client sent and refuses only
-when the framing itself is ambiguous, which is the same principle behind the smuggling defenses
-(CL+TE, multiple CL, `TE` other than `chunked`, and obs-fold are all rejected with 400).
-
-**Passthrough uses a hand-rolled ClientHello parser, deliberately.** ~120 bounds-checked lines that
-read framing only: record header, handshake header, body walk, `server_name` extension. rustls's
-`Acceptor` would have been less code but it applies rustls's protocol policy, which means it can
-reject a hello the *backend* would have accepted. That is the wrong failure mode for a proxy that
-is not a TLS endpoint on those connections. nginx's `ssl_preread` makes the same call.
-
-**Hot reload is Envoy's model, not nginx's.** nginx forks fresh workers because it is
-multi-process. kntx is one process, so there is nothing to fork, and re-binding in-process to
-imitate the fork model would need `SO_REUSEPORT` for no gain. Instead a versioned config snapshot
-sits behind an `arc-swap` pointer; readers on the hot path load it without a lock. Two properties
-carry the design: reload is a **transaction**, with every fallible step (router build, cert load,
-zone build, socket bind) completing before anything mutates, so a bad config leaves the running one
-untouched exactly like `nginx -t`; and state is **preserved by identity**, so a backend present in
-both configs keeps its circuit breaker and warm connections, and an unchanged rate-limit zone keeps
-its accumulated budget. That second one is correctness, not optimization: otherwise an operator
-could reset a flooding client's rate-limit budget by touching an unrelated field.
-
-**A knob is only live-reloadable if a restart would be unacceptable.** Capability is not a reason.
-Pool membership, routes, certs, rate limits, and health thresholds each map to a concrete 3am
-incident. Buffer pool sizes, `metrics.address`, and forwarding strategy do not, so they are
-restart-only and a changed value logs a `WARN` rather than silently half-applying.
-
-**Least-connections has to count queued work, not just in-flight work.** The in-flight counter was
-first claimed where a checked-out backend connection is born, which is one `await` too late:
-checkout acquires the per-backend concurrency permit first, and that blocks when the backend is
-saturated. So requests queued behind a slow backend counted as zero load on it, every saturated
-backend read exactly its cap, and least-connections saw a permanent tie and silently degenerated
-into round-robin at precisely the load where it was supposed to help. The fix was one line moved
-above the permit gate. What caught it was the benchmark, not the tests: least-connections measured
-*worse* than round-robin under a skewed pool, which a correct implementation cannot do. Every unit
-test passed throughout, because they set the counter directly and never exercised the saturation
-path. The general rule is that a load signal must answer "what have I already committed here",
-not "what is running here" - queued work is committed, idle pooled sockets are not.
-
-**Metric labels are bounded by rule, not by habit.** `method`, `status`, `pool`, `listener`,
-`route_id`, `backend` are allowed. `host` and `sni` only when enumerable from config. `path`,
-`query`, `user_agent`, and client IP are never metric labels, they go to access logs and traces.
-The original spec for the passthrough metrics had an `sni` label; it violated this rule and was
-corrected before it shipped.
-
-**Two lock-free bugs found by an exact-count stress test.** The keyed rate limiter's 8-thread test
-asserts the admit count is *exactly* `burst + 1` under a frozen clock, rather than within some
-epsilon. That precision caught two real protocol races: a blind TAT store after claiming a slot
-could roll back concurrent admits, and a two-pass scan/select duplicated hot new keys across empty
-ways about 1% of runs. Both are fixed; every admit is now exactly one successful CAS. An epsilon
-bound would have hidden both.
-
-**Optimizations are measured in instructions per request, not RPS.** On this hardware the same
-binary drifts from 35k to 17k RPS across rounds of an identical workload, which is far wider than
-any change worth making, so throughput cannot tell you whether an optimization worked. Instructions
-per request can: frequency scaling changes how long a request takes, not how much work it is, and
-side-by-side it repeats to within 0.1%. `scripts/ab-compare.sh` alternates two builds round by
-round, flipping order every other round so residual drift lands on both sides.
-
-That instrument measured three L7 changes at -2.0%, -8.1% and -3.7% individually and **-13.3% end
-to end**, with the isolated figures compounding to -13.35% against the direct measurement. It also
-overturned what profiling was expected to find. Metric `Key` construction was the predicted
-bottleneck and came sixth of seven at 8 allocations per request. Moving four per-request buffers
-onto the connection removed 58% of the bytes a request allocates and bought 2%; removing one
-`sendto` of three bought 8%. Bytes allocated is a weak proxy for cost - allocation *count* barely
-moved - and on a machine with Meltdown and Spectre mitigations active, a kernel crossing is simply
-worth more than a large allocation that is never fully faulted in.
-
-## Configuration
-
-Precedence: defaults → config file → env vars → CLI flags.
-
-The timeout surface is larger than most proxies expose, because there are genuinely several
-different things to bound. The four per-call timeouts limit the gap between two successful I/O
-operations rather than the total phase duration, which is what makes them a real progress invariant
-against slowloris.
-
-| Setting | Scope | On expiry | Default |
-|---|---|---|---:|
-| `client_header_timeout_secs` | gap reading request head | 408 + close | 60 |
-| `client_body_timeout_secs` | gap reading request body | close | 60 |
-| `proxy_send_timeout_secs` | gap writing to backend | 504 if pre-response | 60 |
-| `proxy_read_timeout_secs` | gap reading backend response | 504 if pre-response | 60 |
-| `request_timeout_secs` | whole request | 504 if pre-response | 60 |
-| `keepalive_idle_timeout_secs` | between requests on a kept-alive conn | close | 60 |
-| `clienthello_timeout_secs` | passthrough ClientHello peek | close | 10 |
-| `connect_timeout_secs` | TCP connect to backend | next backend, then 504 | 5 |
-| `drain_timeout_secs` | shutdown drain | force close | 30 |
-| pool `idle_conn_ttl_secs` | idle backend conn in cache | drop conn | 60 |
-
-Backend keep-alive is **on by default** (`max_idle = 32`), unlike nginx's opt-in `keepalive`
-directive. Discovering that a connection cache exists but has to be enabled is a worse first
-experience than discovering `max_idle = 0` exists as an opt-out.
-
-## Observability
-
-**Metrics** at `/metrics`, Prometheus format. Connections, bytes by direction, backend health and
-circuit state, TLS handshake outcomes and duration, HTTP requests by method and status, parse and
-smuggling rejects, keep-alive cache hits/misses/stale, WebSocket tunnels, rate-limit rejections,
-passthrough routing, and config reload status. Histogram buckets are set for proxy timescales, not
-library defaults: request duration spans 50 µs to 30 s with the density in the 100 µs to 100 ms
-band where proxy-induced cost actually lives.
-
-**Health endpoints** on the same socket. `/healthz` is liveness: 200 while the process is up. A
-crashed listener task takes the process down with it, so there is no state where it lies. `/ready`
-is readiness: 200 when every pool can still reach a backend, 503 naming the first pool that cannot.
-Point a Kubernetes readiness probe or an ALB target group at `/ready` and the instance is pulled
-from rotation when its backends die, rather than kept in it because the port still answers. They
-share the metrics socket because they share its exposure class - read-only, no secrets, and
-reachable from the network by whoever scrapes or probes.
-
-**Access logs**, one JSON line per completed request, to stdout, stderr, or a file. Carries
-timestamp, listener, client IP, method, host, path, query, status, bytes each way, total and
-backend-wait duration, backend, pool, route ID, request ID, trace ID, and keep-alive index. Pre-route
-rejects log `pool` and `route_id` as `-` following common-log-format convention, because an empty
-string is visually ambiguous in Grafana. File sinks flush every second or 64 lines, whichever comes
-first, so tailing a low-traffic deployment shows lines when they happen.
-
-**Tracing.** Inbound `traceparent`, `tracestate`, and B3 headers pass through unchanged, so requests
-stay visible end to end even though kntx does not emit its own spans yet. Nothing is synthesized
-when absent. OTLP span emission is planned.
-
-`kntx_config_last_reload_success` is the alert to wire up: 0 means a replica rejected a reload and
-is serving stale config. `kntx_config_version` confirms a fleet has converged.
-
-## Deployment
-
-### Behind an L4 load balancer
-
-An NLB and kntx are not substitutes, they compose. The balancer spreads load across the fleet and
-survives losing an availability zone; kntx decides what happens to each request, which an L4
-balancer cannot do at all.
-
-| layer | owns |
-|---|---|
-| L4 balancer (NLB, ELB in TCP mode, another HAProxy) | spreading load across instances, AZ failover, registration and drain |
-| kntx | routing, rate limiting, TLS termination or passthrough, circuit breaking, retries, keep-alive |
-| backends | the application |
-
-Because the balancer terminates the TCP connection, the peer address kntx sees is the balancer's.
-Without PROXY protocol, `X-Forwarded-For`, `X-Real-IP`, access logs, and **per-IP rate limiting** all
-key on the balancer rather than the client.
-
-Enable it on the sender - AWS: the `proxy_protocol_v2.enabled` target group attribute; HAProxy:
-`send-proxy-v2` on the server line; nginx: `proxy_protocol on` inside a `stream` block, since the
-`http` upstream cannot send it at all - and on the listener:
-
-```toml
-[[listeners]]
-address             = "0.0.0.0:8443"
-mode                = "l7"
-pool                = "web"
-proxy_protocol      = true
-proxy_protocol_from = ["10.0.0.0/16"]   # the balancer subnets, nothing else
-```
-
-> **Once `proxy_protocol` is on, the header is mandatory on that listener.** A port that accepts
-> either a header or a bare connection lets any client claim any source address. There is no mixed
-> mode by design; give plain clients their own listener.
-
-`proxy_protocol_from` restricts which peers may send the header. Leaving it empty trusts anything
-that can reach the port - HAProxy `accept-proxy`'s model, and only safe when the port is reachable
-from the balancer alone. Set it whenever that is not provably true.
-
-v1 and v2 are both accepted. A `LOCAL` header, which is what a balancer sends for its own health
-check, keeps the socket peer rather than inventing a client address. This works in **every listener
-mode**, including `l4` and `tls-passthrough` where there is no HTTP request to inject a header into,
-and it does not cost the zero-copy path: the header is consumed before `splice(2)` takes over.
-
-One interaction to know about. On a `proxy_protocol` listener the listener-level `rate_limit` check
-runs after the header is read rather than at accept, because the address to key on does not exist
-any earlier. A rejected connection has therefore already taken a `max_connections` slot, so on that
-listener `max_connections` rather than the zone is what bounds a flood.
-
-### Health checks
-
-Point the target group at `/ready` over HTTP on the `[metrics]` port, not a TCP check on the traffic
-port. A TCP check only proves the socket is bound, so an instance whose every backend pool is dead
-stays in rotation; `/ready` returns 503 naming the first pool that cannot reach a backend. See
-[Observability](#observability) for what each endpoint means.
-
-### Draining
-
-Three settings have to be ordered around `drain_timeout_secs` or the graceful shutdown that already
-works gets defeated:
-
-```
-deregistration delay  >=  drain_timeout_secs  <  TimeoutStopSec
-```
-
-- **Deregistration delay at least `drain_timeout_secs`.** `SIGTERM` makes kntx stop accepting and
-  close its listening sockets at once, then drain in-flight work. A balancer still sending new
-  connections gets refused ones. AWS defaults this to 300s, so the trap is shortening it for faster
-  deploys without shortening the drain to match.
-- **`TimeoutStopSec` above `drain_timeout_secs`.** systemd `SIGKILL`s at `TimeoutStopSec`; set it at
-  or below the drain timeout and it kills mid-drain, which is precisely what the drain exists to
-  avoid.
-
-```ini
-[Service]
-ExecStart=/usr/local/bin/kntx --config /etc/kntx/config.toml
-ExecReload=/bin/kill -HUP $MAINPID
-KillSignal=SIGTERM
-TimeoutStopSec=45      # must exceed drain_timeout_secs (default 30)
-LimitNOFILE=21280      # see File descriptor limit; a unit does not inherit your shell's
-Restart=on-failure
-User=kntx
-```
-
-`systemctl reload kntx` then maps to `SIGHUP`, which swaps pools, routes, listeners, certs, and
-rate-limit zones in place. A reload that fails validation aborts before mutating anything and the
-running config keeps serving, so check it before shipping:
-
-```bash
-kntx --config /etc/kntx/config.toml --validate
-```
-
-### Common mistakes
-
-| symptom | cause |
-|---|---|
-| every client shares one rate-limit budget | `proxy_protocol` off behind an L4 balancer |
-| access logs record the balancer's IP | same |
-| all connections refused right after enabling `proxy_protocol` | the sender is not configured to send the header, which is mandatory once the listener requires it |
-| connections refused during a rolling deploy | deregistration delay shorter than `drain_timeout_secs` |
-| requests cut mid-flight on restart | `TimeoutStopSec` at or below `drain_timeout_secs` |
-| instance stays in rotation with every backend dead | target group doing a TCP check instead of `/ready` |
-| reload appears to do nothing | the field is restart-only; the log says so, and `kntx_config_version` still advances |
-| `Too many open files` under load | see [File descriptor limit](#file-descriptor-limit) |
+Weighted's 0.43ms p50 beside a 98ms p99 is bimodal: 90% goes to the healthy backend, 10% still
+queues behind the cap. It also needed the 9:1 ratio known in advance, which least_conn measured at
+runtime.
 
 ## Limits
 
-Honest list of what kntx does not do.
-
-- **HTTP/2 and HTTP/3.** HTTP/1.1 only. Binary framing, HPACK, flow control, and multiplexed streams
-  are a large protocol surface; nginx and HAProxy each took years to ship stable implementations.
-- **Backend TLS.** kntx speaks plain TCP upstream. Terminating at the edge and re-encrypting to the
-  backend needs upstream cert validation, SNI selection, and rotation semantics of its own.
-- **Body buffering, and therefore body transforms.** Bodies stream through untouched. This bounds
-  memory by `max_body_size_bytes` instead of `concurrent_requests × max_body_size_bytes`, but it is
-  also why mid-body retry is impossible and why there is no filter chain yet. The `BodyForwarder`
-  trait boundary exists for a decoding implementation when a concrete use case arrives.
-- **WebSocket frames.** Tunnels are byte-opaque. No per-frame metrics or frame-size enforcement.
-- **`CONNECT`.** kntx is a reverse proxy, so 405 is the correct answer. Forward-proxy tunneling is
-  out of scope.
-- **HTTP pipelining.** Deprecated by browsers and replaced by HTTP/2 multiplexing. kntx reads the
-  next request only after the previous response completes, which is current industry behavior.
-- **PROXY protocol is ingress only.** kntx reads the header to recover the client address (see
-  [Deployment](#behind-an-l4-load-balancer)) but does not send one upstream. On an `l7` listener that
-  does not matter, because backends get `X-Forwarded-For` and `X-Real-IP`. On `l4` and
-  `tls-passthrough` there is no header to inject and no way to tell the backend who the client is, so
-  a backend that needs the client address has to sit behind an L7 listener.
-- **No session affinity.** No consistent hashing or sticky sessions, so stateful backends, shard
-  routing, and cache-locality workloads are not served. Round-robin, least-connections and weighted
-  all assume any backend can take any request.
-- **Linux is the target, not a supported-platform matrix.** kntx is built for Linux servers.
-  `splice(2)` and the startup fd-limit preflight are both Linux-gated; other platforms compile and
-  fall back to the vectored or userspace forwarding paths, but they are not tested or benchmarked
-  and CI does not build them.
-- **Reload commit is a sequence of atomic operations, not one global atomic.** There is a
-  sub-microsecond window where new routes can pair with an about-to-update pool. Both backend sets
-  are valid targets so there is no correctness bug, and pools reconcile before routers publish to
-  minimize it. This is the same eventual consistency Envoy has mid-xDS-apply, and it is the price of
-  not taking a lock on the hot path.
+- **HTTP/2 and HTTP/3.** HTTP/1.1 only.
+- **Backend TLS.** kntx speaks plain TCP upstream.
+- **No body buffering, so no body transforms.** Bodies stream through untouched, which bounds memory
+  by `max_body_size_bytes` rather than `concurrency × max_body_size_bytes`, and is why mid-body
+  retry is impossible.
+- **WebSocket frames are opaque.** Tunnels forward bytes; no per-frame metrics.
+- **`CONNECT` returns 405.** kntx is a reverse proxy.
+- **No HTTP pipelining.** Next request is read after the previous response completes.
+- **PROXY protocol is ingress only.** On `l4` and `tls-passthrough` there is no way to tell the
+  backend the client address; use an L7 listener if it needs one.
+- **No session affinity.** No consistent hashing or sticky sessions yet.
+- **Linux only.** `splice(2)` and `SO_LINGER` handling are Linux-specific.
 
 ## Development
 
 ```bash
-cargo test                                  # 587 tests
+cargo test                                  # 625 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-kntx --config config.toml --validate        # check a config without binding anything
+cargo deny check                            # advisories, licenses, sources
+cargo +nightly fuzz run parse_request        # four parser targets under fuzz/
 ```
 
-Tests cover unit-level protocol logic and integration paths end to end: real TLS handshakes with
-`rcgen`-generated certs, per-byte truncation property tests on the ClientHello parser, byte-exact
-fragmented-hello forwarding proven against a recording backend, exact-count concurrent rate-limit
-stress, live `apply_reload` against a serving listener, and the full forwarding strategy matrix
-including splice.
+CI runs fmt, clippy and tests on stable, plus `cargo-deny`.
 
 ## Roadmap
 
-Near term: the rest of the admin surface (`/config_dump`, `/clusters`, and a forced-unhealthy toggle
-so an instance can be drained for maintenance without stopping the process). Then consistent hashing
-for session affinity, and OpenTelemetry span emission with Prometheus exemplars.
+Consistent hashing for session affinity, then OpenTelemetry span emission with Prometheus exemplars.
 
-Longer term, kntx is aiming at programmable proxy logic, the space Cloudflare Workers, Envoy
-filters, and nginx+Lua occupy, but with the priority order inverted: performance first,
-programmability layered on without compromising the L4 path. The `Matcher` and `Router` traits
-already in the codebase are the plug-in surface. A routing expression DSL (`host == "api.example.com"
-&& path.startsWith("/v1") && time.is_peak() → fast_pool`) compiles down to them; scripted filters
-(Lua, Wasm) come after that model is validated.
-
-kntx is the data plane, not a full edge platform. No KV store, no durable objects, no cron triggers,
-no built-in dashboards.
+Longer term kntx targets programmable proxy logic, the space Cloudflare Workers and Envoy filters
+occupy, with the priority order inverted: performance first. The `Matcher` and `Router` traits are
+the plug-in surface a routing DSL compiles down to. kntx is the data plane, not an edge platform.
 
 ## License
 
-[MIT](LICENSE)
+MIT

@@ -31,11 +31,16 @@ use kntx::runtime::{
 struct TestProxy {
     ctx: ReloadContext,
     _shutdown: watch::Sender<()>,
+    /// held so the channel stays open. a reload hands a newly bound listener over
+    /// this before registering it, and a closed channel makes it log "process is
+    /// shutting down" and skip the registry insert. nothing polls the futures.
+    _spawn_rx: mpsc::UnboundedReceiver<kntx::runtime::ListenerSpawn>,
 }
 
 impl TestProxy {
-    async fn start(config: &Config) -> Self {
-        let state = Arc::new(ArcSwap::from_pointee(build_snapshot(config)));
+    async fn start(config: Config) -> Self {
+        let config = Arc::new(config);
+        let state = Arc::new(ArcSwap::from_pointee(build_snapshot(Arc::clone(&config))));
         let snap = state.load_full();
 
         let buffer_pool = BufferPool::with_defaults();
@@ -65,9 +70,6 @@ impl TestProxy {
             );
         }
 
-        // ReloadContext needs the sender; no test here adds a *served* listener
-        // (the bind-abort test fails at bind, before any handoff), so there is
-        // nothing to adopt and no consumer task.
         let (spawn_tx, _spawn_rx) = mpsc::unbounded_channel();
         for cfg in &config.listeners {
             let router: Arc<dyn Router> =
@@ -100,12 +102,15 @@ impl TestProxy {
                 spawn_tx,
                 shutdown: shutdown_rx,
                 admin: None,
+                log_filter: None,
+                flags: Arc::new(kntx::control::RuntimeFlags::new()),
             },
             _shutdown: shutdown_tx,
+            _spawn_rx,
         }
     }
 
-    async fn reload(&self, cfg: &Config) -> Result<u64, kntx::runtime::ReloadError> {
+    async fn reload(&self, cfg: Config) -> Result<u64, kntx::runtime::ReloadError> {
         apply_reload(&self.ctx, cfg).await
     }
 
@@ -152,6 +157,59 @@ fn l7_single_pool(listen: SocketAddr, backend: SocketAddr) -> Config {
     .unwrap()
 }
 
+/// 10.22: draining stops accepting without stopping the process, and the next
+/// committed reload re-binds through the ordinary listener-add path.
+#[tokio::test]
+async fn drain_stops_accepting_and_a_reload_rebinds() {
+    let alpha = HttpBackend::start(ResponseSpec::ok("alpha")).await;
+    let listen = free_port();
+    let proxy = TestProxy::start(l7_single_pool(listen, alpha.addr)).await;
+    assert_eq!(get(listen).await, (200, "alpha".to_owned()));
+
+    let drained = kntx::runtime::drain_listeners(&proxy.ctx.listeners);
+    assert_eq!(drained, 1);
+    proxy.ctx.flags.set_draining(true);
+
+    // the registry has to be empty, not merely signalled: apply_reload decides a
+    // listener is already bound by looking it up there, so a leftover entry would
+    // make the reload below swap a runtime onto a dead socket and never re-bind
+    assert!(proxy.ctx.listeners.lock().unwrap().is_empty());
+
+    // the socket is closed, so connects are refused rather than hanging in a
+    // backlog nobody will accept from
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        connect_until_refused(listen),
+    )
+    .await;
+    assert!(refused.is_ok(), "port still accepting after drain");
+
+    let v = proxy
+        .reload(l7_single_pool(listen, alpha.addr))
+        .await
+        .expect("reload succeeds");
+    assert_eq!(v, 1);
+    assert!(
+        !proxy.ctx.flags.is_draining(),
+        "a committed reload must clear the drain flag",
+    );
+
+    // the re-bind goes through spawn_tx, which this harness does not drain, so the
+    // serve task is never adopted here. what the reload owns is the bind and the
+    // registry entry, and both are asserted.
+    assert_eq!(proxy.ctx.listeners.lock().unwrap().len(), 1);
+}
+
+/// retries until a connect is refused, so the assertion does not race the drain.
+async fn connect_until_refused(addr: SocketAddr) {
+    loop {
+        match TcpStream::connect(addr).await {
+            Err(_) => return,
+            Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+}
+
 /// 8.6: swapping a pool's backend set routes new connections to the new backend.
 #[tokio::test]
 async fn reload_backend_swap_routes_new_requests() {
@@ -159,12 +217,12 @@ async fn reload_backend_swap_routes_new_requests() {
     let beta = HttpBackend::start(ResponseSpec::ok("beta")).await;
     let listen = free_port();
 
-    let proxy = TestProxy::start(&l7_single_pool(listen, alpha.addr)).await;
+    let proxy = TestProxy::start(l7_single_pool(listen, alpha.addr)).await;
     let (status, body) = get(listen).await;
     assert_eq!((status, body.as_str()), (200, "alpha"));
 
     let v = proxy
-        .reload(&l7_single_pool(listen, beta.addr))
+        .reload(l7_single_pool(listen, beta.addr))
         .await
         .expect("reload succeeds");
     assert_eq!(v, 1);
@@ -185,7 +243,7 @@ async fn reload_backend_swap_routes_new_requests() {
 async fn reload_bind_failure_keeps_old_config_serving() {
     let alpha = HttpBackend::start(ResponseSpec::ok("alpha")).await;
     let listen = free_port();
-    let proxy = TestProxy::start(&l7_single_pool(listen, alpha.addr)).await;
+    let proxy = TestProxy::start(l7_single_pool(listen, alpha.addr)).await;
     assert_eq!(get(listen).await, (200, "alpha".to_owned()));
 
     // occupy a port, then reload a config that adds a second listener on it
@@ -202,7 +260,7 @@ async fn reload_bind_failure_keeps_old_config_serving() {
     )
     .unwrap();
 
-    let err = proxy.reload(&adds_busy_listener).await.unwrap_err();
+    let err = proxy.reload(adds_busy_listener).await.unwrap_err();
     assert!(
         matches!(err, kntx::runtime::ReloadError::Bind(_)),
         "got {err:?}"
@@ -240,13 +298,13 @@ async fn reload_tightening_zone_starts_rejecting() {
     let backend = HttpBackend::start(ResponseSpec::ok("ok")).await;
     let listen = free_port();
 
-    let proxy = TestProxy::start(&l7_rate_limited(listen, backend.addr, 1000, 100)).await;
+    let proxy = TestProxy::start(l7_rate_limited(listen, backend.addr, 1000, 100)).await;
     for _ in 0..5 {
         assert_eq!(get(listen).await.0, 200, "lenient zone admits everything");
     }
 
     proxy
-        .reload(&l7_rate_limited(listen, backend.addr, 1, 0))
+        .reload(l7_rate_limited(listen, backend.addr, 1, 0))
         .await
         .expect("reload succeeds");
 

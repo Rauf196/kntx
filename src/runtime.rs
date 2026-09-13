@@ -16,7 +16,7 @@ use crate::balancer::RoundRobin;
 use crate::config::{
     self, Config, ForwardingStrategy, ListenerConfig, RateLimitConfig, ResolvedHealth, ZoneConfig,
 };
-use crate::control::AdminHandle;
+use crate::control::{AdminHandle, LogFilterHandle, RuntimeFlags};
 use crate::health::{BackendPool, HealthChecker};
 use crate::listener::{self, ListenerRuntime, RuntimeCell, ServeConfig};
 use crate::pool::buffer::BufferPool;
@@ -97,6 +97,10 @@ pub struct ReloadContext {
     pub shutdown: watch::Receiver<()>,
     /// the running admin socket, if one was configured at boot.
     pub admin: Option<AdminHandle>,
+    /// `None` only in tests, which install no subscriber.
+    pub log_filter: Option<LogFilterHandle>,
+    /// shared with both control sockets; a committed reload clears the drain flag.
+    pub flags: Arc<RuntimeFlags>,
 }
 
 /// the effective running configuration: the reconcilable, swappable runtime
@@ -111,6 +115,11 @@ pub struct Snapshot {
     pub zones: HashMap<String, ZoneSlot>,
     /// monotonic reload counter; startup is 0, each committed reload increments it.
     pub version: u64,
+    /// the config this snapshot was committed from, with restart-only fields pinned
+    /// back to what is actually running. read by `/config_dump`. living here rather
+    /// than in a second `ArcSwap` means one store, so the dump and the version it
+    /// reports can never come from different reloads.
+    pub config: Arc<Config>,
 }
 
 /// a live rate-limit zone plus the config it was built from. the config is the
@@ -129,7 +138,7 @@ pub struct ZoneSlot {
 ///
 /// the config MUST be validated first (`Config::from_file`/`from_toml`): zone rate
 /// is unwrapped as NonZero on that guarantee.
-pub fn build_snapshot(config: &Config) -> Snapshot {
+pub fn build_snapshot(config: Arc<Config>) -> Snapshot {
     let mut pools = HashMap::with_capacity(config.pools.len());
     for pool_cfg in &config.pools {
         pools.insert(pool_cfg.name.clone(), build_pool(pool_cfg, &config.health));
@@ -144,6 +153,7 @@ pub fn build_snapshot(config: &Config) -> Snapshot {
         pools,
         zones,
         version: 0,
+        config,
     }
 }
 
@@ -287,13 +297,32 @@ pub fn drain_all(listeners: &ListenerRegistry) {
     }
 }
 
+/// stop accepting on every listener and forget them, returning how many were drained.
+///
+/// clearing the registry is the load-bearing half: `apply_reload` decides a listener
+/// is already bound by looking it up here, so leaving entries behind would make the
+/// next SIGHUP swap runtimes onto dead sockets and never re-bind. emptied, every
+/// listener looks new and takes the ordinary listener-add path.
+///
+/// `drain_all` does not clear, and should not: nothing re-binds after shutdown.
+pub fn drain_listeners(listeners: &ListenerRegistry) -> usize {
+    let mut registry = listeners.lock().expect("registry lock");
+    for (address, handle) in registry.iter() {
+        let _ = handle.drain.send(());
+        tracing::info!(%address, "listener drained by admin request");
+    }
+    let drained = registry.len();
+    registry.clear();
+    drained
+}
+
 /// re-read + validate the config file, then apply the reload. emits reload metrics
 /// and logs the outcome. a parse/validation failure aborts with the current config
 /// fully intact - nothing is mutated before validation passes.
 pub async fn reload_from_file(ctx: &ReloadContext, path: &str) {
     tracing::info!(config = %path, "SIGHUP received, reloading config");
     let result = match Config::from_file(path) {
-        Ok(new) => apply_reload(ctx, &new).await,
+        Ok(new) => apply_reload(ctx, new).await,
         Err(e) => Err(ReloadError::from(e)),
     };
     match result {
@@ -335,7 +364,7 @@ struct Prepared {
 ///
 /// everything that can fail - router build, cert load, bind - runs before anything
 /// mutates, so a rejected reload leaves the running config fully intact.
-pub async fn apply_reload(ctx: &ReloadContext, new: &Config) -> Result<u64, ReloadError> {
+pub async fn apply_reload(ctx: &ReloadContext, mut new: Config) -> Result<u64, ReloadError> {
     let current = ctx.state.load();
 
     // pools in both configs keep their Arc, so circuit state, warm keepalive conns
@@ -421,24 +450,37 @@ pub async fn apply_reload(ctx: &ReloadContext, new: &Config) -> Result<u64, Relo
 
     // the admin socket is bound at startup and never rebound, but the token is a
     // credential: a leaked one has to be revocable without dropping traffic.
-    match (&ctx.admin, &new.admin) {
+    // live unless RUST_LOG or a POST /logging already claimed the filter, so editing
+    // the level in the file and sending SIGHUP is not a silent no-op.
+    if let Some(log_filter) = &ctx.log_filter {
+        log_filter.apply_config_level(&new.logging.level);
+    }
+
+    // each arm also pins `new.admin` back to what is bound, so `/config_dump` reports
+    // the socket that is serving rather than the one the file asked for.
+    match (&ctx.admin, &mut new.admin) {
         (Some(running), Some(cfg)) => {
             if cfg.address != running.address {
                 tracing::warn!(
                     address = %running.address,
                     "[admin] address is restart-only, keeping the bound socket",
                 );
+                cfg.address = running.address;
             }
             running.set_token(cfg.token.as_deref());
         }
         // the socket outlives the section, so dropping the gate with it would
         // leave it serving unauthenticated
-        (Some(running), None) => tracing::warn!(
-            address = %running.address,
-            "[admin] removed but its socket stays bound until restart, keeping the running token",
-        ),
+        (Some(running), None) => {
+            tracing::warn!(
+                address = %running.address,
+                "[admin] removed but its socket stays bound until restart, keeping the running token",
+            );
+            new.admin = current.config.admin.clone();
+        }
         (None, Some(_)) => {
-            tracing::warn!("[admin] added, but binding its socket needs a restart")
+            tracing::warn!("[admin] added, but binding its socket needs a restart");
+            new.admin = None;
         }
         (None, None) => {}
     }
@@ -543,11 +585,27 @@ pub async fn apply_reload(ctx: &ReloadContext, new: &Config) -> Result<u64, Relo
     });
     drop(registry);
 
+    // a surviving pool keeps the balancer it was built with, so pin the config that
+    // gets published to the strategy actually selecting backends. warned about above;
+    // this is what stops `/config_dump` from reporting the value that was ignored.
+    // added pools already agree, so this is a no-op for them.
+    for pool_cfg in &mut new.pools {
+        if let Some((_, balancer)) = pools.get(&pool_cfg.name) {
+            pool_cfg.strategy = balancer.strategy();
+        }
+    }
+
+    // a committed reload binds every listener the config names, so whatever drain
+    // emptied the registry is over. a rejected reload never reaches here and leaves
+    // the flag set, which is correct: nothing was bound.
+    ctx.flags.set_draining(false);
+
     let version = current.version + 1;
     ctx.state.store(Arc::new(Snapshot {
         pools,
         zones,
         version,
+        config: Arc::new(new),
     }));
     Ok(version)
 }
@@ -608,8 +666,9 @@ mod tests {
         _shutdown: watch::Sender<()>,
     }
 
-    fn harness(config: &Config) -> Harness {
-        let snapshot = build_snapshot(config);
+    fn harness(config: Config) -> Harness {
+        let config = Arc::new(config);
+        let snapshot = build_snapshot(Arc::clone(&config));
         let mut registry = HashMap::new();
         let mut drains = HashMap::new();
         for l in &config.listeners {
@@ -654,6 +713,8 @@ mod tests {
                 spawn_tx,
                 shutdown,
                 admin: None,
+                log_filter: None,
+                flags: Arc::new(RuntimeFlags::new()),
             },
             spawn_rx,
             drains,
@@ -702,7 +763,7 @@ backends = [{ address = "127.0.0.1:4001" }]
 
     #[test]
     fn builds_pools_with_correct_membership() {
-        let snap = build_snapshot(&cfg(TWO_POOLS));
+        let snap = build_snapshot(Arc::new(cfg(TWO_POOLS)));
         assert_eq!(snap.version, 0);
         assert_eq!(snap.pools.len(), 2);
         assert_eq!(snap.pools.get("web").unwrap().0.len(), 2);
@@ -718,7 +779,7 @@ backends = [{ address = "127.0.0.1:4001" }]
              [rate_limit.zones.per_ip]\nkey = \"client_ip\"\nrate = 100\nburst = 10\n\n\
              [rate_limit.zones.global_cap]\nkey = \"global\"\nrate = 50\n"
         );
-        let snap = build_snapshot(&cfg(&toml));
+        let snap = build_snapshot(Arc::new(cfg(&toml)));
         assert_eq!(snap.zones.len(), 2);
         assert!(matches!(
             &*snap.zones.get("per_ip").unwrap().limiter,
@@ -732,7 +793,7 @@ backends = [{ address = "127.0.0.1:4001" }]
 
     #[test]
     fn no_rate_limit_section_yields_no_zones() {
-        let snap = build_snapshot(&cfg(TWO_POOLS));
+        let snap = build_snapshot(Arc::new(cfg(TWO_POOLS)));
         assert!(snap.zones.is_empty());
     }
 
@@ -758,8 +819,8 @@ backends = [{ address = "127.0.0.1:4001" }]
     #[tokio::test]
     async fn reload_reconciles_backend_membership() {
         let start = one_pool_cfg(&["127.0.0.1:3001", "127.0.0.1:3002"]);
-        let h = harness(&start);
-        let v = apply_reload(&h.ctx, &one_pool_cfg(&["127.0.0.1:3001", "127.0.0.1:3003"]))
+        let h = harness(start);
+        let v = apply_reload(&h.ctx, one_pool_cfg(&["127.0.0.1:3001", "127.0.0.1:3003"]))
             .await
             .expect("reload succeeds");
         assert_eq!(v, 1);
@@ -798,7 +859,7 @@ backends = [{ address = "127.0.0.1:4001" }]
 
     #[test]
     fn build_snapshot_wires_strategy_and_weights_from_config() {
-        let snapshot = build_snapshot(&weighted_pool_cfg("weighted", 3, 1));
+        let snapshot = build_snapshot(Arc::new(weighted_pool_cfg("weighted", 3, 1)));
         let (pool, balancer) = snapshot.pools.get("web").unwrap();
 
         assert_eq!(balancer.strategy(), config::BalancerStrategy::Weighted);
@@ -817,12 +878,12 @@ backends = [{ address = "127.0.0.1:4001" }]
 
     #[tokio::test]
     async fn reload_retunes_weights_but_keeps_strategy() {
-        let h = harness(&weighted_pool_cfg("weighted", 3, 1));
+        let h = harness(weighted_pool_cfg("weighted", 3, 1));
         let balancer_before = h.ctx.state.load().pools.get("web").unwrap().1.clone();
 
         // weight moves to drain 3001; strategy change in the same reload is
         // restart-only and must be ignored rather than half-applied.
-        apply_reload(&h.ctx, &weighted_pool_cfg("least_conn", 0, 5))
+        apply_reload(&h.ctx, weighted_pool_cfg("least_conn", 0, 5))
             .await
             .expect("reload succeeds");
 
@@ -835,6 +896,14 @@ backends = [{ address = "127.0.0.1:4001" }]
             balancer_after.strategy(),
             config::BalancerStrategy::Weighted,
             "strategy is restart-only",
+        );
+        // the published config must agree with the balancer, not with the file:
+        // /config_dump reporting least_conn while weighted is selecting backends
+        // is the exact lie the dump exists to prevent
+        assert_eq!(
+            h.ctx.state.load().config.pools[0].strategy,
+            config::BalancerStrategy::Weighted,
+            "the dump would have reported the ignored value",
         );
         assert_eq!(pool.state_for(addr("127.0.0.1:3001")).unwrap().weight(), 0);
         assert_eq!(pool.state_for(addr("127.0.0.1:3002")).unwrap().weight(), 5);
@@ -850,8 +919,8 @@ backends = [{ address = "127.0.0.1:4001" }]
 
     #[tokio::test]
     async fn reload_applies_weight_to_a_backend_it_adds() {
-        let h = harness(&weighted_pool_cfg("weighted", 1, 1));
-        apply_reload(&h.ctx, &weighted_pool_cfg("weighted", 1, 4))
+        let h = harness(weighted_pool_cfg("weighted", 1, 1));
+        apply_reload(&h.ctx, weighted_pool_cfg("weighted", 1, 4))
             .await
             .expect("reload succeeds");
 
@@ -865,7 +934,7 @@ backends = [{ address = "127.0.0.1:4001" }]
     async fn reload_preserves_pool_arc_and_circuit() {
         use crate::health::CircuitState;
         let start = one_pool_cfg(&["127.0.0.1:3001", "127.0.0.1:3002"]);
-        let h = harness(&start);
+        let h = harness(start);
         let pool_before = h.ctx.state.load().pools.get("web").unwrap().0.clone();
         pool_before.record_failure(addr("127.0.0.1:3001"));
         assert_eq!(
@@ -879,7 +948,7 @@ backends = [{ address = "127.0.0.1:4001" }]
         // reload with an unrelated change (a third backend added)
         apply_reload(
             &h.ctx,
-            &one_pool_cfg(&["127.0.0.1:3001", "127.0.0.1:3002", "127.0.0.1:3003"]),
+            one_pool_cfg(&["127.0.0.1:3001", "127.0.0.1:3002", "127.0.0.1:3003"]),
         )
         .await
         .expect("reload succeeds");
@@ -901,16 +970,16 @@ backends = [{ address = "127.0.0.1:4001" }]
 
     #[tokio::test]
     async fn reload_version_increments() {
-        let h = harness(&one_pool_cfg(&["127.0.0.1:3001"]));
+        let h = harness(one_pool_cfg(&["127.0.0.1:3001"]));
         assert_eq!(h.ctx.state.load().version, 0);
         assert_eq!(
-            apply_reload(&h.ctx, &one_pool_cfg(&["127.0.0.1:3001"]))
+            apply_reload(&h.ctx, one_pool_cfg(&["127.0.0.1:3001"]))
                 .await
                 .unwrap(),
             1
         );
         assert_eq!(
-            apply_reload(&h.ctx, &one_pool_cfg(&["127.0.0.1:3002"]))
+            apply_reload(&h.ctx, one_pool_cfg(&["127.0.0.1:3002"]))
                 .await
                 .unwrap(),
             2
@@ -953,10 +1022,10 @@ backends = [{ address = "127.0.0.1:4001" }]
 
     #[tokio::test]
     async fn reload_swaps_the_route_table() {
-        let h = harness(&routed_cfg("api"));
+        let h = harness(routed_cfg("api"));
         assert_eq!(routed_pool_for(&h, "/api/v1"), "api");
 
-        apply_reload(&h.ctx, &routed_cfg("web"))
+        apply_reload(&h.ctx, routed_cfg("web"))
             .await
             .expect("reload succeeds");
 
@@ -973,7 +1042,7 @@ backends = [{ address = "127.0.0.1:4001" }]
     /// pool add landed.
     #[tokio::test]
     async fn reload_adds_a_pool_and_routes_to_it() {
-        let h = harness(&routed_cfg("api"));
+        let h = harness(routed_cfg("api"));
         let with_new_pool = cfg(
             "[[listeners]]\naddress = \"127.0.0.1:8080\"\nmode = \"l7\"\n\n\
              [[listeners.routes]]\npath_prefix = \"/api\"\npool = \"fallback\"\n\n\
@@ -982,7 +1051,7 @@ backends = [{ address = "127.0.0.1:4001" }]
              [[pools]]\nname = \"fallback\"\nbackends = [{ address = \"127.0.0.1:5001\" }]\n",
         );
 
-        apply_reload(&h.ctx, &with_new_pool)
+        apply_reload(&h.ctx, with_new_pool)
             .await
             .expect("a route may reference a pool this reload adds");
 
@@ -1006,7 +1075,7 @@ backends = [{ address = "127.0.0.1:4001" }]
     /// connections pinned to the old route table finish on it.
     #[tokio::test]
     async fn reload_removes_a_pool_and_stops_its_tasks() {
-        let h = harness(&routed_cfg("api"));
+        let h = harness(routed_cfg("api"));
         let pinned = h.ctx.state.load().pools["api"].0.clone();
 
         // "web" catch-all only: nothing references "api" any more
@@ -1015,7 +1084,7 @@ backends = [{ address = "127.0.0.1:4001" }]
              [[listeners.routes]]\npool = \"web\"\n\n\
              [[pools]]\nname = \"web\"\nbackends = [{ address = \"127.0.0.1:3001\" }]\n",
         );
-        apply_reload(&h.ctx, &without_api)
+        apply_reload(&h.ctx, without_api)
             .await
             .expect("reload succeeds");
 
@@ -1031,7 +1100,7 @@ backends = [{ address = "127.0.0.1:4001" }]
     #[tokio::test]
     async fn reload_adds_and_removes_listeners() {
         let extra = free_port();
-        let mut h = harness(&routed_cfg("api"));
+        let mut h = harness(routed_cfg("api"));
         let old = addr("127.0.0.1:8080");
 
         let moved = cfg(&format!(
@@ -1039,7 +1108,7 @@ backends = [{ address = "127.0.0.1:4001" }]
              [[listeners.routes]]\npool = \"web\"\n\n\
              [[pools]]\nname = \"web\"\nbackends = [{{ address = \"127.0.0.1:3001\" }}]\n"
         ));
-        apply_reload(&h.ctx, &moved).await.expect("reload succeeds");
+        apply_reload(&h.ctx, moved).await.expect("reload succeeds");
 
         let (spawned, _task) = h.spawn_rx.try_recv().expect("added listener handed over");
         assert_eq!(spawned, extra);
@@ -1074,7 +1143,7 @@ backends = [{ address = "127.0.0.1:4001" }]
         std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\ntruncated\n").unwrap();
         std::fs::write(&key, b"not a key").unwrap();
 
-        let h = harness(&routed_cfg("api"));
+        let h = harness(routed_cfg("api"));
         let with_tls = cfg(&format!(
             "[[listeners]]\naddress = \"127.0.0.1:8080\"\nmode = \"l7\"\n\n\
              [[listeners.tls.certificates]]\ncert = \"{}\"\nkey = \"{}\"\n\n\
@@ -1085,7 +1154,7 @@ backends = [{ address = "127.0.0.1:4001" }]
             key.display(),
         ));
 
-        let err = apply_reload(&h.ctx, &with_tls).await.unwrap_err();
+        let err = apply_reload(&h.ctx, with_tls).await.unwrap_err();
         assert!(matches!(err, ReloadError::Tls { .. }), "got {err:?}");
         assert_eq!(
             h.ctx.state.load().version,
@@ -1109,7 +1178,7 @@ backends = [{ address = "127.0.0.1:4001" }]
         std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\ntruncated\n").unwrap();
         std::fs::write(&key, b"not a key").unwrap();
 
-        let mut h = harness(&routed_cfg("api"));
+        let mut h = harness(routed_cfg("api"));
         let admin = AdminHandle::new("127.0.0.1:9901".parse().unwrap(), Some("old"));
         h.ctx.admin = Some(admin.clone());
 
@@ -1124,7 +1193,7 @@ backends = [{ address = "127.0.0.1:4001" }]
             key.display(),
         ));
 
-        apply_reload(&h.ctx, &with_tls).await.unwrap_err();
+        apply_reload(&h.ctx, with_tls).await.unwrap_err();
         assert!(admin.token_is(Some("old")), "aborted reload rotated it");
 
         // the same edit on a config that commits does rotate
@@ -1136,7 +1205,7 @@ backends = [{ address = "127.0.0.1:4001" }]
              [[pools]]\nname = \"api\"\nbackends = [{ address = \"127.0.0.1:4001\" }]\n\n\
              [admin]\naddress = \"127.0.0.1:9901\"\ntoken = \"new\"\n",
         );
-        apply_reload(&h.ctx, &good).await.unwrap();
+        apply_reload(&h.ctx, good).await.unwrap();
         assert!(
             admin.token_is(Some("new")),
             "committed reload kept the old one"
@@ -1161,7 +1230,7 @@ backends = [{ address = "127.0.0.1:4001" }]
     /// on every SIGHUP.
     #[tokio::test]
     async fn reload_preserves_unchanged_zone_limiter() {
-        let h = harness(&zoned_cfg(100));
+        let h = harness(zoned_cfg(100));
         let before = zone_limiter(&h.ctx.state.load(), "edge");
 
         // reload an unrelated backend change; the zone params are byte-identical
@@ -1170,7 +1239,7 @@ backends = [{ address = "127.0.0.1:4001" }]
              [[pools]]\nname = \"web\"\nbackends = [{ address = \"127.0.0.1:3002\" }]\n\n\
              [rate_limit.zones.edge]\nkey = \"global\"\nrate = 100\n",
         );
-        apply_reload(&h.ctx, &with_backend)
+        apply_reload(&h.ctx, with_backend)
             .await
             .expect("reload succeeds");
 
@@ -1185,10 +1254,10 @@ backends = [{ address = "127.0.0.1:4001" }]
     /// limiter reaches the listener's pinned runtime cell.
     #[tokio::test]
     async fn reload_rebuilds_changed_zone_and_relinks_listener() {
-        let h = harness(&zoned_cfg(100));
+        let h = harness(zoned_cfg(100));
         let before = zone_limiter(&h.ctx.state.load(), "edge");
 
-        apply_reload(&h.ctx, &zoned_cfg(500))
+        apply_reload(&h.ctx, zoned_cfg(500))
             .await
             .expect("reload succeeds");
 
@@ -1215,14 +1284,14 @@ backends = [{ address = "127.0.0.1:4001" }]
     /// referencing it drops its handle.
     #[tokio::test]
     async fn reload_removes_unreferenced_zone() {
-        let h = harness(&zoned_cfg(100));
+        let h = harness(zoned_cfg(100));
         assert!(h.ctx.state.load().zones.contains_key("edge"));
 
         let no_zone = cfg(
             "[[listeners]]\naddress = \"127.0.0.1:8080\"\npool = \"web\"\n\n\
              [[pools]]\nname = \"web\"\nbackends = [{ address = \"127.0.0.1:3001\" }]\n",
         );
-        apply_reload(&h.ctx, &no_zone)
+        apply_reload(&h.ctx, no_zone)
             .await
             .expect("reload succeeds");
 
@@ -1241,14 +1310,14 @@ backends = [{ address = "127.0.0.1:4001" }]
     /// desired zone set, not the running one (the pool-add analog for zones).
     #[tokio::test]
     async fn reload_adds_a_zone_a_listener_references() {
-        let h = harness(&routed_cfg("api"));
+        let h = harness(routed_cfg("api"));
 
         let with_zone = cfg(
             "[[listeners]]\naddress = \"127.0.0.1:8080\"\npool = \"web\"\nrate_limit = \"edge\"\n\n\
              [[pools]]\nname = \"web\"\nbackends = [{ address = \"127.0.0.1:3001\" }]\n\n\
              [rate_limit.zones.edge]\nkey = \"client_ip\"\nrate = 10\n",
         );
-        apply_reload(&h.ctx, &with_zone)
+        apply_reload(&h.ctx, with_zone)
             .await
             .expect("a listener may reference a zone this reload adds");
 

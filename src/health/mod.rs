@@ -20,6 +20,16 @@ pub enum CircuitState {
 }
 
 impl CircuitState {
+    /// wire name for `/pools` and the panel. the `kntx_circuit_breaker_state` gauge
+    /// keeps the numeric encoding; a scrape and a JSON dump want different shapes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::HalfOpen => "half_open",
+        }
+    }
+
     fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::Closed,
@@ -119,6 +129,10 @@ impl BackendState {
 
     pub fn circuit_state(&self) -> CircuitState {
         CircuitState::from_u8(self.circuit.load(Ordering::Acquire))
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures.load(Ordering::Relaxed)
     }
 
     /// check if this backend can accept traffic.
@@ -322,6 +336,10 @@ impl BackendPool {
 
     pub fn recovery_timeout(&self) -> Duration {
         Duration::from_millis(self.recovery_timeout_millis.load(Ordering::Relaxed))
+    }
+
+    pub fn failure_threshold(&self) -> u32 {
+        self.failure_threshold.load(Ordering::Relaxed)
     }
 
     /// owned snapshot of the current backend set, safe to hold across await points.

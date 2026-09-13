@@ -49,9 +49,13 @@ enum LogFormat {
     Json,
 }
 
-fn init_tracing(level: Option<&str>, format: &LogFormat) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level.unwrap_or("info")));
+fn init_tracing(level: Option<&str>, format: &LogFormat) -> kntx::control::LogFilterHandle {
+    // RUST_LOG counts as an override: an explicit environment setting outranks the
+    // config file, so a reload must not move the filter out from under it.
+    let from_env = EnvFilter::try_from_default_env();
+    let overridden = from_env.is_ok();
+    let filter = from_env.unwrap_or_else(|_| EnvFilter::new(level.unwrap_or("info")));
+    let (filter, handle) = kntx::control::log_filter_layer(filter, overridden);
 
     match format {
         LogFormat::Text => {
@@ -67,6 +71,7 @@ fn init_tracing(level: Option<&str>, format: &LogFormat) {
                 .init();
         }
     }
+    handle
 }
 
 async fn shutdown_signal() {
@@ -149,10 +154,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     let args = Args::parse();
 
-    let config = config::Config::from_file(&args.config)?;
+    // Arc'd because the committed snapshot publishes it for `/config_dump`; every
+    // field access below still reads through Deref.
+    let config = Arc::new(config::Config::from_file(&args.config)?);
 
     let log_level = args.log_level.as_deref().unwrap_or(&config.logging.level);
-    init_tracing(Some(log_level), &args.log_format);
+    let log_filter = init_tracing(Some(log_level), &args.log_format);
 
     if args.validate {
         tracing::info!(config = %args.config, "configuration is valid");
@@ -229,7 +236,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // zones. held in an ArcSwap so the SIGHUP reload task can reconcile it live.
     // one builder is shared by startup and reload so the two never diverge.
     let config_state = Arc::new(arc_swap::ArcSwap::from_pointee(
-        kntx::runtime::build_snapshot(&config),
+        kntx::runtime::build_snapshot(Arc::clone(&config)),
     ));
     // owned snapshot for startup wiring; safe to hold across the bind awaits below.
     let snapshot = config_state.load_full();
@@ -337,13 +344,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         task_addrs.insert(abort.id(), listener_cfg.address);
     }
 
+    // one set of operator-forced flags for both sockets: /ready is served by the
+    // metrics socket and the routes that set it live on the admin socket.
+    let control_flags = Arc::new(kntx::control::RuntimeFlags::new());
+
     if let Some((handle, listener)) = metrics_endpoint {
         let address = listener.local_addr()?;
         kntx::control::spawn(
             listener,
             kntx::control::Surface::Metrics {
                 handle,
-                state: Arc::clone(&config_state),
+                flags: Arc::clone(&control_flags),
             },
         );
         tracing::info!(%address, "metrics endpoint started (/metrics, /healthz, /ready)");
@@ -358,6 +369,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 handle: handle.clone(),
                 state: Arc::clone(&config_state),
                 started,
+                flags: Arc::clone(&control_flags),
+                log_filter: log_filter.clone(),
+                listeners: Arc::clone(&listeners),
             },
         );
         tracing::info!(%address, authenticated, "admin endpoint started (/server_info)");
@@ -378,6 +392,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             spawn_tx,
             shutdown: shutdown_rx.clone(),
             admin: admin_handle,
+            log_filter: Some(log_filter),
+            flags: Arc::clone(&control_flags),
         };
         let reload_path = args.config.clone();
         tokio::spawn(async move {
@@ -401,14 +417,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // out to every listener's drain channel, and treat any abnormal exit as fatal.
     // a queued spawn keeps the loop alive when the last old listener has already
     // exited - the reload that replaces a listener sends before it drains the old one.
+    //
+    // exit is keyed on the shutdown signal, not on the task count: /drain_listeners
+    // empties the JoinSet without meaning "stop", and inferring intent from the count
+    // would turn that route into a slower SIGTERM. with zero listeners the join arm
+    // yields None and disables itself for the call, so the loop parks on the other
+    // two arms - main holds shutdown_tx and ReloadContext holds spawn_tx, so both
+    // stay pending rather than spinning.
     let mut had_error = false;
-    while !listener_tasks.is_empty() || !spawn_rx.is_empty() {
+    let mut shutting_down = false;
+    loop {
+        if shutting_down && listener_tasks.is_empty() && spawn_rx.is_empty() {
+            break;
+        }
         tokio::select! {
             Some((address, task)) = spawn_rx.recv() => {
                 let abort = listener_tasks.spawn(task);
                 task_addrs.insert(abort.id(), address);
             }
             Ok(()) = shutdown_rx.changed() => {
+                shutting_down = true;
                 kntx::runtime::drain_all(&listeners);
             }
             Some(result) = listener_tasks.join_next_with_id() => {

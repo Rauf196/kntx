@@ -11,7 +11,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -83,11 +83,26 @@ pub struct RecoveredPeer {
 /// a peer allowed to speak the protocol, as `<address>` or `<address>/<prefix>`.
 /// deserialized through `FromStr` like `ListenerConfig.address`, so a bad value
 /// fails at config parse with the offending line attached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "String")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct TrustedCidr {
     network: IpAddr,
     bits: u8,
+}
+
+/// round-trips back through `try_from`. a bare address parses as a full-width prefix,
+/// so `10.0.0.1` comes back out as `10.0.0.1/32` - the effective value, which is what
+/// `/config_dump` is for.
+impl std::fmt::Display for TrustedCidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.network, self.bits)
+    }
+}
+
+impl From<TrustedCidr> for String {
+    fn from(cidr: TrustedCidr) -> Self {
+        cidr.to_string()
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]

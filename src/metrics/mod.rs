@@ -202,6 +202,14 @@ pub fn install() -> Result<PrometheusHandle, Box<dyn std::error::Error>> {
         "kntx_config_version",
         "Monotonic version of the running config, incremented on each committed reload."
     );
+    describe_gauge!(
+        "kntx_admin_health_override",
+        "1 while /healthcheck/fail is forcing /ready to report unhealthy, 0 otherwise."
+    );
+    describe_gauge!(
+        "kntx_admin_draining",
+        "1 while listeners are drained by /drain_listeners, cleared by the next committed reload."
+    );
 
     Ok(handle)
 }

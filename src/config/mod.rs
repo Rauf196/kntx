@@ -3,13 +3,13 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::proxy_protocol::TrustedCidr;
 
 /// route entry inside a `[[listeners.routes]]` array.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct RouteConfig {
     #[serde(default)]
     pub host: Option<String>,
@@ -170,7 +170,7 @@ pub enum ConfigError {
     AdminEmptyToken,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ForwardingStrategy {
     #[default]
@@ -192,7 +192,7 @@ impl fmt::Display for ForwardingStrategy {
 }
 
 /// which protocol mode this listener runs in.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ListenerMode {
     #[default]
@@ -204,7 +204,7 @@ pub enum ListenerMode {
     TlsPassthrough,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
@@ -228,7 +228,7 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ListenerConfig {
     pub address: SocketAddr,
     #[serde(default)]
@@ -280,7 +280,7 @@ pub struct ListenerConfig {
 }
 
 /// backend selection algorithm for a pool.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BalancerStrategy {
     #[default]
@@ -292,7 +292,7 @@ pub enum BalancerStrategy {
     Weighted,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PoolConfig {
     pub name: String,
     pub backends: Vec<BackendConfig>,
@@ -322,7 +322,7 @@ impl PoolConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PoolHealthOverride {
     pub check_interval_secs: Option<u64>,
     pub failure_threshold: Option<u32>,
@@ -340,7 +340,7 @@ pub struct ResolvedHealth {
 /// named `idle_conn_ttl_secs` not `idle_timeout_secs` to avoid collision
 /// with the listener-level `idle_timeout_secs` (completely different semantics:
 /// cache TTL for an idle backend conn vs inter-byte gap on a request stream).
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(default)]
 pub struct KeepaliveConfig {
     /// max idle conns per backend; 0 disables backend keep-alive entirely.
@@ -361,7 +361,7 @@ impl Default for KeepaliveConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsConfig {
     #[serde(default = "default_handshake_timeout")]
     pub handshake_timeout_secs: u64,
@@ -370,7 +370,7 @@ pub struct TlsConfig {
     pub certificates: Vec<CertificateConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CertificateConfig {
     pub cert: PathBuf,
     pub key: PathBuf,
@@ -387,7 +387,7 @@ fn default_min_version() -> String {
     "1.2".to_owned()
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ForwardingConfig {
     #[serde(default)]
     pub strategy: ForwardingStrategy,
@@ -446,7 +446,7 @@ fn default_max_connect_attempts() -> u32 {
     3
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct HealthConfig {
     /// active probe interval in seconds. None = no active health checks.
     pub check_interval_secs: Option<u64>,
@@ -476,7 +476,7 @@ fn default_recovery_timeout() -> u64 {
     10
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BackendConfig {
     pub address: SocketAddr,
     /// relative share under `strategy = "weighted"`; ignored by the other
@@ -489,7 +489,7 @@ fn default_weight() -> u32 {
     1
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -507,17 +507,29 @@ fn default_log_level() -> String {
     "info".to_owned()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct MetricsConfig {
     pub address: SocketAddr,
 }
 
 /// the admin socket. separate from `[metrics]`: these routes dump config and
 /// mutate the instance, so binding off-loopback requires a token.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AdminConfig {
     pub address: SocketAddr,
+    #[serde(serialize_with = "redact")]
     pub token: Option<String>,
+}
+
+/// the only secret in the config file. `/config_dump` is itself gated by this token,
+/// so a dump that returned it would hand over the credential for every route behind
+/// it, including the mutating ones. TLS `key` is a path rather than key material and
+/// ships verbatim; hiding it while `cert` sits in the same directory conceals nothing.
+fn redact<S: serde::Serializer>(token: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    match token {
+        Some(_) => s.serialize_str("<redacted>"),
+        None => s.serialize_none(),
+    }
 }
 
 fn default_header_size_limit() -> usize {
@@ -526,13 +538,13 @@ fn default_header_size_limit() -> usize {
 
 /// maps status codes (as strings) to custom error page file paths.
 /// keys are strings because TOML requires string keys for quoted numeric keys.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ErrorPagesConfig {
     #[serde(flatten)]
     pub pages: std::collections::HashMap<String, std::path::PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum AccessLogOutput {
     Named(String),
@@ -545,7 +557,7 @@ impl Default for AccessLogOutput {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AccessLogConfig {
     #[serde(default)]
     pub output: AccessLogOutput,
@@ -572,7 +584,7 @@ fn default_file_channel_capacity() -> usize {
 /// named rate limit zones, `[rate_limit.zones.<name>]`. a zone is one
 /// limiter instance; every listener and route referencing the name shares
 /// its budget.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct RateLimitConfig {
     #[serde(default)]
     pub zones: HashMap<String, ZoneConfig>,
@@ -580,7 +592,7 @@ pub struct RateLimitConfig {
 
 pub const DEFAULT_ZONE_MAX_KEYS: u32 = 65536;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ZoneConfig {
     pub key: ZoneKey,
     /// admitted events per `per`, sustained. must be >= 1.
@@ -596,14 +608,14 @@ pub struct ZoneConfig {
 }
 
 /// what a zone counts: one budget per client IP, or one shared budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ZoneKey {
     ClientIp,
     Global,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub enum RatePeriod {
     #[default]
     #[serde(rename = "s")]
