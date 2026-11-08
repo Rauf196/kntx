@@ -9,6 +9,7 @@
 // tokio TcpStream is converted to std (deregisters from the reactor), then
 // AsyncFd provides readiness. avoids double-registering the fd with epoll.
 
+use std::net::{Shutdown, TcpStream as StdTcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -42,19 +43,17 @@ pub async fn forward(
         source,
     })?;
 
-    let client_fd = client_std.as_raw_fd();
-    let server_fd = server_std.as_raw_fd();
-
-    // register with tokio's reactor via AsyncFd  - no double-registration
+    // SAFETY: the AsyncFd owns the TcpStream, so the fd stays open and unchanged
+    // until the AsyncFd drops.
     let async_client =
-        AsyncFd::new(FdWrapper(client_fd)).map_err(|source| ProxyError::Forward {
+        unsafe { AsyncFd::register(client_std) }.map_err(|e| ProxyError::Forward {
             direction: Direction::ClientToBackend,
-            source,
+            source: e.into(),
         })?;
     let async_server =
-        AsyncFd::new(FdWrapper(server_fd)).map_err(|source| ProxyError::Forward {
+        unsafe { AsyncFd::register(server_std) }.map_err(|e| ProxyError::Forward {
             direction: Direction::BackendToClient,
-            source,
+            source: e.into(),
         })?;
 
     let c2b_pipe = pipe_pool.get().ok_or(ProxyError::PipePoolExhausted)?;
@@ -66,10 +65,6 @@ pub async fn forward(
         splice_one_direction(&async_client, &async_server, &c2b_pipe, last_activity),
         splice_one_direction(&async_server, &async_client, &b2c_pipe, last_activity),
     );
-
-    // client_std/server_std own the fds and must outlive async_client/async_server.
-    // rust drops in reverse declaration order, so this is guaranteed by the
-    // declaration order above (std before async).
 
     let client_to_backend = c2b_result.map_err(|source| ProxyError::Forward {
         direction: Direction::ClientToBackend,
@@ -90,13 +85,13 @@ pub async fn forward(
 /// splice bytes from src to dst through a pipe. zero-copy  - data
 /// never enters userspace. TCP_CORK batches output into optimal segments.
 async fn splice_one_direction(
-    src: &AsyncFd<FdWrapper>,
-    dst: &AsyncFd<FdWrapper>,
+    src: &AsyncFd<StdTcpStream>,
+    dst: &AsyncFd<StdTcpStream>,
     pipe: &PipeGuard,
     last_activity: &AtomicU64,
 ) -> std::io::Result<u64> {
-    let src_fd = src.get_ref().0;
-    let dst_fd = dst.get_ref().0;
+    let src_fd = src.as_raw_fd();
+    let dst_fd = dst.as_raw_fd();
     let pipe_read = pipe.read_fd();
     let pipe_write = pipe.write_fd();
 
@@ -109,9 +104,7 @@ async fn splice_one_direction(
 
             match do_splice(src_fd, pipe_write, SPLICE_LEN) {
                 Ok(0) => {
-                    // SAFETY: dst_fd is owned by the std TcpStream kept alive
-                    // in the caller (forward()). valid for the duration of this function.
-                    unsafe { libc::shutdown(dst_fd, libc::SHUT_WR) };
+                    let _ = dst.get_ref().shutdown(Shutdown::Write);
                     return Ok(total);
                 }
                 Ok(n) => {
@@ -160,7 +153,7 @@ async fn splice_one_direction(
 /// raw splice(2) syscall wrapper.
 /// SAFETY: caller must ensure fd_in and fd_out are valid open file descriptors.
 fn do_splice(fd_in: RawFd, fd_out: RawFd, len: usize) -> std::io::Result<i64> {
-    // SAFETY: fds are owned by std TcpStreams / PipeGuards kept alive in the caller
+    // SAFETY: fds are owned by the AsyncFd'd TcpStreams / PipeGuards kept alive in the caller
     let ret = unsafe {
         libc::splice(
             fd_in,
@@ -181,7 +174,7 @@ fn do_splice(fd_in: RawFd, fd_out: RawFd, len: usize) -> std::io::Result<i64> {
 
 fn set_tcp_cork(fd: RawFd, cork: bool) {
     let val: libc::c_int = i32::from(cork);
-    // SAFETY: fd is owned by the std TcpStream kept alive in forward()
+    // SAFETY: fd is owned by the AsyncFd'd TcpStream kept alive in forward()
     let ret = unsafe {
         libc::setsockopt(
             fd,
@@ -193,15 +186,5 @@ fn set_tcp_cork(fd: RawFd, cork: bool) {
     };
     if ret < 0 {
         tracing::debug!(error = %std::io::Error::last_os_error(), "failed to set tcp_cork");
-    }
-}
-
-/// thin wrapper to make a raw fd usable with AsyncFd.
-/// does NOT own the fd  - the std TcpStream owns it.
-struct FdWrapper(RawFd);
-
-impl AsRawFd for FdWrapper {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
     }
 }
