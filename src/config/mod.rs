@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::balancer::ring::MAX_WEIGHT_SUM;
 use crate::proxy_protocol::TrustedCidr;
 
 /// route entry inside a `[[listeners.routes]]` array.
@@ -118,8 +119,24 @@ pub enum ConfigError {
     #[error("pool '{pool}' has no backends")]
     EmptyPoolBackends { pool: String },
 
-    #[error("pool '{pool}' uses strategy 'weighted' but every backend has weight 0")]
+    #[error("pool '{pool}' has every backend at weight 0, so nothing can be selected")]
     AllWeightsZero { pool: String },
+
+    #[error("pool '{pool}' sets 'hash_key' but its strategy is not 'hash'")]
+    HashKeyOnNonHashPool { pool: String },
+
+    #[error(
+        "pool '{pool}' hashes on a header but is used by non-l7 listener {listener} - \
+         only l7 listeners see headers"
+    )]
+    HashHeaderKeyOnNonL7Listener { pool: String, listener: SocketAddr },
+
+    #[error("pool '{pool}' has weight sum {weight_sum}, hash pools allow at most {max}")]
+    HashRingTooLarge {
+        pool: String,
+        weight_sum: u64,
+        max: u64,
+    },
 
     #[error("invalid value for '{field}': {reason}")]
     InvalidValue { field: &'static str, reason: String },
@@ -290,6 +307,15 @@ pub enum BalancerStrategy {
     LeastConn,
     /// smooth weighted round-robin over per-backend `weight`.
     Weighted,
+    /// consistent hash on `hash_key`, so a key keeps its backend.
+    Hash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HashKey {
+    ClientIp,
+    Header(String),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -303,9 +329,20 @@ pub struct PoolConfig {
     /// per-backend `weight` stays live so a drain can happen without a restart.
     #[serde(default)]
     pub strategy: BalancerStrategy,
+    /// restart-only, like `strategy`: changing the key remaps every key.
+    #[serde(default)]
+    pub hash_key: Option<HashKey>,
 }
 
 impl PoolConfig {
+    /// `client_ip` for a hash pool without `hash_key`, `None` for other strategies.
+    pub fn effective_hash_key(&self) -> Option<&HashKey> {
+        match self.strategy {
+            BalancerStrategy::Hash => Some(self.hash_key.as_ref().unwrap_or(&HashKey::ClientIp)),
+            _ => None,
+        }
+    }
+
     pub fn effective_health(&self, defaults: &HealthConfig) -> ResolvedHealth {
         let ovr = self.health.as_ref();
         ResolvedHealth {
@@ -479,7 +516,7 @@ fn default_recovery_timeout() -> u64 {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BackendConfig {
     pub address: SocketAddr,
-    /// relative share under `strategy = "weighted"`; ignored by the other
+    /// relative share under `weighted` and `hash`; ignored by the other
     /// strategies. 0 drains the backend without removing it from the pool.
     #[serde(default = "default_weight")]
     pub weight: u32,
@@ -720,12 +757,58 @@ impl Config {
         // every request to it would 503. zeroing one backend to drain it is the
         // point of weights; zeroing all of them is a typo.
         for pool in &self.pools {
-            if pool.strategy == BalancerStrategy::Weighted
-                && !pool.backends.is_empty()
+            if matches!(
+                pool.strategy,
+                BalancerStrategy::Weighted | BalancerStrategy::Hash
+            ) && !pool.backends.is_empty()
                 && pool.backends.iter().all(|b| b.weight == 0)
             {
                 return Err(ConfigError::AllWeightsZero {
                     pool: pool.name.clone(),
+                });
+            }
+        }
+
+        for pool in &self.pools {
+            if pool.strategy != BalancerStrategy::Hash {
+                if pool.hash_key.is_some() {
+                    return Err(ConfigError::HashKeyOnNonHashPool {
+                        pool: pool.name.clone(),
+                    });
+                }
+                continue;
+            }
+            let weight_sum: u64 = pool.backends.iter().map(|b| u64::from(b.weight)).sum();
+            if weight_sum > MAX_WEIGHT_SUM {
+                return Err(ConfigError::HashRingTooLarge {
+                    pool: pool.name.clone(),
+                    weight_sum,
+                    max: MAX_WEIGHT_SUM,
+                });
+            }
+            let Some(HashKey::Header(name)) = &pool.hash_key else {
+                continue;
+            };
+            // a bad name can never match, so every request would silently fall back
+            if !is_token(name) {
+                return Err(ConfigError::InvalidValue {
+                    field: "pools.hash_key.header",
+                    reason: format!("pool '{}': '{name}' is not a header name", pool.name),
+                });
+            }
+            let uses_pool = |l: &&ListenerConfig| {
+                l.pool.as_deref() == Some(pool.name.as_str())
+                    || l.routes.iter().any(|r| r.pool == pool.name)
+            };
+            if let Some(listener) = self
+                .listeners
+                .iter()
+                .filter(|l| l.mode != ListenerMode::L7)
+                .find(uses_pool)
+            {
+                return Err(ConfigError::HashHeaderKeyOnNonL7Listener {
+                    pool: pool.name.clone(),
+                    listener: listener.address,
                 });
             }
         }
@@ -858,7 +941,7 @@ impl Config {
                             });
                         }
                         if let Some(method) = &route.method
-                            && !is_valid_method_token(method)
+                            && !is_token(method)
                         {
                             return Err(ConfigError::InvalidRouteMethod {
                                 listener: listener.address,
@@ -1149,12 +1232,12 @@ fn is_valid_path_prefix(prefix: &str) -> bool {
     true
 }
 
-fn is_valid_method_token(method: &str) -> bool {
-    if method.is_empty() {
+/// RFC 9110 `token`, the grammar of both methods and header names.
+fn is_token(s: &str) -> bool {
+    if s.is_empty() {
         return false;
     }
-    method
-        .bytes()
+    s.bytes()
         .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
 }
 
@@ -2695,6 +2778,7 @@ mod tests {
             ("round_robin", BalancerStrategy::RoundRobin),
             ("least_conn", BalancerStrategy::LeastConn),
             ("weighted", BalancerStrategy::Weighted),
+            ("hash", BalancerStrategy::Hash),
         ] {
             let file = write_temp_config(&format!(
                 r#"
@@ -2765,6 +2849,164 @@ mod tests {
         assert!(
             matches!(&err, ConfigError::AllWeightsZero { pool } if pool == "web"),
             "expected AllWeightsZero for 'web', got: {err}"
+        );
+    }
+
+    fn load_hash_pool(
+        mode: &str,
+        pool_extra: &str,
+        weights: &[u32],
+    ) -> Result<Config, ConfigError> {
+        let backends: String = weights
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                format!(
+                    "[[pools.backends]]\naddress = \"127.0.0.1:{}\"\nweight = {w}\n",
+                    3001 + i
+                )
+            })
+            .collect();
+        let file = write_temp_config(&format!(
+            "[[listeners]]\naddress = \"0.0.0.0:8080\"\nmode = \"{mode}\"\npool = \"web\"\n\n\
+             [[pools]]\nname = \"web\"\nstrategy = \"hash\"\n{pool_extra}\n\n{backends}"
+        ));
+        Config::from_file(file.path().to_str().unwrap())
+    }
+
+    #[test]
+    fn hash_key_parses_both_forms_and_defaults_to_client_ip() {
+        let cfg = load_hash_pool("l4", "", &[1]).unwrap();
+        assert_eq!(cfg.pools[0].hash_key, None);
+        assert_eq!(cfg.pools[0].effective_hash_key(), Some(&HashKey::ClientIp));
+
+        let cfg = load_hash_pool("l4", r#"hash_key = "client_ip""#, &[1]).unwrap();
+        assert_eq!(cfg.pools[0].effective_hash_key(), Some(&HashKey::ClientIp));
+
+        let cfg = load_hash_pool("l7", r#"hash_key = { header = "x-session-id" }"#, &[1]).unwrap();
+        assert_eq!(
+            cfg.pools[0].effective_hash_key(),
+            Some(&HashKey::Header("x-session-id".into()))
+        );
+    }
+
+    #[test]
+    fn effective_hash_key_is_none_for_non_hash_pools() {
+        let file = write_temp_config(&format!(
+            "[[listeners]]\naddress = \"0.0.0.0:8080\"\npool = \"web\"\n{}",
+            base_pool_toml()
+        ));
+        let cfg = Config::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(cfg.pools[0].effective_hash_key(), None);
+    }
+
+    #[test]
+    fn validate_rejects_hash_key_on_non_hash_pool() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8080"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+            strategy = "least_conn"
+            hash_key = "client_ip"
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::HashKeyOnNonHashPool { pool } if pool == "web"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_header_key_on_l4_listener_pool() {
+        let err = load_hash_pool("l4", r#"hash_key = { header = "x-id" }"#, &[1]).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ConfigError::HashHeaderKeyOnNonL7Listener { pool, listener }
+                    if pool == "web" && listener.port() == 8080
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_header_key_on_passthrough_route() {
+        let file = write_temp_config(
+            r#"
+            [[listeners]]
+            address = "0.0.0.0:8443"
+            mode = "tls-passthrough"
+
+            [[listeners.routes]]
+            sni = "api.test"
+            pool = "web"
+
+            [[pools]]
+            name = "web"
+            strategy = "hash"
+            hash_key = { header = "x-id" }
+
+            [[pools.backends]]
+            address = "127.0.0.1:3001"
+            "#,
+        );
+        let err = Config::from_file(file.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ConfigError::HashHeaderKeyOnNonL7Listener { pool, listener }
+                    if pool == "web" && listener.port() == 8443
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_hash_header_name() {
+        for name in ["", "x session", "x:id"] {
+            let extra = format!(r#"hash_key = {{ header = "{name}" }}"#);
+            let err = load_hash_pool("l7", &extra, &[1]).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::InvalidValue {
+                        field: "pools.hash_key.header",
+                        ..
+                    }
+                ),
+                "header {name:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_hash_weight_sum_boundary() {
+        load_hash_pool("l4", "", &[999, 1]).expect("sum 1000 is the cap");
+
+        let err = load_hash_pool("l4", "", &[1000, 1]).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ConfigError::HashRingTooLarge { pool, weight_sum: 1001, max: 1000 } if pool == "web"
+            ),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_hash_pool_with_all_weights_zero() {
+        let err = load_hash_pool("l4", "", &[0, 0]).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::AllWeightsZero { pool } if pool == "web"),
+            "got: {err}"
         );
     }
 

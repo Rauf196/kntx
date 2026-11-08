@@ -159,6 +159,10 @@ pub fn install() -> Result<PrometheusHandle, Box<dyn std::error::Error>> {
         "Current count of idle backend conns in the keepalive cache (labels: pool, backend)."
     );
     describe_counter!(
+        "kntx_hash_key_missing_total",
+        "Requests to a hash pool without its hash key, balanced by weight instead. nonzero means affinity is off for those clients (labels: pool)."
+    );
+    describe_counter!(
         "kntx_pool_full_failovers_total",
         "Backend checkouts that failed over to a peer because the selected backend was at max_total (labels: pool, backend)."
     );

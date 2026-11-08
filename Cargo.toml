@@ -62,6 +62,10 @@ criterion = "0.7"
 name = "rate_limit"
 harness = false
 
+[[bench]]
+name = "balancer"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

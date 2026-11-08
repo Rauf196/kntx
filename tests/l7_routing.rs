@@ -13,7 +13,7 @@ use helpers::http_backend::{HttpBackend, ResponseSpec};
 use helpers::tls::{client_config_trusting, generate_cert, write_cert_to_tempdir};
 use kntx::access_log::AccessLogSink;
 use kntx::balancer::RoundRobin;
-use kntx::config::{AccessLogConfig, AccessLogOutput};
+use kntx::config::{AccessLogConfig, AccessLogOutput, BalancerStrategy, HashKey};
 use kntx::config::{
     CertificateConfig, ErrorPagesConfig, ForwardingStrategy, KeepaliveConfig, ListenerConfig,
     ListenerMode, TlsConfig,
@@ -135,11 +135,16 @@ async fn start_routing_proxy(router: Arc<dyn Router>) -> RoutingProxy {
 }
 
 async fn get(proxy_addr: SocketAddr, host: &str, path: &str) -> (u16, String) {
+    get_with(proxy_addr, host, path, "").await
+}
+
+/// `extra` is raw header lines, each ending in "\r\n".
+async fn get_with(proxy_addr: SocketAddr, host: &str, path: &str, extra: &str) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.unwrap();
 
     let mut resp = Vec::new();
@@ -1002,5 +1007,90 @@ async fn describe_metrics_present() {
     assert!(
         output.contains("# HELP kntx_route_no_match_total"),
         "missing HELP line for kntx_route_no_match_total in:\n{output}"
+    );
+}
+
+async fn start_hash_proxy(name: &str) -> (RoutingProxy, [HttpBackend; 3]) {
+    let backends = [
+        HttpBackend::start(ResponseSpec::ok("b0")).await,
+        HttpBackend::start(ResponseSpec::ok("b1")).await,
+        HttpBackend::start(ResponseSpec::ok("b2")).await,
+    ];
+    let pool = BackendPool::new(
+        Arc::from(name),
+        backends.iter().map(|b| b.addr).collect(),
+        3,
+        Duration::from_secs(10),
+        KeepaliveConfig::default(),
+    )
+    .with_hash_ring();
+    let pool = Arc::new(pool);
+    let rr = RoundRobin::with_strategy(Arc::clone(&pool), BalancerStrategy::Hash)
+        .with_hash_key(HashKey::Header("x-session-id".into()));
+    let router = Arc::new(ConfigRouter::new(vec![catch_all(pool_handle(
+        name,
+        pool,
+        Arc::new(rr),
+    ))]));
+    (start_routing_proxy(router).await, backends)
+}
+
+#[tokio::test]
+async fn hash_header_pins_session_and_spreads_distinct_keys() {
+    let (proxy, _backends) = start_hash_proxy("hash-pin").await;
+
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..50 {
+        let (status, body) = get_with(proxy.addr, "h", "/", "x-session-id: u42\r\n").await;
+        assert_eq!(status, 200);
+        seen.insert(body);
+    }
+    assert_eq!(seen.len(), 1, "one session id, one backend");
+
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..300 {
+        let (_, body) = get_with(proxy.addr, "h", "/", &format!("x-session-id: u{i}\r\n")).await;
+        seen.insert(body);
+    }
+    assert_eq!(seen.len(), 3, "distinct session ids reach every backend");
+}
+
+#[tokio::test]
+async fn hash_missing_header_falls_back_and_is_counted() {
+    let handle = init_metrics();
+    let (proxy, _backends) = start_hash_proxy("hash-missing").await;
+
+    let (status, _) = get(proxy.addr, "h", "/").await;
+    assert_eq!(status, 200, "a request without the key is still served");
+
+    let output = handle.render();
+    let line = output
+        .lines()
+        .find(|l| {
+            l.starts_with("kntx_hash_key_missing_total") && l.contains("pool=\"hash-missing\"")
+        })
+        .unwrap_or_else(|| panic!("no missing-key counter in:\n{output}"));
+    assert!(line.ends_with(" 1"), "expected exactly one miss: {line}");
+}
+
+#[test]
+fn hash_pool_seeds_missing_key_counter_at_zero() {
+    let handle = init_metrics();
+    BackendPool::new(
+        Arc::from("hash-seed"),
+        vec!["127.0.0.1:1".parse().unwrap()],
+        3,
+        Duration::from_secs(10),
+        KeepaliveConfig::default(),
+    )
+    .with_hash_ring()
+    .emit_initial_metrics();
+
+    let output = handle.render();
+    assert!(
+        output
+            .lines()
+            .any(|l| l == "kntx_hash_key_missing_total{pool=\"hash-seed\"} 0"),
+        "series must exist before the first miss:\n{output}"
     );
 }

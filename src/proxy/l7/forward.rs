@@ -1051,8 +1051,9 @@ where
     let mut retry_remaining: u32 = 1;
     let (mut conn, backend_addr) = 'outer: loop {
         let mut attempts = 0u32;
+        let mut tried = Vec::new();
         let conn_result: Result<crate::proxy::l7::keepalive::KeepaliveConn, u16> = 'checkout: loop {
-            let addr = match rr.next_backend() {
+            let addr = match rr.next_backend(&ctx, &tried) {
                 Some(a) => a,
                 None => break 'checkout Err(503u16),
             };
@@ -1066,6 +1067,7 @@ where
                     // saturation is not a backend failure; the backend is
                     // operating at capacity. Failover only - never record
                     // a failure that would count toward the circuit breaker.
+                    tried.push(addr);
                     attempts += 1;
                     metrics::counter!(
                         "kntx_pool_full_failovers_total",
@@ -1079,6 +1081,7 @@ where
                 }
                 Err(CheckoutError::ConnectTimeout) => {
                     pool.record_failure(addr);
+                    tried.push(addr);
                     attempts += 1;
                     metrics::counter!(
                         "kntx_connect_retries_total",
@@ -1092,6 +1095,7 @@ where
                 }
                 Err(CheckoutError::ConnectFailed(_)) => {
                     pool.record_failure(addr);
+                    tried.push(addr);
                     attempts += 1;
                     metrics::counter!(
                         "kntx_connect_retries_total",

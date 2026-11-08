@@ -548,8 +548,9 @@ pub async fn serve(
                                         let rr = l4_entry.pool.rr.clone();
                                         let pool_name = l4_entry.pool.name.to_string();
                                         let mut attempts = 0u32;
+                                        let mut tried = Vec::new();
                                         let backend_result = loop {
-                                            let addr = match rr.next_backend() {
+                                            let addr = match rr.next_backend(&l4_ctx, &tried) {
                                                 Some(a) => a,
                                                 None => {
                                                     tracing::warn!("no healthy backends available");
@@ -566,6 +567,7 @@ pub async fn serve(
                                                 }
                                                 Err(e) => {
                                                     pool.record_failure(addr);
+                                                    tried.push(addr);
                                                     attempts += 1;
                                                     metrics::counter!(
                                                         "kntx_connect_retries_total",

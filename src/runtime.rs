@@ -217,19 +217,24 @@ fn build_pool(
 ) -> (Arc<BackendPool>, Arc<RoundRobin>) {
     let health = pool_cfg.effective_health(defaults);
     let addrs: Vec<_> = pool_cfg.backends.iter().map(|b| b.address).collect();
-    let pool = Arc::new(BackendPool::new(
+    let mut pool = BackendPool::new(
         pool_cfg.name.as_str().into(),
         addrs,
         health.failure_threshold,
         Duration::from_secs(health.recovery_timeout_secs),
         pool_cfg.keepalive.clone(),
-    ));
+    );
+    let hash_key = pool_cfg.effective_hash_key();
+    if hash_key.is_some() {
+        pool = pool.with_hash_ring();
+    }
+    let pool = Arc::new(pool);
     pool.set_weights(&weights_of(pool_cfg));
-    let balancer = Arc::new(RoundRobin::with_strategy(
-        Arc::clone(&pool),
-        pool_cfg.strategy,
-    ));
-    (pool, balancer)
+    let mut balancer = RoundRobin::with_strategy(Arc::clone(&pool), pool_cfg.strategy);
+    if let Some(key) = hash_key {
+        balancer = balancer.with_hash_key(key.clone());
+    }
+    (pool, Arc::new(balancer))
 }
 
 fn weights_of(pool_cfg: &config::PoolConfig) -> Vec<(std::net::SocketAddr, u32)> {
@@ -491,13 +496,10 @@ pub async fn apply_reload(ctx: &ReloadContext, mut new: Config) -> Result<u64, R
         let addrs: Vec<_> = pool_cfg.backends.iter().map(|b| b.address).collect();
         let diff = pool.reconcile(
             &addrs,
+            &weights_of(pool_cfg),
             health.failure_threshold,
             Duration::from_secs(health.recovery_timeout_secs),
         );
-        // after reconcile, so weights land on the surviving states and on any
-        // backend this reload just added. weight 0 drains a backend without
-        // removing it, which is the whole reason weights are live.
-        pool.set_weights(&weights_of(pool_cfg));
         if !diff.added.is_empty() || !diff.removed.is_empty() {
             tracing::info!(
                 pool = %pool_cfg.name,
@@ -515,6 +517,13 @@ pub async fn apply_reload(ctx: &ReloadContext, mut new: Config) -> Result<u64, R
                 running = ?balancer.strategy(),
                 configured = ?pool_cfg.strategy,
                 "pool strategy is restart-only, keeping the running strategy",
+            );
+        } else if balancer.hash_key() != pool_cfg.effective_hash_key() {
+            tracing::warn!(
+                pool = %pool_cfg.name,
+                running = ?balancer.hash_key(),
+                configured = ?pool_cfg.effective_hash_key(),
+                "pool hash_key is restart-only, keeping the running key",
             );
         }
     }
@@ -592,6 +601,7 @@ pub async fn apply_reload(ctx: &ReloadContext, mut new: Config) -> Result<u64, R
     for pool_cfg in &mut new.pools {
         if let Some((_, balancer)) = pools.get(&pool_cfg.name) {
             pool_cfg.strategy = balancer.strategy();
+            pool_cfg.hash_key = balancer.hash_key().cloned();
         }
     }
 
@@ -769,7 +779,14 @@ backends = [{ address = "127.0.0.1:4001" }]
         assert_eq!(snap.pools.get("web").unwrap().0.len(), 2);
         assert_eq!(snap.pools.get("api").unwrap().0.len(), 1);
         // the RoundRobin is wired to its own pool
-        assert!(snap.pools.get("web").unwrap().1.next_backend().is_some());
+        assert!(
+            snap.pools
+                .get("web")
+                .unwrap()
+                .1
+                .next_backend_any()
+                .is_some()
+        );
     }
 
     #[test]
@@ -869,7 +886,7 @@ backends = [{ address = "127.0.0.1:4001" }]
         // and the wiring actually steers selection, not just the stored fields
         let mut first = 0;
         for _ in 0..400 {
-            if balancer.next_backend().unwrap() == addr("127.0.0.1:3001") {
+            if balancer.next_backend_any().unwrap() == addr("127.0.0.1:3001") {
                 first += 1;
             }
         }
@@ -911,7 +928,7 @@ backends = [{ address = "127.0.0.1:4001" }]
         // the drained backend must stop receiving traffic immediately
         for _ in 0..100 {
             assert_eq!(
-                balancer_after.next_backend().unwrap(),
+                balancer_after.next_backend_any().unwrap(),
                 addr("127.0.0.1:3002")
             );
         }
@@ -924,10 +941,123 @@ backends = [{ address = "127.0.0.1:4001" }]
             .await
             .expect("reload succeeds");
 
-        // set_weights runs after reconcile, so a weight lands even on a backend
-        // that only exists as of this reload
         let pool = h.ctx.state.load().pools.get("web").unwrap().0.clone();
         assert_eq!(pool.state_for(addr("127.0.0.1:3002")).unwrap().weight(), 4);
+    }
+
+    fn hash_pool_cfg(mode: &str, strategy: &str, key: &str, ports: &[u16]) -> Config {
+        let backends: String = ports
+            .iter()
+            .map(|p| format!("[[pools.backends]]\naddress = \"127.0.0.1:{p}\"\n"))
+            .collect();
+        cfg(&format!(
+            "[[listeners]]\naddress = \"127.0.0.1:18080\"\nmode = \"{mode}\"\npool = \"web\"\n\n\
+             [[pools]]\nname = \"web\"\nstrategy = \"{strategy}\"\n{key}\n\n{backends}"
+        ))
+    }
+
+    fn pick_for(balancer: &RoundRobin, i: u32) -> std::net::SocketAddr {
+        let ctx = crate::proxy::l7::matcher::RouteContext {
+            method: None,
+            host: None,
+            path: None,
+            headers: &[],
+            sni: None,
+            client_ip: std::net::Ipv4Addr::from(0x0a00_0000 + i).into(),
+        };
+        balancer.next_backend(&ctx, &[]).unwrap()
+    }
+
+    #[test]
+    fn build_snapshot_wires_hash_ring_and_key() {
+        let snapshot = build_snapshot(Arc::new(hash_pool_cfg("l4", "hash", "", &[3001, 3002])));
+        let (pool, balancer) = snapshot.pools.get("web").unwrap();
+        assert!(pool.snapshot().ring().is_some());
+        assert_eq!(balancer.hash_key(), Some(&config::HashKey::ClientIp));
+
+        let first = pick_for(balancer, 7);
+        for _ in 0..100 {
+            assert_eq!(pick_for(balancer, 7), first);
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_hash_pool_add_backend_remaps_only_to_new() {
+        let h = harness(hash_pool_cfg("l4", "hash", "", &[3001, 3002, 3003, 3004]));
+        let balancer = h.ctx.state.load().pools.get("web").unwrap().1.clone();
+        let before: Vec<_> = (0..10_000).map(|i| pick_for(&balancer, i)).collect();
+
+        apply_reload(
+            &h.ctx,
+            hash_pool_cfg("l4", "hash", "", &[3001, 3002, 3003, 3004, 3005]),
+        )
+        .await
+        .expect("reload succeeds");
+
+        let new = addr("127.0.0.1:3005");
+        let mut moved = 0;
+        for (i, old) in before.iter().enumerate() {
+            let now = pick_for(&balancer, i as u32);
+            if now != *old {
+                assert_eq!(
+                    now, new,
+                    "key {i} moved somewhere other than the new backend"
+                );
+                moved += 1;
+            }
+        }
+        let frac = f64::from(moved) / 10_000.0;
+        assert!(
+            (0.15..=0.25).contains(&frac),
+            "moved {frac}, expected ~0.20"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_hash_key_change_is_ignored_and_dump_shows_running_key() {
+        let h = harness(hash_pool_cfg(
+            "l7",
+            "hash",
+            r#"hash_key = { header = "x-a" }"#,
+            &[3001, 3002],
+        ));
+        apply_reload(
+            &h.ctx,
+            hash_pool_cfg(
+                "l7",
+                "hash",
+                r#"hash_key = { header = "x-b" }"#,
+                &[3001, 3002],
+            ),
+        )
+        .await
+        .expect("reload succeeds");
+
+        let running = config::HashKey::Header("x-a".into());
+        let state = h.ctx.state.load();
+        assert_eq!(state.pools["web"].1.hash_key(), Some(&running));
+        assert_eq!(state.config.pools[0].hash_key, Some(running));
+    }
+
+    #[tokio::test]
+    async fn reload_to_hash_on_running_non_hash_pool_publishes_no_key() {
+        let h = harness(hash_pool_cfg("l4", "round_robin", "", &[3001, 3002]));
+        apply_reload(
+            &h.ctx,
+            hash_pool_cfg("l4", "hash", r#"hash_key = "client_ip""#, &[3001, 3002]),
+        )
+        .await
+        .expect("reload succeeds");
+
+        let state = h.ctx.state.load();
+        assert_eq!(
+            state.config.pools[0].strategy,
+            config::BalancerStrategy::RoundRobin
+        );
+        assert_eq!(
+            state.config.pools[0].hash_key, None,
+            "a round_robin pool published with a hash_key would fail its own validation"
+        );
     }
 
     #[tokio::test]

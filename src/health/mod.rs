@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -7,6 +8,7 @@ use arc_swap::ArcSwap;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 
+use crate::balancer::ring::Ring;
 use crate::config::KeepaliveConfig;
 use crate::proxy::l7::keepalive::KeepaliveCache;
 use crate::util::{CacheLinePadded, intern_label, monotonic_millis};
@@ -213,12 +215,20 @@ pub struct BackendReconcile {
     pub removed: Vec<SocketAddr>,
 }
 
+/// one published backend set. the ring indexes into `list`, so the two are only
+/// ever swapped together.
+pub struct Backends {
+    list: Vec<Arc<BackendState>>,
+    ring: Option<Ring>,
+}
+
 pub struct BackendPool {
     pool_name: Arc<str>,
     // backend set swaps atomically on reload; readers (RR selection, health probe,
     // sweeper) load one coherent snapshot per call. surviving addresses keep their
     // Arc<BackendState> so circuit + keepalive cache + counters ride the reload.
-    backends: ArcSwap<Vec<Arc<BackendState>>>,
+    backends: ArcSwap<Backends>,
+    hashed: bool,
     // health tuning is reloadable, so these are atomic: a reload stores new values
     // that in-flight selections pick up on their next read.
     failure_threshold: AtomicU32,
@@ -247,7 +257,11 @@ impl BackendPool {
             .collect();
         Self {
             pool_name,
-            backends: ArcSwap::from_pointee(backends),
+            backends: ArcSwap::from_pointee(Backends {
+                list: backends,
+                ring: None,
+            }),
+            hashed: false,
             failure_threshold: AtomicU32::new(failure_threshold),
             recovery_timeout_millis: AtomicU64::new(recovery_timeout.as_millis() as u64),
             keepalive_cfg: keepalive,
@@ -258,11 +272,12 @@ impl BackendPool {
     /// BackendState (circuit, keepalive cache, counters) by identity. new addresses
     /// get a fresh state with the pool's keepalive config; removed addresses drop
     /// when the last in-flight holder releases, closing their idle keepalive conns.
-    /// also stores the reloaded health thresholds. safe under live traffic: readers
-    /// load one coherent snapshot and the swap is a single atomic store.
+    /// also stores the reloaded health thresholds. `weights` are applied before
+    /// the store so a hash ring never goes out with a new backend's default weight.
     pub fn reconcile(
         &self,
         new_addrs: &[SocketAddr],
+        weights: &[(SocketAddr, u32)],
         failure_threshold: u32,
         recovery_timeout: Duration,
     ) -> BackendReconcile {
@@ -294,26 +309,39 @@ impl BackendPool {
                     })
             })
             .collect();
+        apply_weights(&next, weights);
         self.failure_threshold
             .store(failure_threshold, Ordering::Relaxed);
         self.recovery_timeout_millis
             .store(recovery_timeout.as_millis() as u64, Ordering::Relaxed);
-        self.backends.store(Arc::new(next));
+        self.publish(next);
         BackendReconcile { added, removed }
     }
 
     /// apply configured weights to the current backend set, matching by address.
     /// addresses not in `weights` keep what they have; entries with no matching
-    /// backend are ignored, since membership is reconcile's job. called after
-    /// construction and after every membership reconcile, which is what lets a
-    /// reload retune a weight (including to 0, to drain) without a restart.
+    /// backend are ignored, since membership is reconcile's job. a weight is live,
+    /// which is what lets a reload drain a backend (weight 0) without a restart.
     pub fn set_weights(&self, weights: &[(SocketAddr, u32)]) {
         let backends = self.backends.load();
-        for (addr, weight) in weights {
-            if let Some(backend) = backends.iter().find(|b| b.address == *addr) {
-                backend.set_weight(*weight);
-            }
+        apply_weights(&backends.list, weights);
+        if self.hashed {
+            self.publish(backends.list.clone());
         }
+    }
+
+    pub fn with_hash_ring(mut self) -> Self {
+        self.hashed = true;
+        let list = self.backends.load().list.clone();
+        self.publish(list);
+        self
+    }
+
+    fn publish(&self, list: Vec<Arc<BackendState>>) {
+        let ring = self
+            .hashed
+            .then(|| Ring::build(list.iter().map(|b| (b.address, b.weight()))));
+        self.backends.store(Arc::new(Backends { list, ring }));
     }
 
     /// pool-wide keepalive configuration. used by the sweeper to derive its tick interval
@@ -344,7 +372,7 @@ impl BackendPool {
 
     /// owned snapshot of the current backend set, safe to hold across await points.
     /// hot readers (RR selection, health probe, sweeper) load one per call.
-    pub fn snapshot(&self) -> Arc<Vec<Arc<BackendState>>> {
+    pub fn snapshot(&self) -> Arc<Backends> {
         self.backends.load_full()
     }
 
@@ -479,6 +507,13 @@ impl BackendPool {
             )
             .set(backend.weight() as f64);
         }
+        if self.hashed {
+            metrics::counter!(
+                "kntx_hash_key_missing_total",
+                "pool" => intern_label(&self.pool_name),
+            )
+            .increment(0);
+        }
     }
 
     fn find(&self, addr: SocketAddr) -> Option<Arc<BackendState>> {
@@ -487,6 +522,28 @@ impl BackendPool {
             .iter()
             .find(|b| b.address == addr)
             .map(Arc::clone)
+    }
+}
+
+impl Backends {
+    pub fn ring(&self) -> Option<&Ring> {
+        self.ring.as_ref()
+    }
+}
+
+impl Deref for Backends {
+    type Target = [Arc<BackendState>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.list
+    }
+}
+
+fn apply_weights(backends: &[Arc<BackendState>], weights: &[(SocketAddr, u32)]) {
+    for (addr, weight) in weights {
+        if let Some(backend) = backends.iter().find(|b| b.address == *addr) {
+            backend.set_weight(*weight);
+        }
     }
 }
 
@@ -889,7 +946,7 @@ mod tests {
             CircuitState::Open
         );
 
-        let diff = pool.reconcile(&[a, c], 1, Duration::from_secs(30));
+        let diff = pool.reconcile(&[a, c], &[], 1, Duration::from_secs(30));
 
         assert_eq!(diff.added, vec![c]);
         assert_eq!(diff.removed, vec![b]);
@@ -913,7 +970,7 @@ mod tests {
         let pool = make_pool(&[ADDR], 3, 10);
         let addr: SocketAddr = ADDR.parse().unwrap();
         let before = pool.state_for(addr).unwrap();
-        let diff = pool.reconcile(&[addr], 3, Duration::from_secs(10));
+        let diff = pool.reconcile(&[addr], &[], 3, Duration::from_secs(10));
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
         let after = pool.state_for(addr).unwrap();
@@ -923,12 +980,91 @@ mod tests {
         );
     }
 
+    fn hash_pool(addrs: &[SocketAddr]) -> BackendPool {
+        BackendPool::new(
+            "test".into(),
+            addrs.to_vec(),
+            3,
+            Duration::from_secs(10),
+            KeepaliveConfig::default(),
+        )
+        .with_hash_ring()
+    }
+
+    fn published_owners(pool: &BackendPool) -> Vec<SocketAddr> {
+        let snap = pool.snapshot();
+        let ring = snap.ring().expect("hash pool publishes a ring");
+        (0..1000u64)
+            .map(|i| {
+                let idx = ring.owner(crate::balancer::ring::hash64(&i.to_le_bytes()));
+                snap[idx.unwrap()].address()
+            })
+            .collect()
+    }
+
+    fn expected_owners(list: &[(SocketAddr, u32)]) -> Vec<SocketAddr> {
+        let ring = Ring::build(list.iter().copied());
+        (0..1000u64)
+            .map(|i| {
+                list[ring
+                    .owner(crate::balancer::ring::hash64(&i.to_le_bytes()))
+                    .unwrap()]
+                .0
+            })
+            .collect()
+    }
+
+    fn addrs(n: u16) -> Vec<SocketAddr> {
+        (0..n)
+            .map(|i| SocketAddr::from(([127, 0, 0, 1], 3001 + i)))
+            .collect()
+    }
+
+    #[test]
+    fn hash_pool_reconcile_rebuilds_ring() {
+        let a = addrs(4);
+        let pool = hash_pool(&a[..3]);
+        assert_eq!(
+            published_owners(&pool),
+            expected_owners(&[(a[0], 1), (a[1], 1), (a[2], 1)])
+        );
+
+        pool.reconcile(&[a[0], a[2], a[3]], &[], 3, Duration::from_secs(10));
+        assert_eq!(
+            published_owners(&pool),
+            expected_owners(&[(a[0], 1), (a[2], 1), (a[3], 1)])
+        );
+    }
+
+    #[test]
+    fn hash_pool_reconcile_applies_weights_in_one_store() {
+        let a = addrs(3);
+        let pool = hash_pool(&a[..2]);
+        pool.reconcile(&a, &[(a[2], 3)], 3, Duration::from_secs(10));
+        assert_eq!(
+            published_owners(&pool),
+            expected_owners(&[(a[0], 1), (a[1], 1), (a[2], 3)]),
+            "the first ring with the new backend must already carry its weight"
+        );
+    }
+
+    #[test]
+    fn hash_pool_set_weights_zero_removes_backend_from_ring() {
+        let a = addrs(3);
+        let pool = hash_pool(&a);
+        pool.set_weights(&[(a[1], 0)]);
+        assert_eq!(
+            published_owners(&pool),
+            expected_owners(&[(a[0], 1), (a[2], 1)])
+        );
+    }
+
     #[test]
     fn reconcile_updates_health_thresholds() {
         // start lenient, reconcile the threshold down to 1: a single failure must now open.
         let pool = make_pool(&[ADDR], 5, 60);
         let addr: SocketAddr = ADDR.parse().unwrap();
-        pool.reconcile(&[addr], 1, Duration::from_secs(7));
+        pool.reconcile(&[addr], &[], 1, Duration::from_secs(7));
         assert_eq!(pool.recovery_timeout(), Duration::from_secs(7));
         pool.record_failure(addr);
         assert_eq!(
@@ -966,7 +1102,7 @@ mod tests {
 
             // reconcile keeping the same address plus a new one
             let other: SocketAddr = "127.0.0.1:3999".parse().unwrap();
-            pool.reconcile(&[addr, other], 3, Duration::from_secs(10));
+            pool.reconcile(&[addr, other], &[], 3, Duration::from_secs(10));
 
             assert_eq!(
                 pool.state_for(addr).unwrap().keepalive.queue_len(),

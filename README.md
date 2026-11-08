@@ -42,14 +42,14 @@ Every listener picks its own mode, routes, and backend pool, in one process.
 | **L4 forwarding** | `splice(2)` zero-copy with a pooled pipe allocator and `TCP_CORK` batching; vectored and userspace paths as alternatives |
 | **L7 HTTP/1.1** | parse, route, header injection, chunked and Content-Length pass-through, 100-continue, keep-alive both sides, WebSocket tunneling |
 | **Routing** | host, path prefix, method, SNI matchers composed per route; first match wins; wildcards (`*.example.com`) |
-| **Load balancing** | round-robin, least-connections, weighted; weights live-reloadable, so `weight = 0` drains a backend without a restart |
+| **Load balancing** | round-robin, least-connections, weighted, consistent hash on client IP or a header; weights live-reloadable, so `weight = 0` drains a backend without a restart |
 | **TLS** | rustls termination with multi-cert SNI, or SNI-routed passthrough where kntx holds no cert |
 | **Resilience** | per-backend circuit breakers, active TCP probes, passive failure tracking, connect retries with failover |
 | **Rate limiting** | GCRA on a lock-free set-associative cache; named zones attached per listener or per route |
 | **Hot reload** | `SIGHUP` swaps pools, routes, listeners, certs, and rate-limit zones with no restart and no dropped connections |
 | **PROXY protocol** | v1 and v2 ingress, any listener mode, including the `splice(2)` path |
 | **Admin** | token-gated socket: pool state, config dump, live log level, two-phase drain, and a JS-free HTML panel |
-| **Observability** | 43 Prometheus metrics, JSON access logs, W3C `traceparent` propagation |
+| **Observability** | 45 Prometheus metrics, JSON access logs, W3C `traceparent` propagation |
 
 Not implemented: HTTP/2, HTTP/3, backend TLS, request-body buffering, forward-proxy `CONNECT`.
 See [Limits](#limits).
@@ -116,8 +116,8 @@ duration, which is what makes them a progress invariant against slowloris.
 
 Backend keep-alive is on by default (`max_idle = 32`); set `max_idle = 0` to opt out.
 
-Restart-only fields log a `WARN` and keep the running value on reload: pool `strategy`,
-`[admin] address`, `metrics.address`, buffer pool sizes, and the per-listener connection settings.
+Restart-only fields log a `WARN` and keep the running value on reload: pool `strategy` and
+`hash_key`, `[admin] address`, `metrics.address`, buffer pool sizes, and the per-listener connection settings.
 
 ## Admin
 
@@ -261,6 +261,8 @@ connections the balancer was still routing to you.
 | symptom | cause |
 |---|---|
 | `X-Forwarded-For` shows one IP for everyone | `proxy_protocol` off behind an L4 balancer |
+| a `hash` pool sends everything to one backend | `client_ip` key with `proxy_protocol` off behind an L4 balancer |
+| `kntx_hash_key_missing_total` rising | clients not sending the `hash_key` header; those requests are balanced by weight, without affinity |
 | all connections refused right after enabling `proxy_protocol` | sender not configured to send the header, which is mandatory once on |
 | connections refused during a rolling deploy | deregistration delay shorter than `drain_timeout_secs` |
 | requests cut mid-flight on restart | `TimeoutStopSec` at or below `drain_timeout_secs` |
@@ -351,6 +353,25 @@ that no strategy collapses when there is nothing to optimize, nothing finer.
 Weighted's 0.43ms p50 beside a 98ms p99 is bimodal: 90% goes to the healthy backend, 10% still
 queues behind the cap. It also needed the 9:1 ratio known in advance, which least_conn measured at
 runtime.
+
+### Consistent hash
+
+`cargo bench --bench balancer` - criterion, i7-8550U on AC, a different client IP per selection.
+
+| backends | round_robin | hash | hash, 8 threads |
+|---:|---:|---:|---:|
+| 2 | 46-56 ns | 62-68 ns | 96-105 ns |
+| 8 | 48-55 ns | 63-67 ns | 77-124 ns |
+| 32 | 48-55 ns | 75-84 ns | 100-110 ns |
+
+Ranges span two runs; this laptop moves 10-20% between identical runs. Hashing the key and a binary
+search over 160 points per backend add 15-30 ns over round-robin.
+
+Ring build runs on reload only: 32 µs for 8 backends, 167 µs for 32, 6.0 ms at the weight-sum cap
+of 1000 (160k points).
+
+Remapping, measured live with 300 session IDs over 3 backends: adding a fourth moved 78 keys (26%),
+all of them to the new backend. Killing one moved exactly its 82 keys and failed no request.
 
 ## Limits
 

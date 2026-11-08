@@ -10,15 +10,30 @@ use tokio::net::{TcpListener, TcpStream};
 use kntx::access_log::AccessLogSink;
 use kntx::balancer::RoundRobin;
 use kntx::config::{
-    ErrorPagesConfig, ForwardingStrategy, KeepaliveConfig, ListenerConfig, ListenerMode,
+    BalancerStrategy, ErrorPagesConfig, ForwardingStrategy, KeepaliveConfig, ListenerConfig,
+    ListenerMode,
 };
 use kntx::health::BackendPool;
 use kntx::listener::{self, ListenerRuntime, ServeConfig};
 use kntx::pool::buffer::BufferPool;
 use kntx::proxy::l4::Resources;
 use kntx::proxy::l7::ErrorPages;
+use kntx::proxy::l7::matcher::RouteContext;
 
+use helpers::http_backend::{HttpBackend, ResponseSpec};
 use helpers::{EchoServer, make_single_pool_router};
+
+fn next_backend(rr: &RoundRobin) -> Option<SocketAddr> {
+    let ctx = RouteContext {
+        method: None,
+        host: None,
+        path: None,
+        headers: &[],
+        sni: None,
+        client_ip: [127, 0, 0, 1].into(),
+    };
+    rr.next_backend(&ctx, &[])
+}
 
 fn test_resources() -> Resources {
     Resources {
@@ -163,8 +178,58 @@ async fn round_robin_distribution() {
     }
 
     // connections consumed indices 0,1,2,3 - next is 4 % 2 == 0 -> first backend
-    let next = rr.next_backend().unwrap();
+    let next = next_backend(&rr).unwrap();
     assert_eq!(next, b1_addr);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hash_client_ip_pins_every_connection_to_one_backend() {
+    let backends = [
+        HttpBackend::start(ResponseSpec::ok("x")).await,
+        HttpBackend::start(ResponseSpec::ok("x")).await,
+        HttpBackend::start(ResponseSpec::ok("x")).await,
+    ];
+    let addrs: Vec<_> = backends.iter().map(|b| b.addr).collect();
+    let pool = Arc::new(
+        BackendPool::new(
+            "hash-l4".into(),
+            addrs,
+            3,
+            Duration::from_secs(10),
+            KeepaliveConfig::default(),
+        )
+        .with_hash_ring(),
+    );
+    let rr = Arc::new(RoundRobin::with_strategy(
+        Arc::clone(&pool),
+        BalancerStrategy::Hash,
+    ));
+    let router = make_single_pool_router(pool, rr);
+
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = tcp_listener.local_addr().unwrap();
+    let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(listener::serve(
+        tcp_listener,
+        ListenerRuntime::cell(router, test_listener_cfg(), None, None),
+        test_serve_config(ForwardingStrategy::Userspace),
+        shutdown_rx,
+    ));
+
+    for _ in 0..20 {
+        let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).await.unwrap();
+        assert!(resp.starts_with(b"HTTP/1.1 200"));
+    }
+
+    let mut counts: Vec<u64> = backends.iter().map(|b| b.accept_count()).collect();
+    counts.sort();
+    assert_eq!(counts, vec![0, 0, 20], "one client ip, one backend");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -334,7 +399,7 @@ mod splice_tests {
             assert_eq!(&buf[..n], b"ping");
         }
 
-        let next = rr.next_backend().unwrap();
+        let next = next_backend(&rr).unwrap();
         assert_eq!(next, b1_addr);
     }
 

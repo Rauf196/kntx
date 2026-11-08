@@ -185,8 +185,12 @@ tls.min_version = "1.2"   # "1.2" (default) or "1.3"
 #   "weighted"              - each backend gets a share of traffic proportional to
 #                             its `weight`. for uneven backend capacity, canary
 #                             rollouts, and draining.
+#   "hash"                  - consistent hash on `hash_key`: the same key keeps
+#                             its backend, and adding or removing a backend only
+#                             moves that backend's keys. for sessions and caches.
+#                             weights apply; their sum is capped at 1000.
 #
-# strategy is restart-only. a reload logs a WARN and keeps the running strategy;
+# strategy and hash_key are restart-only. a reload logs a WARN and keeps the running strategy;
 # per-backend `weight` IS live, which is what makes draining work without a restart.
 
 [[pools]]
@@ -210,6 +214,19 @@ backends = [
 # backends = [
 #   { address = "127.0.0.1:3001", weight = 3 },
 #   { address = "127.0.0.1:3002", weight = 1 },
+# ]
+
+# hash_key is "client_ip" (default, any listener mode) or { header = "<name>" }
+# (l7 listeners only). a request without the header falls back to weighted.
+# behind an l4 balancer, client_ip needs proxy_protocol or every client looks the same.
+#
+# [[pools]]
+# name = "sessions"
+# strategy = "hash"
+# hash_key = { header = "x-session-id" }
+# backends = [
+#   { address = "127.0.0.1:4001" },
+#   { address = "127.0.0.1:4002" },
 # ]
 
 # [[pools]]
